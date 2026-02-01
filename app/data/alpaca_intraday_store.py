@@ -121,6 +121,79 @@ def _fetch_intraday_bars(symbol: str, session_date: dt.date, minutes: int, cfg: 
     return out
 
 
+def _fetch_recent_bars(
+    symbols: List[str],
+    start_utc: dt.datetime,
+    end_utc: dt.datetime,
+    cfg: dict,
+) -> Dict[str, List[Dict[str, Any]]]:
+    alp = cfg.get("alpaca") or {}
+    key_id = str(alp.get("api_key_id") or "").strip()
+    secret = str(alp.get("api_secret_key") or "").strip()
+    if not key_id or not secret:
+        return {}
+    base_url = str(alp.get("data_url") or "https://data.alpaca.markets").rstrip("/")
+    url = f"{base_url}/v2/stocks/bars"
+    headers = {
+        "APCA-API-KEY-ID": key_id,
+        "APCA-API-SECRET-KEY": secret,
+    }
+    params = {
+        "symbols": ",".join(symbols),
+        "timeframe": "1Min",
+        "adjustment": str(alp.get("adjustment") or "raw"),
+        "feed": str(alp.get("data_feed") or "iex"),
+        "limit": 10000,
+        "start": start_utc.isoformat(),
+        "end": end_utc.isoformat(),
+    }
+    timeout = alp.get("timeout_sec") or 10
+    max_retries = int(alp.get("max_retries") or 0)
+    retry_backoff = float(alp.get("retry_backoff_sec") or 0)
+    out: Dict[str, List[Dict[str, Any]]] = {str(s).upper(): [] for s in symbols}
+    page_token = None
+    while True:
+        if page_token:
+            params["page_token"] = page_token
+        attempt = 0
+        while True:
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+                resp.raise_for_status()
+                payload = resp.json()
+                break
+            except Exception:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                if retry_backoff > 0:
+                    time.sleep(retry_backoff * attempt)
+        bars_payload = payload.get("bars")
+        if isinstance(bars_payload, dict):
+            for sym, rows in bars_payload.items():
+                sym_key = str(sym).upper()
+                for row in rows or []:
+                    ts = _parse_timestamp(row.get("t") or row.get("timestamp"))
+                    if not ts:
+                        continue
+                    out.setdefault(sym_key, []).append(
+                        {
+                            "timestamp": ts.isoformat(),
+                            "open": float(row.get("o") or row.get("open") or 0),
+                            "high": float(row.get("h") or row.get("high") or 0),
+                            "low": float(row.get("l") or row.get("low") or 0),
+                            "close": float(row.get("c") or row.get("close") or 0),
+                            "volume": float(row.get("v") or row.get("volume") or 0),
+                        }
+                    )
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+    for sym, rows in out.items():
+        rows.sort(key=lambda b: b.get("timestamp") or "")
+    return out
+
+
 def get_intraday_bars(
     symbol: str,
     session_date: str | dt.date,
@@ -162,3 +235,30 @@ def get_intraday_bars(
             pass
     _MEM_CACHE[cache_key] = bars
     return bars
+
+
+def get_latest_intraday_prices(
+    symbols: List[str],
+    cfg: Optional[dict] = None,
+    lookback_minutes: int = 5,
+) -> Dict[str, float]:
+    cfg = cfg or {}
+    symbols = [str(s).upper() for s in symbols if s]
+    if not symbols:
+        return {}
+    lookback_minutes = max(1, int(lookback_minutes or 1))
+    end_utc = dt.datetime.now(tz=dt.timezone.utc)
+    start_utc = end_utc - dt.timedelta(minutes=lookback_minutes)
+    chunk_size = int((cfg.get("alpaca") or {}).get("bars_chunk_size") or 50)
+    prices: Dict[str, float] = {}
+    for i in range(0, len(symbols), max(1, chunk_size)):
+        chunk = symbols[i : i + max(1, chunk_size)]
+        try:
+            bars_map = _fetch_recent_bars(chunk, start_utc, end_utc, cfg)
+        except Exception as exc:
+            logging.warning("[INTRADAY] latest bars fetch failed chunk=%s: %s", chunk, exc)
+            continue
+        for sym, rows in bars_map.items():
+            if rows:
+                prices[sym] = float(rows[-1].get("close") or 0.0)
+    return prices

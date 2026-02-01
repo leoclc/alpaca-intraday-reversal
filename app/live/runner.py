@@ -104,14 +104,18 @@ def flatten_intraday_positions_if_needed(cfg: Dict, broker: AlpacaBroker) -> Lis
     return closed
 
 
-def run_live(cfg: Optional[Dict] = None, target_date: Optional[str] = None) -> List[Dict]:
+def run_live(
+    cfg: Optional[Dict] = None,
+    target_date: Optional[str] = None,
+    return_plans: bool = False,
+) -> List[Dict] | tuple[List[Dict], List]:
     cfg = cfg or load_config()
     tgt = expected_watchlist_date_str(target_date)
     wl = read_watchlist(tgt, cfg)
     symbols = [str(r.get("symbol") or "").upper() for r in wl.get("watchlist") or [] if r.get("symbol")]
     if not symbols:
         logging.warning("[LIVE] no watchlist entries for date=%s", tgt)
-        return []
+        return ([], []) if return_plans else []
     data_store = AlpacaOHLCStore(cfg=cfg)
     broker = AlpacaBroker(cfg)
     params = cfg.get("daily_trend_reversal") or {}
@@ -119,6 +123,7 @@ def run_live(cfg: Optional[Dict] = None, target_date: Optional[str] = None) -> L
     tif = str(params.get("order_tif") or "day").lower()
     use_brackets = bool(params.get("use_brackets", True))
     placed: List[Dict] = []
+    plans: List = []
     for symbol in symbols:
         signals = generate_signals([symbol], tgt, tgt, cfg, data_store)
         if not signals:
@@ -127,7 +132,10 @@ def run_live(cfg: Optional[Dict] = None, target_date: Optional[str] = None) -> L
         plan = build_trade(signal, cfg, data_store, context="live")
         if not plan:
             continue
+        plans.append(plan)
         qty = _compute_qty(cfg, plan, broker)
+        if qty <= 0:
+            continue
         if not broker.ready():
             logging.error("[LIVE] Alpaca credentials missing; cannot place order for %s", symbol)
             continue
@@ -160,7 +168,7 @@ def run_live(cfg: Optional[Dict] = None, target_date: Optional[str] = None) -> L
         except Exception as exc:
             logging.error("[LIVE] order failed symbol=%s error=%s", symbol, exc)
     flatten_intraday_positions_if_needed(cfg, broker)
-    return placed
+    return (placed, plans) if return_plans else placed
 
 
 def run_flatten(cfg: Optional[Dict] = None) -> List[Dict]:
