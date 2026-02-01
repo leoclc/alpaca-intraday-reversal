@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app.config.loader import load_config
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
+from app.portfolio.sizing import compute_qty_with_guards
 from app.replay.daily_strategy_replay import run_replay
 from app.utils.time import iter_trading_days
 from app.watchlist.daily_strategy_builder import build_watchlist
@@ -27,6 +28,63 @@ def _summarize(trades) -> Dict[str, float]:
         "avgR": avg_r,
         "total_pnl_pct": total_pnl,
     }
+
+
+def _apply_portfolio_sizing(
+    day_trades: List,
+    equity: float,
+    cfg: Dict,
+) -> Tuple[List, List[Dict], float]:
+    params = cfg.get("daily_trend_reversal") or {}
+    used_notional = 0.0
+    open_positions = 0
+    accepted: List = []
+    sized_records: List[Dict] = []
+    for trade in day_trades:
+        plan = getattr(trade, "plan", None)
+        if plan is None:
+            continue
+        qty, state = compute_qty_with_guards(
+            plan,
+            equity,
+            used_notional,
+            cfg,
+            open_positions=open_positions,
+        )
+        if qty <= 0:
+            continue
+        direction_mult = 1.0 if plan.direction == "long" else -1.0
+        pnl_per_share = (float(trade.exit_price) - plan.entry_price) * direction_mult
+        pnl_total = pnl_per_share * qty
+        equity_before = equity
+        equity = equity + pnl_total
+        notional = plan.entry_price * qty
+        used_notional += notional
+        open_positions += 1
+        accepted.append(trade)
+        sized_records.append(
+            {
+                "symbol": plan.symbol,
+                "direction": plan.direction,
+                "entry_date": plan.entry_date,
+                "entry_time_et": plan.entry_time_et,
+                "entry_price": plan.entry_price,
+                "stop_price": plan.stop_price,
+                "target_price": plan.target_price,
+                "exit_date": trade.exit_date,
+                "exit_price": trade.exit_price,
+                "exit_reason": trade.exit_reason,
+                "qty": qty,
+                "pnl_total": pnl_total,
+                "pnl_pct": trade.pnl_pct,
+                "r_multiple": trade.r_multiple,
+                "equity_before": equity_before,
+                "equity_after": equity,
+                "notional": notional,
+                "sizing_state": state,
+            }
+        )
+    return accepted, sized_records, equity
 
 
 def run_backtest(
@@ -60,6 +118,11 @@ def run_backtest(
     logging.info("[BACKTEST] prefetching daily bars from %s to %s", prefetch_start, end)
     data_store.get_daily_bars_bulk(symbols, prefetch_start, end, cfg=cfg, allow_fetch=True)
     all_trades: List = []
+    sized_trades: List[Dict] = []
+    equity_curve: List[Dict] = []
+    params = cfg.get("daily_trend_reversal") or {}
+    starting_equity = float(params.get("starting_equity") or 100000.0)
+    equity = starting_equity
     run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     for day in iter_trading_days(start, end):
         date_str = day.isoformat()
@@ -67,8 +130,13 @@ def run_backtest(
         _ = build_watchlist(cfg, target_date=date_str, symbols=symbols, data_store=data_store, run_id=run_id)
         day_trades = run_replay(cfg, start_date=date_str, end_date=date_str, data_store=data_store, run_id=run_id)
         if day_trades:
-            all_trades.extend(day_trades)
-        logging.info("[BACKTEST] date=%s trades=%s total=%s", date_str, len(day_trades), len(all_trades))
+            accepted, sized_records, equity = _apply_portfolio_sizing(day_trades, equity, cfg)
+            if accepted:
+                all_trades.extend(accepted)
+            if sized_records:
+                sized_trades.extend(sized_records)
+        equity_curve.append({"date": date_str, "equity": equity})
+        logging.info("[BACKTEST] date=%s trades=%s total=%s equity=%.2f", date_str, len(day_trades), len(all_trades), equity)
 
     summary = _summarize(all_trades)
     out_file: Optional[Path] = None
@@ -96,7 +164,19 @@ def run_backtest(
                     "r_multiple": t.r_multiple,
                 }
             )
-        payload = {"summary": summary, "trades": trades_payload}
+        equity_return_pct = ((equity / starting_equity) - 1.0) * 100.0 if starting_equity > 0 else 0.0
+        payload = {
+            "summary": {
+                **summary,
+                "starting_equity": starting_equity,
+                "ending_equity": equity,
+                "total_pnl_dollars": equity - starting_equity,
+                "total_pnl_pct_equity": equity_return_pct,
+            },
+            "trades": trades_payload,
+            "sized_trades": sized_trades,
+            "equity_curve": equity_curve,
+        }
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         logging.info("[BACKTEST] wrote %s", out_file)

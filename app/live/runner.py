@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from app.brokers.alpaca import AlpacaBroker
 from app.config.loader import load_config
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
+from app.portfolio.sizing import compute_qty_with_guards
 from app.strategies.daily_trend_reversal import build_trade, generate_signals
 from app.utils.time import et_now, parse_time_hhmm
 from app.watchlist.storage import expected_watchlist_date_str, read_watchlist
@@ -27,11 +28,46 @@ def _compute_qty(cfg: Dict, plan, broker: AlpacaBroker) -> int:
         equity = float(acct.get("equity") or 0.0)
     except Exception:
         return 1
-    risk_dollars = equity * risk_per_trade
-    if plan.stop_distance <= 0:
-        return 1
-    qty = int(risk_dollars / plan.stop_distance)
-    return max(1, qty)
+
+    leverage_cfg = params.get("leverage")
+    max_margin_usage = float(params.get("max_margin_usage") or 0.70)
+    try:
+        leverage = float(leverage_cfg) if leverage_cfg is not None else float(acct.get("multiplier") or 4.0)
+    except Exception:
+        leverage = 4.0
+    try:
+        buying_power = float(acct.get("buying_power") or 0.0)
+    except Exception:
+        buying_power = 0.0
+    allowed_total = max(0.0, equity * leverage)
+    if buying_power > 0:
+        allowed_total = min(allowed_total, buying_power)
+    allowed_total *= max(0.0, min(max_margin_usage, 1.0))
+
+    used_notional = 0.0
+    positions = []
+    try:
+        positions = broker.list_positions() or []
+        for pos in positions:
+            try:
+                mv = float(pos.get("market_value") or 0.0)
+            except Exception:
+                mv = 0.0
+            used_notional += abs(mv)
+    except Exception:
+        used_notional = 0.0
+        positions = []
+
+    allowed_total *= max(0.0, min(max_margin_usage, 1.0))
+    qty, _ = compute_qty_with_guards(
+        plan,
+        equity,
+        used_notional,
+        cfg,
+        allowed_total_override=allowed_total,
+        open_positions=len(positions),
+    )
+    return qty
 
 
 def flatten_intraday_positions_if_needed(cfg: Dict, broker: AlpacaBroker) -> List[Dict]:
