@@ -7,8 +7,9 @@ from typing import Dict, List, Optional
 from app.brokers.alpaca import AlpacaBroker
 from app.config.loader import load_config
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
+from app.data.alpaca_intraday_store import get_intraday_bars
 from app.portfolio.sizing import compute_qty_with_guards
-from app.strategies.daily_trend_reversal import build_trade, generate_signals
+from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
 from app.utils.time import et_now, parse_time_hhmm
 from app.watchlist.storage import expected_watchlist_date_str, read_watchlist
 
@@ -125,11 +126,18 @@ def run_live(
     placed: List[Dict] = []
     plans: List = []
     for symbol in symbols:
-        signals = generate_signals([symbol], tgt, tgt, cfg, data_store)
-        if not signals:
+        signal = generate_signal_for_date(symbol, tgt, cfg, data_store)
+        if not signal:
             continue
-        signal = signals[0]
-        plan = build_trade(signal, cfg, data_store, context="live")
+        params = cfg.get("daily_trend_reversal") or {}
+        intraday_filter_enabled = bool(params.get("intraday_filter_enabled", False))
+        early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
+        time_stop_minutes = int(params.get("time_stop_minutes") or 0)
+        minutes_needed = max(early_range_minutes, time_stop_minutes)
+        bars_intraday = None
+        if minutes_needed > 0:
+            bars_intraday = get_intraday_bars(symbol, tgt, minutes_needed, cfg=cfg, allow_fetch=True)
+        plan = build_trade(signal, cfg, data_store, context="live", bars_intraday=bars_intraday)
         if not plan:
             continue
         plans.append(plan)

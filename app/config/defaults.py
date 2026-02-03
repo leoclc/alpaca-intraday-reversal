@@ -19,6 +19,8 @@ DEFAULT_CONFIG: dict = {
         "entry_end_et": "11:30",
         "session_open_et": "09:30",
         "entry_price_mode": "open",
+        "use_intraday_entry": True,
+        "intraday_entry_in_watchlist": False,
         "max_positions": 0,
         "risk_per_trade": 0.02,
         "leverage": 4.0,

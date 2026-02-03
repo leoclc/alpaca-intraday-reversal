@@ -82,10 +82,46 @@ def simulate_entry(
     else:
         bar = bars_daily[idx]
     entry_price_mode = str((cfg.get("daily_trend_reversal") or {}).get("entry_price_mode") or "open").lower()
-    if entry_price_mode == "close" or source_date != entry_date:
-        entry_price = float(bar["close"])
-    else:
-        entry_price = float(bar["open"])
+    use_intraday_entry = bool((cfg.get("daily_trend_reversal") or {}).get("use_intraday_entry", False))
+    entry_price: Optional[float] = None
+    if use_intraday_entry and bars_intraday:
+        entry_time = parse_time_hhmm(entry_time_et)
+        entry_dt = ensure_et(dt.datetime.combine(ensure_date(entry_date), entry_time))
+        for row in bars_intraday:
+            ts = _parse_intraday_ts(row)
+            if not ts:
+                continue
+            ts = ensure_et(ts)
+            if ts >= entry_dt:
+                if entry_price_mode == "close":
+                    entry_price = float(row.get("close") or row.get("c") or 0.0)
+                else:
+                    entry_price = float(row.get("open") or row.get("o") or 0.0)
+                break
+    if entry_price is None and source_date == entry_date:
+        if entry_price_mode == "close":
+            entry_price = float(bar["close"])
+        else:
+            entry_price = float(bar["open"])
+    elif entry_price is None:
+        # No daily bar for entry_date yet (live). Prefer intraday price if available.
+        if bars_intraday:
+            entry_time = parse_time_hhmm(entry_time_et)
+            entry_dt = ensure_et(dt.datetime.combine(ensure_date(entry_date), entry_time))
+            for row in bars_intraday:
+                ts = _parse_intraday_ts(row)
+                if not ts:
+                    continue
+                ts = ensure_et(ts)
+                if ts >= entry_dt:
+                    if entry_price_mode == "close":
+                        entry_price = float(row.get("close") or row.get("c") or 0.0)
+                    else:
+                        entry_price = float(row.get("open") or row.get("o") or 0.0)
+                    break
+        if entry_price is None:
+            # Fallback to previous close
+            entry_price = float(bar["close"])
     entry_time = parse_time_hhmm(entry_time_et)
     entry_dt = ensure_date(entry_date)
     return {

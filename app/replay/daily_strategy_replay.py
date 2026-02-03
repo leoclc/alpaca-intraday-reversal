@@ -11,7 +11,7 @@ from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.execution.daily_execution_model import simulate_exit
 from app.strategies.daily_trend_reversal import build_trade, generate_signals
 from app.strategies.types import TradeResult
-from app.utils.time import iter_trading_days
+from app.utils.time import iter_trading_days, parse_time_hhmm
 from app.watchlist.storage import read_watchlist
 
 _DEFAULT_RUN_ID: Optional[str] = None
@@ -57,6 +57,17 @@ def run_replay(
         early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
         time_stop_minutes = int(params.get("time_stop_minutes") or 0)
         minutes_needed = max(early_range_minutes, time_stop_minutes)
+        if bool(params.get("use_intraday_entry", False)):
+            try:
+                entry_time_et = str(params.get("entry_time_et") or "09:35")
+                session_open_et = str(params.get("session_open_et") or "09:30")
+                entry_time = parse_time_hhmm(entry_time_et)
+                open_time = parse_time_hhmm(session_open_et)
+                entry_minutes = int((dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds() / 60)
+                entry_minutes = max(1, entry_minutes + 1)
+                minutes_needed = max(minutes_needed, entry_minutes)
+            except Exception:
+                minutes_needed = max(minutes_needed, 1)
         for symbol in symbols:
             signals = generate_signals([symbol], date_str, date_str, cfg, data_store)
             if not signals:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import csv
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -138,6 +139,55 @@ def run_backtest(
         equity_curve.append({"date": date_str, "equity": equity})
         logging.info("[BACKTEST] date=%s trades=%s total=%s equity=%.2f", date_str, len(day_trades), len(all_trades), equity)
 
+    leverage = float(params.get("leverage") or 4.0)
+    # Aggregate notional per day for margin usage metrics.
+    notional_by_day: Dict[str, float] = {}
+    for rec in sized_trades:
+        day = rec.get("entry_date")
+        if not day:
+            continue
+        notional_by_day[day] = notional_by_day.get(day, 0.0) + float(rec.get("notional") or 0.0)
+
+    daily_metrics: List[Dict] = []
+    peak = 0.0
+    max_drawdown_pct = 0.0
+    max_drawdown_date = None
+    max_daily_drop_pct = 0.0
+    max_daily_drop_date = None
+    max_day_margin_usage_pct = 0.0
+    max_day_margin_usage_date = None
+    prev_equity = None
+    for row in equity_curve:
+        date_str = row["date"]
+        equity_val = float(row["equity"])
+        if equity_val > peak:
+            peak = equity_val
+        drawdown_pct = ((equity_val - peak) / peak) * 100.0 if peak > 0 else 0.0
+        if drawdown_pct < max_drawdown_pct:
+            max_drawdown_pct = drawdown_pct
+            max_drawdown_date = date_str
+        daily_return_pct = 0.0
+        if prev_equity is not None and prev_equity > 0:
+            daily_return_pct = ((equity_val - prev_equity) / prev_equity) * 100.0
+            if daily_return_pct < max_daily_drop_pct:
+                max_daily_drop_pct = daily_return_pct
+                max_daily_drop_date = date_str
+        prev_equity = equity_val
+        day_notional = notional_by_day.get(date_str, 0.0)
+        margin_usage_pct = ((day_notional / (equity_val * leverage)) * 100.0) if equity_val > 0 else 0.0
+        if margin_usage_pct > max_day_margin_usage_pct:
+            max_day_margin_usage_pct = margin_usage_pct
+            max_day_margin_usage_date = date_str
+        daily_metrics.append(
+            {
+                "date": date_str,
+                "equity": round(equity_val, 6),
+                "daily_return_pct": round(daily_return_pct, 6),
+                "drawdown_pct": round(drawdown_pct, 6),
+                "margin_usage_pct": round(margin_usage_pct, 6),
+            }
+        )
+
     summary = _summarize(all_trades)
     out_file: Optional[Path] = None
     if out_path:
@@ -172,12 +222,44 @@ def run_backtest(
                 "ending_equity": equity,
                 "total_pnl_dollars": equity - starting_equity,
                 "total_pnl_pct_equity": equity_return_pct,
+                "max_drawdown_pct": max_drawdown_pct,
+                "max_drawdown_date": max_drawdown_date,
+                "max_daily_drop_pct": max_daily_drop_pct,
+                "max_daily_drop_date": max_daily_drop_date,
+                "max_day_margin_usage_pct": max_day_margin_usage_pct,
+                "max_day_margin_usage_date": max_day_margin_usage_date,
             },
             "trades": trades_payload,
             "sized_trades": sized_trades,
             "equity_curve": equity_curve,
+            "daily_metrics": daily_metrics,
         }
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Write a daily metrics CSV alongside the backtest JSON.
+        daily_csv = out_file.parent / "backtest_daily.csv"
+        with daily_csv.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["date", "equity", "daily_return_pct", "drawdown_pct", "margin_usage_pct"],
+            )
+            writer.writeheader()
+            for row in daily_metrics:
+                writer.writerow(row)
+        metrics_json = out_file.parent / "backtest_metrics.json"
+        metrics_json.write_text(
+            json.dumps(
+                {
+                    "max_drawdown_pct": max_drawdown_pct,
+                    "max_drawdown_date": max_drawdown_date,
+                    "max_daily_drop_pct": max_daily_drop_pct,
+                    "max_daily_drop_date": max_daily_drop_date,
+                    "max_day_margin_usage_pct": max_day_margin_usage_pct,
+                    "max_day_margin_usage_date": max_day_margin_usage_date,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         logging.info("[BACKTEST] wrote %s", out_file)
     return summary, all_trades

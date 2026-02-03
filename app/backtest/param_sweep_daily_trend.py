@@ -20,9 +20,9 @@ from app.watchlist.node_assets import fetch_asset_symbols, resolve_watchlist_ass
 
 def _default_grid() -> Dict[str, List[float]]:
     return {
-        "rr_target": [1.1, 1.3, 1.5],
-        "stop_bps": [20, 30, 40],
-        "max_hold_minutes": [30, 60, 120],
+        "rr_target": [1.2, 1.5, 1.8],
+        "stop_bps": [30, 40, 50],
+        "max_hold_minutes": [30, 60, 90],
     }
 
 
@@ -197,7 +197,14 @@ def run_param_sweep(
     out_path = Path(out_path) if out_path else out_dir / "param_sweep_2025_daily_trend.csv"
     logging.info("[SWEEP] run_id=%s out_dir=%s", run_id, out_dir)
     # Write config snapshot for reproducibility/debugging
-    (out_dir / "config_snapshot.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    snapshot_path = out_dir / "config_snapshot.json"
+    snapshot_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    # Emit a restore helper so it's easy to revert after experiments.
+    restore_script = out_dir / "restore_config.ps1"
+    restore_script.write_text(
+        "Copy-Item -Force .\\logs\\backtests\\{run_id}\\config_snapshot.json .\\config.json\n".format(run_id=run_id),
+        encoding="utf-8",
+    )
     logging.info(
         "[SWEEP] config daily_trend_reversal=%s watchlist=%s",
         cfg.get("daily_trend_reversal"),
