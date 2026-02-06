@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app.config.loader import load_config
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
+from app.market.filters import market_filter_decision
 from app.portfolio.sizing import compute_qty_with_guards
 from app.replay.daily_strategy_replay import run_replay
 from app.utils.time import iter_trading_days
@@ -121,6 +122,8 @@ def run_backtest(
     all_trades: List = []
     sized_trades: List[Dict] = []
     equity_curve: List[Dict] = []
+    skip_count = 0
+    skip_reasons: Dict[str, int] = {}
     params = cfg.get("daily_trend_reversal") or {}
     starting_equity = float(params.get("starting_equity") or 100000.0)
     equity = starting_equity
@@ -129,6 +132,22 @@ def run_backtest(
         date_str = day.isoformat()
         logging.info("[BACKTEST] build watchlist date=%s", date_str)
         _ = build_watchlist(cfg, target_date=date_str, symbols=symbols, data_store=data_store, run_id=run_id)
+        skip, info = market_filter_decision(date_str, cfg, data_store)
+        if skip:
+            skip_count += 1
+            if isinstance(info, dict):
+                reasons = info.get("reasons")
+                if isinstance(reasons, list) and reasons:
+                    for reason in reasons:
+                        skip_reasons[str(reason)] = skip_reasons.get(str(reason), 0) + 1
+                else:
+                    reason = info.get("reason")
+                    if reason:
+                        reason_key = str(reason)
+                        skip_reasons[reason_key] = skip_reasons.get(reason_key, 0) + 1
+            logging.info("[BACKTEST] market filter skip date=%s info=%s", date_str, info)
+            equity_curve.append({"date": date_str, "equity": equity})
+            continue
         day_trades = run_replay(cfg, start_date=date_str, end_date=date_str, data_store=data_store, run_id=run_id)
         if day_trades:
             accepted, sized_records, equity = _apply_portfolio_sizing(day_trades, equity, cfg)
@@ -228,6 +247,8 @@ def run_backtest(
                 "max_daily_drop_date": max_daily_drop_date,
                 "max_day_margin_usage_pct": max_day_margin_usage_pct,
                 "max_day_margin_usage_date": max_day_margin_usage_date,
+                "market_filter_skips": skip_count,
+                "market_filter_skip_reasons": skip_reasons,
             },
             "trades": trades_payload,
             "sized_trades": sized_trades,

@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
+from app.data.alpaca_intraday_store import get_intraday_bars
 from app.execution.daily_execution_model import simulate_exit
 from app.strategies.daily_trend_reversal import build_trade, generate_signals
 from app.strategies.types import TradeResult
-from app.utils.time import ensure_date
+from app.utils.time import ensure_date, parse_time_hhmm
 from app.watchlist.node_assets import fetch_asset_symbols, resolve_watchlist_asset_filters, resolve_watchlist_builder_base
 from app.watchlist.storage import expected_watchlist_date_str, write_watchlist
 
@@ -68,12 +69,14 @@ def build_watchlist(
     min_trades = int(watch_cfg.get("minTrades") or 0)
     reject_negative_pnl = bool(watch_cfg.get("reject_negative_pnl", False))
     min_profit_factor = float(watch_cfg.get("minProfitFactor") or 0.0)
+    entry_time_rank_by = str(watch_cfg.get("entry_time_rank_by") or "avgR").lower()
     try:
         min_avg_r_raw = watch_cfg.get("minAvgR")
         min_avg_r = float(min_avg_r_raw) if min_avg_r_raw is not None else None
     except Exception:
         min_avg_r = None
     top_k = int(watch_cfg.get("top_k") or 0)
+    top_k_rank_by = str(watch_cfg.get("top_k_rank_by") or "total_pnl_pct").lower()
     report_enabled = bool(watch_cfg.get("report_enabled", False) or cfg.get("watchlist_report_enabled", False))
     tgt = expected_watchlist_date_str(target_date)
     symbols_list = [str(s).upper() for s in (symbols or []) if s]
@@ -102,6 +105,38 @@ def build_watchlist(
     pf_samples: List[float] = []
     trades_samples: List[int] = []
     watchlist: List[Dict] = []
+
+    params = cfg.get("daily_trend_reversal") or {}
+    entry_time_et = str(params.get("entry_time_et") or "09:35")
+    entry_times_raw = params.get("entry_times_et")
+    if isinstance(entry_times_raw, list) and entry_times_raw:
+        entry_times = [str(t) for t in entry_times_raw if t]
+    else:
+        entry_times = [entry_time_et]
+    try:
+        entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t))
+    except Exception:
+        pass
+    intraday_filter_enabled = bool(params.get("intraday_filter_enabled", False))
+    early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
+    time_stop_minutes = int(params.get("time_stop_minutes") or 0)
+    use_intraday_entry = bool(params.get("use_intraday_entry", False))
+    session_open_et = str(params.get("session_open_et") or "09:30")
+    max_entry_minutes = 0
+    if use_intraday_entry:
+        for t in entry_times:
+            try:
+                entry_time = parse_time_hhmm(t)
+                open_time = parse_time_hhmm(session_open_et)
+                entry_minutes = int(
+                    (dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds()
+                    / 60
+                )
+                entry_minutes = max(1, entry_minutes + 1)
+                max_entry_minutes = max(max_entry_minutes, entry_minutes)
+            except Exception:
+                max_entry_minutes = max(max_entry_minutes, 1)
+    minutes_needed_base = max(early_range_minutes, time_stop_minutes, max_entry_minutes)
 
     tgt_date = ensure_date(tgt)
     lookback_start = _lookback_start_date(tgt_date, lookback_days)
@@ -134,30 +169,58 @@ def build_watchlist(
         funnel["scanned_symbols"] += 1
         signals = generate_signals([symbol], start_date, end_date, cfg, data_store)
         funnel["signals_found"] += len(signals)
-        trades: List[TradeResult] = []
+        trades_by_time: Dict[str, List[TradeResult]] = {t: [] for t in entry_times}
         for signal in signals:
-            plan = build_trade(signal, cfg, data_store, context="watchlist")
-            if not plan:
-                continue
-            exit_info = simulate_exit(plan, "daily", bars, None, cfg)
-            if not exit_info:
-                continue
-            direction_mult = 1.0 if plan.direction == "long" else -1.0
-            pnl = (float(exit_info["exit_price"]) - plan.entry_price) * direction_mult
-            pnl_pct = (pnl / plan.entry_price) * 100.0
-            r_multiple = pnl / plan.stop_distance
-            trades.append(
-                TradeResult(
-                    plan=plan,
-                    exit_date=str(exit_info["exit_date"]),
-                    exit_price=float(exit_info["exit_price"]),
-                    exit_reason=str(exit_info["exit_reason"]),
-                    pnl_pct=pnl_pct,
-                    r_multiple=r_multiple,
+            bars_intraday = None
+            if minutes_needed_base > 0:
+                bars_intraday = get_intraday_bars(symbol, signal.signal_date, minutes_needed_base, cfg=cfg, allow_fetch=True)
+                if not bars_intraday:
+                    bars_intraday = None
+            for entry_time in entry_times:
+                plan = build_trade(
+                    signal,
+                    cfg,
+                    data_store,
+                    context="watchlist",
+                    bars_intraday=bars_intraday,
+                    entry_time_override=entry_time,
                 )
-            )
-        funnel["trades_simulated"] += len(trades)
-        stats = _compute_stats(trades)
+                if not plan:
+                    continue
+                exit_info = simulate_exit(plan, "daily", bars, bars_intraday, cfg)
+                if not exit_info:
+                    continue
+                direction_mult = 1.0 if plan.direction == "long" else -1.0
+                pnl = (float(exit_info["exit_price"]) - plan.entry_price) * direction_mult
+                pnl_pct = (pnl / plan.entry_price) * 100.0
+                r_multiple = pnl / plan.stop_distance
+                trades_by_time[entry_time].append(
+                    TradeResult(
+                        plan=plan,
+                        exit_date=str(exit_info["exit_date"]),
+                        exit_price=float(exit_info["exit_price"]),
+                        exit_reason=str(exit_info["exit_reason"]),
+                        pnl_pct=pnl_pct,
+                        r_multiple=r_multiple,
+                    )
+                )
+        total_trades_sim = sum(len(t) for t in trades_by_time.values())
+        funnel["trades_simulated"] += total_trades_sim
+        # Pick best entry time per symbol.
+        best_time = entry_times[0]
+        best_stats = _compute_stats(trades_by_time.get(best_time, []))
+        def _score(stats: Dict[str, float]) -> float:
+            if entry_time_rank_by in ("total_pnl_pct", "pnl", "total_pnl"):
+                return float(stats.get("total_pnl_pct") or 0.0)
+            if entry_time_rank_by in ("profit_factor", "pf"):
+                return float(stats.get("profit_factor") or 0.0)
+            return float(stats.get("avgR") or 0.0)
+        for entry_time, trades in trades_by_time.items():
+            stats = _compute_stats(trades)
+            if _score(stats) > _score(best_stats):
+                best_time = entry_time
+                best_stats = stats
+        stats = best_stats
         trades_samples.append(int(stats["trades_count"]))
         pnl_samples.append(float(stats["total_pnl_pct"]))
         pf_samples.append(float(stats["profit_factor"]))
@@ -183,14 +246,22 @@ def build_watchlist(
             if min_profit_factor <= 0 or stats["profit_factor"] >= min_profit_factor:
                 pass_trades_and_pf += 1
         if report_enabled:
-            report_rows.append({"symbol": symbol, **stats, "reasons": reasons})
+            report_rows.append({"symbol": symbol, "entry_time_et": best_time, **stats, "reasons": reasons})
         if reasons:
             continue
         funnel["symbols_passing_filters"] += 1
-        watchlist.append({"symbol": symbol, **stats})
+        watchlist.append({"symbol": symbol, "entry_time_et": best_time, **stats})
 
     if watchlist and top_k > 0:
-        watchlist.sort(key=lambda r: float(r.get("total_pnl_pct") or 0.0), reverse=True)
+        def _rank_key(row: Dict) -> float:
+            if top_k_rank_by in ("avgR", "avgr"):
+                return float(row.get("avgR") or 0.0)
+            if top_k_rank_by in ("profit_factor", "pf"):
+                return float(row.get("profit_factor") or 0.0)
+            if top_k_rank_by in ("win_rate", "winrate"):
+                return float(row.get("win_rate") or 0.0)
+            return float(row.get("total_pnl_pct") or 0.0)
+        watchlist.sort(key=_rank_key, reverse=True)
         watchlist = watchlist[:top_k]
 
     funnel["watchlist_size"] = len(watchlist)
@@ -248,6 +319,12 @@ def build_watchlist(
         logging.warning("[WATCHLIST] empty watchlist date=%s; no fallback applied", tgt)
         # Overwrite any stale watchlist for this date so replay can't pick up old symbols.
         write_watchlist([], cfg, date_str=tgt)
+    if watchlist:
+        entry_time_counts: Dict[str, int] = {}
+        for row in watchlist:
+            et = str(row.get("entry_time_et") or "")
+            entry_time_counts[et] = entry_time_counts.get(et, 0) + 1
+        logging.info("[WATCHLIST_ENTRY_TIMES] date=%s %s", tgt, entry_time_counts)
     if report_enabled:
         logs_dir = Path(str(cfg.get("logs_dir") or "logs"))
         if run_id:
@@ -266,6 +343,8 @@ def build_watchlist(
                 "minProfitFactor": min_profit_factor,
                 "minAvgR": min_avg_r,
                 "top_k": top_k,
+                "entry_time_rank_by": entry_time_rank_by,
+                "top_k_rank_by": top_k_rank_by,
             },
             "summary": {
                 **funnel,

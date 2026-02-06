@@ -50,6 +50,30 @@ class AlpacaBroker:
         stop_loss: float,
         tif: str = "day",
     ) -> Dict[str, Any]:
+        def _round_price(price: float) -> float:
+            # Alpaca rejects sub-penny increments for >= $1 stocks.
+            return round(float(price), 2 if price >= 1 else 4)
+
+        def _min_tick(base: float) -> float:
+            return 0.01 if base >= 1 else 0.0001
+
+        base_price = float(entry_price) if entry_price is not None else float(take_profit)
+        tick = _min_tick(base_price)
+        tp = float(take_profit)
+        sl = float(stop_loss)
+        if str(side).lower() == "buy":
+            if tp < base_price + tick:
+                tp = base_price + tick
+            if sl > base_price - tick:
+                sl = base_price - tick
+        else:
+            if tp > base_price - tick:
+                tp = base_price - tick
+            if sl < base_price + tick:
+                sl = base_price + tick
+        tp = _round_price(tp)
+        sl = _round_price(sl)
+
         payload: Dict[str, Any] = {
             "symbol": symbol,
             "side": side,
@@ -57,13 +81,13 @@ class AlpacaBroker:
             "type": entry_type,
             "time_in_force": tif,
             "order_class": "bracket",
-            "take_profit": {"limit_price": round(float(take_profit), 4)},
-            "stop_loss": {"stop_price": round(float(stop_loss), 4)},
+            "take_profit": {"limit_price": tp},
+            "stop_loss": {"stop_price": sl},
         }
         if entry_type == "limit":
             if entry_price is None:
                 raise ValueError("limit order requires entry_price")
-            payload["limit_price"] = round(float(entry_price), 4)
+            payload["limit_price"] = _round_price(entry_price)
         return self.submit_order(payload)
 
     def list_positions(self) -> Dict[str, Any]:

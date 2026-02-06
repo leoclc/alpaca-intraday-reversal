@@ -298,11 +298,23 @@ def build_trade(
     data_store: AlpacaOHLCStore,
     context: str = "replay",
     bars_intraday: Optional[List[Dict]] = None,
+    entry_time_override: Optional[str] = None,
 ) -> Optional[TradePlan]:
     params = cfg.get("daily_trend_reversal") or {}
     entry_time_et = str(params.get("entry_time_et") or "09:35")
     entry_start_et = str(params.get("entry_start_et") or entry_time_et)
     entry_end_et = str(params.get("entry_end_et") or entry_time_et)
+    entry_times_raw = params.get("entry_times_et")
+    if entry_time_override:
+        entry_times = [str(entry_time_override)]
+    elif isinstance(entry_times_raw, list) and entry_times_raw:
+        entry_times = [str(t) for t in entry_times_raw if t]
+    else:
+        entry_times = [entry_time_et]
+    try:
+        entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t))
+    except Exception:
+        pass
     atr_period = int(params.get("atr_period") or 14)
     stop_mode = str(params.get("stop_mode") or "atr").lower()
     stop_atr_mult = float(params.get("stop_atr_mult") or 1.0)
@@ -324,15 +336,6 @@ def build_trade(
     bars = data_store.get_daily_bars(signal.symbol, None, None, cfg=cfg, allow_fetch=True)
     if not bars:
         return None
-    if entry_start_et and entry_end_et:
-        if not (entry_start_et <= entry_time_et <= entry_end_et):
-            return None
-    entry_info = simulate_entry(signal, entry_time_et, "daily", bars, None, cfg)
-    if not entry_info:
-        return None
-    entry_price = float(entry_info["entry_price"])
-    entry_date = str(entry_info["entry_date"])
-    entry_idx = entry_info["entry_index"]
     direction = signal.direction.lower()
     apply_gap_filter = (min_gap_bps_long > 0) or (min_gap_bps_short > 0)
     apply_early_filter = intraday_filter_enabled
@@ -343,41 +346,56 @@ def build_trade(
     if apply_early_filter and early_range_minutes > 0 and max_early_pullback_bps > 0:
         minutes_needed = early_range_minutes
     if apply_intraday_entry:
-        try:
-            entry_time = parse_time_hhmm(entry_time_et)
-            open_time = parse_time_hhmm(session_open_et)
-            entry_minutes = int((dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds() / 60)
-            entry_minutes = max(1, entry_minutes + 1)
-            minutes_needed = max(minutes_needed, entry_minutes)
-        except Exception:
-            minutes_needed = max(minutes_needed, 1)
+        max_entry_minutes = 0
+        for t in entry_times:
+            try:
+                entry_time = parse_time_hhmm(t)
+                open_time = parse_time_hhmm(session_open_et)
+                entry_minutes = int(
+                    (dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds() / 60
+                )
+                entry_minutes = max(1, entry_minutes + 1)
+                max_entry_minutes = max(max_entry_minutes, entry_minutes)
+            except Exception:
+                max_entry_minutes = max(max_entry_minutes, 1)
+        minutes_needed = max(minutes_needed, max_entry_minutes)
     if minutes_needed > 0 and bars_intraday is None:
-        bars_intraday = get_intraday_bars(signal.symbol, entry_date, minutes_needed, cfg=cfg, allow_fetch=True)
-    if apply_intraday_entry and bars_intraday:
-        entry_info = simulate_entry(signal, entry_time_et, "daily", bars, bars_intraday, cfg)
+        bars_intraday = get_intraday_bars(signal.symbol, signal.signal_date, minutes_needed, cfg=cfg, allow_fetch=True)
+    for entry_time_et in entry_times:
+        if entry_start_et and entry_end_et:
+            if not (entry_start_et <= entry_time_et <= entry_end_et):
+                continue
+        entry_info = simulate_entry(signal, entry_time_et, "daily", bars, None, cfg)
         if not entry_info:
-            return None
+            continue
         entry_price = float(entry_info["entry_price"])
         entry_date = str(entry_info["entry_date"])
         entry_idx = entry_info["entry_index"]
-    if apply_gap_filter:
-        if entry_idx is not None and entry_idx > 0:
-            try:
-                prev_close = float(bars[entry_idx - 1]["close"])
-                open_price = float(bars[entry_idx]["open"])
-            except Exception:
-                prev_close = 0.0
-                open_price = 0.0
-            if prev_close > 0 and open_price > 0:
-                gap_bps = ((open_price - prev_close) / prev_close) * 10000.0
-                if direction == "long" and min_gap_bps_long > 0 and gap_bps < min_gap_bps_long:
-                    return None
-                if direction == "short" and min_gap_bps_short > 0 and gap_bps > -min_gap_bps_short:
-                    return None
-    if apply_early_filter and early_range_minutes > 0 and max_early_pullback_bps > 0:
-        if not bars_intraday and intraday_filter_require:
-            return None
-        if bars_intraday:
+        if apply_intraday_entry and bars_intraday:
+            entry_info = simulate_entry(signal, entry_time_et, "daily", bars, bars_intraday, cfg)
+            if not entry_info:
+                continue
+            entry_price = float(entry_info["entry_price"])
+            entry_date = str(entry_info["entry_date"])
+            entry_idx = entry_info["entry_index"]
+        if apply_gap_filter:
+            if entry_idx is not None and entry_idx > 0:
+                try:
+                    prev_close = float(bars[entry_idx - 1]["close"])
+                    open_price = float(bars[entry_idx]["open"])
+                except Exception:
+                    prev_close = 0.0
+                    open_price = 0.0
+                if prev_close > 0 and open_price > 0:
+                    gap_bps = ((open_price - prev_close) / prev_close) * 10000.0
+                    if direction == "long" and min_gap_bps_long > 0 and gap_bps < min_gap_bps_long:
+                        continue
+                    if direction == "short" and min_gap_bps_short > 0 and gap_bps > -min_gap_bps_short:
+                        continue
+        if apply_early_filter and early_range_minutes > 0 and max_early_pullback_bps > 0:
+            if not bars_intraday and intraday_filter_require:
+                continue
+            if bars_intraday:
                 slice_end = min(len(bars_intraday), early_range_minutes)
                 window = bars_intraday[:slice_end]
                 lows = [float(b.get("low") or b.get("l") or 0.0) for b in window]
@@ -387,44 +405,45 @@ def build_trade(
                 if direction == "long" and min_low is not None and entry_price > 0:
                     pullback_bps = ((entry_price - min_low) / entry_price) * 10000.0
                     if pullback_bps >= max_early_pullback_bps:
-                        return None
+                        continue
                 if direction == "short" and max_high is not None and entry_price > 0:
                     pullback_bps = ((max_high - entry_price) / entry_price) * 10000.0
                     if pullback_bps >= max_early_pullback_bps:
-                        return None
-    atr_end_idx = entry_idx - 1
-    if entry_info.get("entry_source_date") != entry_date:
-        atr_end_idx = entry_idx
-    atr = compute_atr_daily(bars, atr_period, atr_end_idx)
-    if stop_mode == "atr":
-        if atr is None:
-            return None
-        stop_distance = atr * stop_atr_mult * stop_r
-    else:
-        stop_distance = entry_price * (stop_pct / 100.0) * stop_r
-    if stop_distance <= 0:
-        return None
-    if direction == "long":
-        stop_price = entry_price - stop_distance
-        target_price = entry_price + stop_distance * target_rr
-    else:
-        stop_price = entry_price + stop_distance
-        target_price = entry_price - stop_distance * target_rr
-    if intraday_only:
-        time_exit_idx = entry_idx
-    else:
-        time_exit_idx = min(entry_idx + time_exit_days, len(bars) - 1)
-    time_exit_date = str(bars[time_exit_idx]["date"])
-    return TradePlan(
-        symbol=signal.symbol,
-        direction=direction,
-        signal_date=signal.signal_date,
-        entry_date=entry_date,
-        entry_time_et=entry_time_et,
-        entry_price=entry_price,
-        stop_price=stop_price,
-        target_price=target_price,
-        time_exit_date=time_exit_date,
-        stop_distance=stop_distance,
-        target_rr=target_rr,
-    )
+                        continue
+        atr_end_idx = entry_idx - 1
+        if entry_info.get("entry_source_date") != entry_date:
+            atr_end_idx = entry_idx
+        atr = compute_atr_daily(bars, atr_period, atr_end_idx)
+        if stop_mode == "atr":
+            if atr is None:
+                continue
+            stop_distance = atr * stop_atr_mult * stop_r
+        else:
+            stop_distance = entry_price * (stop_pct / 100.0) * stop_r
+        if stop_distance <= 0:
+            continue
+        if direction == "long":
+            stop_price = entry_price - stop_distance
+            target_price = entry_price + stop_distance * target_rr
+        else:
+            stop_price = entry_price + stop_distance
+            target_price = entry_price - stop_distance * target_rr
+        if intraday_only:
+            time_exit_idx = entry_idx
+        else:
+            time_exit_idx = min(entry_idx + time_exit_days, len(bars) - 1)
+        time_exit_date = str(bars[time_exit_idx]["date"])
+        return TradePlan(
+            symbol=signal.symbol,
+            direction=direction,
+            signal_date=signal.signal_date,
+            entry_date=entry_date,
+            entry_time_et=entry_time_et,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            time_exit_date=time_exit_date,
+            stop_distance=stop_distance,
+            target_rr=target_rr,
+        )
+    return None
