@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import time
 import requests
+import logging
 
 from app.utils.time import ensure_date
 
@@ -159,7 +160,11 @@ class AlpacaOHLCStore:
         out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
         for i in range(0, len(symbols), chunk_size):
             chunk = symbols[i : i + chunk_size]
-            fetched = self._fetch_bars_alpaca(chunk, start_date, end_date, cfg)
+            try:
+                fetched = self._fetch_bars_alpaca(chunk, start_date, end_date, cfg)
+            except Exception as exc:
+                logging.warning("[DAILY] fetch failed chunk=%s start=%s end=%s: %s", chunk, start_date, end_date, exc)
+                continue
             for sym, bars in fetched.items():
                 out.setdefault(sym, []).extend(bars)
         return out

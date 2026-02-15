@@ -7,8 +7,8 @@ import time
 from app.config.loader import load_config
 from app.brokers.alpaca import AlpacaBroker
 from app.live.minute_report import log_account_summary, log_minute_report
-from app.live.runner import run_flatten, run_live
-from app.utils.time import ET_TZ, et_now, parse_time_hhmm
+from app.live.runner import enforce_time_stop, run_flatten, run_live
+from app.utils.time import ensure_et, et_now, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
 from app.watchlist.storage import read_watchlist, expected_watchlist_date_str
 
@@ -26,6 +26,9 @@ def _schedule_for_day(cfg: dict, day: dt.date) -> tuple[dt.datetime, list[dt.dat
     params = cfg.get("daily_trend_reversal") or {}
     watchlist_time_str = str(params.get("watchlist_time_et") or "03:00")
     entry_time_str = str(params.get("entry_time_et") or params.get("entry_start_et") or "09:35")
+    confirm_move_bps = float(params.get("confirm_move_bps") or 0.0)
+    confirm_minutes = int(params.get("confirm_minutes") or 0)
+    apply_confirm = confirm_move_bps > 0 and confirm_minutes > 0
     entry_times_raw = params.get("entry_times_et")
     if isinstance(entry_times_raw, list) and entry_times_raw:
         entry_time_strs = [str(t) for t in entry_times_raw if t]
@@ -39,9 +42,17 @@ def _schedule_for_day(cfg: dict, day: dt.date) -> tuple[dt.datetime, list[dt.dat
     entry_times = [parse_time_hhmm(t) for t in entry_time_strs]
     close_time = parse_time_hhmm(session_close_str)
 
-    base = dt.datetime.combine(day, watchlist_time).replace(tzinfo=ET_TZ)
-    entry_dts = [dt.datetime.combine(day, t).replace(tzinfo=ET_TZ) for t in entry_times]
-    close_dt = dt.datetime.combine(day, close_time).replace(tzinfo=ET_TZ)
+    # NOTE: ET_TZ is a pytz timezone in our environment; we must localize (ensure_et)
+    # rather than doing .replace(tzinfo=ET_TZ), otherwise DST/LMT offsets are wrong.
+    base = ensure_et(dt.datetime.combine(day, watchlist_time))
+    entry_dts = [
+        ensure_et(
+            dt.datetime.combine(day, t)
+            + (dt.timedelta(minutes=confirm_minutes) if apply_confirm else dt.timedelta())
+        )
+        for t in entry_times
+    ]
+    close_dt = ensure_et(dt.datetime.combine(day, close_time))
     flatten_dt = close_dt - dt.timedelta(minutes=flatten_buffer)
     return base, entry_dts, flatten_dt
 
@@ -149,6 +160,7 @@ def main() -> None:
             while et_now() < report_until:
                 broker = AlpacaBroker(cfg)
                 try:
+                    enforce_time_stop(cfg, broker)
                     log_minute_report(cfg, broker, plans)
                 except Exception as exc:
                     logging.error("[LIVE] minute report failed: %s", exc)

@@ -40,6 +40,12 @@ def ensure_date(val: str | dt.date | dt.datetime) -> dt.date:
 
 def ensure_et(ts: dt.datetime) -> dt.datetime:
     if ts.tzinfo is None:
+        # pytz requires localize to set the correct offset/DST
+        if hasattr(ET_TZ, "localize"):
+            try:
+                return ET_TZ.localize(ts)  # type: ignore[attr-defined]
+            except Exception:
+                return ts.replace(tzinfo=ET_TZ)
         return ts.replace(tzinfo=ET_TZ)
     try:
         return ts.astimezone(ET_TZ)

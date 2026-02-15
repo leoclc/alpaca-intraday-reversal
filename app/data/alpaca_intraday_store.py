@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from app.utils.time import ET_TZ, ensure_date, parse_time_hhmm
+from app.utils.time import ET_TZ, ensure_date, ensure_et, parse_time_hhmm
 
 _MEM_CACHE: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = {}
 
@@ -41,9 +41,9 @@ def _parse_timestamp(val: Any) -> Optional[dt.datetime]:
 def _session_window(session_date: dt.date, minutes: int, cfg: dict) -> Tuple[dt.datetime, dt.datetime]:
     params = cfg.get("daily_trend_reversal") or {}
     session_open_et = str(params.get("session_open_et") or "09:30")
-    start_et = dt.datetime.combine(session_date, parse_time_hhmm(session_open_et))
-    if start_et.tzinfo is None:
-        start_et = start_et.replace(tzinfo=ET_TZ)
+    # NOTE: ET_TZ is a pytz timezone in our environment; we must localize (ensure_et)
+    # rather than doing .replace(tzinfo=ET_TZ), otherwise DST/LMT offsets are wrong.
+    start_et = ensure_et(dt.datetime.combine(session_date, parse_time_hhmm(session_open_et)))
     end_et = start_et + dt.timedelta(minutes=max(1, int(minutes)))
     start_utc = start_et.astimezone(dt.timezone.utc)
     end_utc = end_et.astimezone(dt.timezone.utc)
@@ -216,8 +216,35 @@ def get_intraday_bars(
         try:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
             if isinstance(cached, list):
-                _MEM_CACHE[cache_key] = cached
-                return cached
+                # Cache safety: older runs used a broken pytz tzinfo attach which can shift the
+                # session window after DST and make backtests silently stop trading.
+                #
+                # If the cached slice doesn't include the session open bar (e.g. 09:30 ET),
+                # treat it as stale and refetch.
+                params = cfg.get("daily_trend_reversal") or {}
+                session_open_et = str(params.get("session_open_et") or "09:30")
+                open_time = parse_time_hhmm(session_open_et)
+                has_open = False
+                for row in cached:
+                    ts = _parse_timestamp(row.get("timestamp") or row.get("t") or row.get("time") or row.get("date"))
+                    if not ts:
+                        continue
+                    ts_et = ensure_et(ts)
+                    if ts_et.hour == open_time.hour and ts_et.minute == open_time.minute:
+                        has_open = True
+                        break
+                if not has_open:
+                    # Stale cache is not an error; we will refetch below. Keep this at DEBUG to
+                    # avoid spamming INFO logs during large backtests.
+                    logging.debug(
+                        "[INTRADAY] cache stale (missing session open bar); refetching sym=%s date=%s minutes=%s",
+                        str(symbol).upper(),
+                        session_dt.isoformat(),
+                        minutes,
+                    )
+                else:
+                    _MEM_CACHE[cache_key] = cached
+                    return cached
         except Exception:
             pass
     if not allow_fetch:
@@ -235,6 +262,30 @@ def get_intraday_bars(
             pass
     _MEM_CACHE[cache_key] = bars
     return bars
+
+
+def filter_intraday_bars_until(
+    bars: List[Dict[str, Any]],
+    session_date: str | dt.date,
+    entry_time_et: str,
+) -> List[Dict[str, Any]]:
+    if not bars:
+        return []
+    entry_dt = ensure_et(dt.datetime.combine(ensure_date(session_date), parse_time_hhmm(entry_time_et)))
+    out: List[Dict[str, Any]] = []
+    for row in bars:
+        ts = _parse_timestamp(row.get("timestamp") or row.get("t") or row.get("time") or row.get("date"))
+        if not ts:
+            continue
+        ts = ensure_et(ts)
+        # Strict "known up to entry_time" parity with live:
+        # at 09:35 you do NOT yet have the 09:35 bar via minute-bars APIs; you only have completed bars strictly
+        # before the entry timestamp.
+        if ts < entry_dt:
+            out.append(row)
+        else:
+            break
+    return out
 
 
 def get_latest_intraday_prices(

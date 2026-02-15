@@ -25,6 +25,20 @@ class TradePlan:
     time_exit_date: str
     stop_distance: float
     target_rr: float
+    target_mode: str | None = None
+    target_window_avg_pct: float | None = None
+    target_window_mult: float | None = None
+    target_window_minutes: int | None = None
+    target_window_samples: int | None = None
+    gap_bps: float | None = None
+    early_pullback_bps: float | None = None
+    confirm_move_bps: float | None = None
+    confirm_minutes: int | None = None
+    confirm_hit_bps: float | None = None
+    signal_return_pct: float | None = None
+    signal_return_atr: float | None = None
+    atr: float | None = None
+    entry_price_mode: str | None = None
 
 
 @dataclass
@@ -35,3 +49,7 @@ class TradeResult:
     exit_reason: str
     pnl_pct: float
     r_multiple: float
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
+    mfe_r: float | None = None
+    mae_r: float | None = None

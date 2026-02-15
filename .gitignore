@@ -2,3 +2,14 @@ logs
 watchlists
 cache
 alpaca-ohlc
+app.zip
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local config (may contain credentials)
+config.local.json
+config.backup.*.json
+config.wip.json

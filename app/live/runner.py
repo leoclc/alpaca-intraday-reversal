@@ -7,11 +7,11 @@ from typing import Dict, List, Optional
 from app.brokers.alpaca import AlpacaBroker
 from app.config.loader import load_config
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
-from app.data.alpaca_intraday_store import get_intraday_bars
+from app.data.alpaca_intraday_store import get_intraday_bars, get_latest_intraday_prices
 from app.market.filters import market_filter_decision
 from app.portfolio.sizing import compute_qty_with_guards
 from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
-from app.utils.time import et_now, parse_time_hhmm
+from app.utils.time import ensure_et, et_now, parse_time_hhmm
 from app.watchlist.storage import expected_watchlist_date_str, read_watchlist
 
 
@@ -106,6 +106,79 @@ def flatten_intraday_positions_if_needed(cfg: Dict, broker: AlpacaBroker) -> Lis
     return closed
 
 
+def _parse_iso_ts(val: Optional[str]) -> Optional[dt.datetime]:
+    if not val:
+        return None
+    ts = str(val).strip()
+    if ts.endswith("Z"):
+        ts = ts.replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(ts)
+    except Exception:
+        return None
+    return ensure_et(parsed)
+
+
+def enforce_time_stop(cfg: Dict, broker: AlpacaBroker) -> List[str]:
+    params = cfg.get("daily_trend_reversal") or {}
+    time_stop_minutes = int(params.get("time_stop_minutes") or 0)
+    if time_stop_minutes <= 0:
+        return []
+    if not broker.ready():
+        logging.error("[LIVE] Alpaca credentials missing; cannot enforce time stop")
+        return []
+    try:
+        positions = broker.list_positions() or []
+    except Exception as exc:
+        logging.error("[LIVE] time stop failed to list positions error=%s", exc)
+        return []
+    if not positions:
+        return []
+    symbols = [str(p.get("symbol") or "").upper() for p in positions if p.get("symbol")]
+    if not symbols:
+        return []
+    now = et_now()
+    session_open_et = str(params.get("session_open_et") or "09:30")
+    open_time = parse_time_hhmm(session_open_et)
+    after_dt = ensure_et(dt.datetime.combine(now.date(), open_time) - dt.timedelta(minutes=1))
+    try:
+        orders = broker.list_orders(status="filled", symbols=symbols, after=after_dt.isoformat())
+    except Exception as exc:
+        logging.error("[LIVE] time stop failed to list orders error=%s", exc)
+        return []
+    latest_fill: Dict[str, dt.datetime] = {}
+    for order in orders or []:
+        sym = str(order.get("symbol") or "").upper()
+        filled_at = _parse_iso_ts(order.get("filled_at") or order.get("updated_at") or order.get("submitted_at"))
+        if not sym or not filled_at:
+            continue
+        prev = latest_fill.get(sym)
+        if not prev or filled_at > prev:
+            latest_fill[sym] = filled_at
+    closed: List[str] = []
+    for pos in positions:
+        sym = str(pos.get("symbol") or "").upper()
+        if not sym:
+            continue
+        entry_dt = latest_fill.get(sym)
+        if not entry_dt:
+            continue
+        cutoff = entry_dt + dt.timedelta(minutes=time_stop_minutes)
+        if now < cutoff:
+            continue
+        try:
+            broker.cancel_orders(symbol=sym)
+        except Exception as exc:
+            logging.error("[LIVE] time stop cancel orders failed symbol=%s error=%s", sym, exc)
+        try:
+            broker.close_position(sym)
+            closed.append(sym)
+            logging.info("[LIVE] time_stop close symbol=%s entry=%s cutoff=%s now=%s", sym, entry_dt, cutoff, now)
+        except Exception as exc:
+            logging.error("[LIVE] time stop close failed symbol=%s error=%s", sym, exc)
+    return closed
+
+
 def run_live(
     cfg: Optional[Dict] = None,
     target_date: Optional[str] = None,
@@ -129,6 +202,11 @@ def run_live(
         logging.info("[LIVE] market filter skip date=%s info=%s", tgt, info)
         return ([], []) if return_plans else []
     symbols = [str(r.get("symbol") or "").upper() for r in wl.get("watchlist") or [] if r.get("symbol")]
+    symbol_overrides = {
+        str(r.get("symbol") or "").upper(): (r.get("param_overrides") or {})
+        for r in wl.get("watchlist") or []
+        if r.get("symbol")
+    }
     if symbols_allow is not None:
         symbols = [s for s in symbols if s in symbols_allow]
     entry_type = str(params.get("entry_order_type") or "market").lower()
@@ -167,21 +245,25 @@ def run_live(
         intraday_filter_enabled = bool(params.get("intraday_filter_enabled", False))
         early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
         time_stop_minutes = int(params.get("time_stop_minutes") or 0)
+        confirm_move_bps = float(params.get("confirm_move_bps") or 0.0)
+        confirm_minutes = int(params.get("confirm_minutes") or 0)
         minutes_needed = max(early_range_minutes, time_stop_minutes)
-        if bool(params.get("use_intraday_entry", False)):
-            try:
-                entry_time_str = entry_time_et or str(params.get("entry_time_et") or "09:35")
-                session_open_et = str(params.get("session_open_et") or "09:30")
-                entry_time = parse_time_hhmm(entry_time_str)
-                open_time = parse_time_hhmm(session_open_et)
-                entry_minutes = int(
-                    (dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds()
-                    / 60
-                )
-                entry_minutes = max(1, entry_minutes + 1)
+        try:
+            entry_time_str = entry_time_et or str(params.get("entry_time_et") or "09:35")
+            session_open_et = str(params.get("session_open_et") or "09:30")
+            entry_time = parse_time_hhmm(entry_time_str)
+            open_time = parse_time_hhmm(session_open_et)
+            entry_minutes = int(
+                (dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds()
+                / 60
+            )
+            entry_minutes = max(1, entry_minutes + 1)
+            if bool(params.get("use_intraday_entry", False)):
                 minutes_needed = max(minutes_needed, entry_minutes)
-            except Exception:
-                minutes_needed = max(minutes_needed, 1)
+            if confirm_move_bps > 0 and confirm_minutes > 0:
+                minutes_needed = max(minutes_needed, entry_minutes + confirm_minutes)
+        except Exception:
+            minutes_needed = max(minutes_needed, 1)
         bars_intraday = None
         if minutes_needed > 0:
             bars_intraday = get_intraday_bars(symbol, tgt, minutes_needed, cfg=cfg, allow_fetch=True)
@@ -205,6 +287,7 @@ def run_live(
             context="live",
             bars_intraday=bars_intraday,
             entry_time_override=entry_time_et,
+            param_overrides=symbol_overrides.get(symbol) or None,
         )
         if not plan:
             _log_debug("symbol=%s no_plan", symbol)
@@ -219,6 +302,13 @@ def run_live(
             plan.stop_distance,
             plan.target_rr,
         )
+        base_price = None
+        if entry_type == "market":
+            latest = get_latest_intraday_prices([symbol], cfg=cfg, lookback_minutes=1)
+            base_price = latest.get(symbol)
+            if base_price is None:
+                base_price = plan.entry_price
+            _log_debug("symbol=%s base_price=%s", symbol, base_price)
         qty, state, allowed_total, used_notional, open_positions = _compute_qty(cfg, plan, broker)
         _log_debug(
             "symbol=%s qty=%s allowed_total=%.2f used_notional=%.2f open_positions=%s state=%s",
@@ -243,6 +333,7 @@ def run_live(
                     qty=qty,
                     entry_type=entry_type,
                     entry_price=plan.entry_price if entry_type == "limit" else None,
+                    base_price=base_price,
                     take_profit=plan.target_price,
                     stop_loss=plan.stop_price,
                     tif=tif,

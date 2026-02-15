@@ -46,6 +46,7 @@ class AlpacaBroker:
         qty: int,
         entry_type: str,
         entry_price: Optional[float],
+        base_price: Optional[float],
         take_profit: float,
         stop_loss: float,
         tif: str = "day",
@@ -57,7 +58,9 @@ class AlpacaBroker:
         def _min_tick(base: float) -> float:
             return 0.01 if base >= 1 else 0.0001
 
-        base_price = float(entry_price) if entry_price is not None else float(take_profit)
+        if base_price is None:
+            base_price = float(entry_price) if entry_price is not None else float(take_profit)
+        base_price = float(base_price)
         tick = _min_tick(base_price)
         tp = float(take_profit)
         sl = float(stop_loss)
@@ -97,6 +100,45 @@ class AlpacaBroker:
         resp = requests.get(url, headers=self._headers(), timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
+
+    def list_orders(
+        self,
+        status: str = "open",
+        symbols: Optional[list[str]] = None,
+        after: Optional[str] = None,
+        until: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        if not self.ready():
+            raise RuntimeError("Alpaca credentials missing")
+        url = f"{self.base_url}/v2/orders"
+        params: Dict[str, Any] = {"status": status, "limit": int(limit)}
+        if symbols:
+            params["symbols"] = ",".join(symbols)
+        if after:
+            params["after"] = after
+        if until:
+            params["until"] = until
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def cancel_orders(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        if not self.ready():
+            raise RuntimeError("Alpaca credentials missing")
+        url = f"{self.base_url}/v2/orders"
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        resp = requests.delete(url, headers=self._headers(), params=params, timeout=self.timeout)
+        if resp.status_code not in (200, 204):
+            resp.raise_for_status()
+        if resp.content:
+            try:
+                return resp.json()
+            except Exception:
+                return {}
+        return {}
 
     def close_position(self, symbol: str) -> Dict[str, Any]:
         if not self.ready():

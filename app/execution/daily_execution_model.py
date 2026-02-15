@@ -152,6 +152,8 @@ def simulate_exit(
         cutoff = entry_dt + dt.timedelta(minutes=time_stop_minutes)
         stop_first = bool(params.get("stop_first_when_both", True))
         direction = str(trade_plan.direction).lower()
+        mfe_val = 0.0
+        mae_val = 0.0
         last_bar = None
         for bar in bars_intraday:
             ts = _parse_intraday_ts(bar)
@@ -166,26 +168,66 @@ def simulate_exit(
             high = float(bar.get("high") or bar.get("h") or bar.get("High") or 0.0)
             low = float(bar.get("low") or bar.get("l") or bar.get("Low") or 0.0)
             if direction == "long":
+                mfe_val = max(mfe_val, high - trade_plan.entry_price)
+                mae_val = min(mae_val, low - trade_plan.entry_price)
                 hit_stop = low <= trade_plan.stop_price
                 hit_target = high >= trade_plan.target_price
             else:
+                mfe_val = max(mfe_val, trade_plan.entry_price - low)
+                mae_val = min(mae_val, trade_plan.entry_price - high)
                 hit_stop = high >= trade_plan.stop_price
                 hit_target = low <= trade_plan.target_price
+            mfe_pct = (mfe_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
+            mae_pct = (mae_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
+            mfe_r = (mfe_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
+            mae_r = (mae_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
             if hit_stop and hit_target:
                 reason = "stop" if stop_first else "target"
                 price = trade_plan.stop_price if stop_first else trade_plan.target_price
-                return {"exit_date": trade_plan.entry_date, "exit_price": price, "exit_reason": reason}
+                return {
+                    "exit_date": trade_plan.entry_date,
+                    "exit_price": price,
+                    "exit_reason": reason,
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": mae_pct,
+                    "mfe_r": mfe_r,
+                    "mae_r": mae_r,
+                }
             if hit_stop:
-                return {"exit_date": trade_plan.entry_date, "exit_price": trade_plan.stop_price, "exit_reason": "stop"}
+                return {
+                    "exit_date": trade_plan.entry_date,
+                    "exit_price": trade_plan.stop_price,
+                    "exit_reason": "stop",
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": mae_pct,
+                    "mfe_r": mfe_r,
+                    "mae_r": mae_r,
+                }
             if hit_target:
                 return {
                     "exit_date": trade_plan.entry_date,
                     "exit_price": trade_plan.target_price,
                     "exit_reason": "target",
+                    "mfe_pct": mfe_pct,
+                    "mae_pct": mae_pct,
+                    "mfe_r": mfe_r,
+                    "mae_r": mae_r,
                 }
         if last_bar:
             close_price = float(last_bar.get("close") or last_bar.get("c") or last_bar.get("Close") or 0.0)
-            return {"exit_date": trade_plan.entry_date, "exit_price": close_price, "exit_reason": "time_stop"}
+            mfe_pct = (mfe_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
+            mae_pct = (mae_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
+            mfe_r = (mfe_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
+            mae_r = (mae_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
+            return {
+                "exit_date": trade_plan.entry_date,
+                "exit_price": close_price,
+                "exit_reason": "time_stop",
+                "mfe_pct": mfe_pct,
+                "mae_pct": mae_pct,
+                "mfe_r": mfe_r,
+                "mae_r": mae_r,
+            }
     intraday_only = bool((cfg.get("daily_trend_reversal") or {}).get("intraday_only", False))
     if intraday_only:
         exit_idx = entry_idx
