@@ -7,7 +7,11 @@ from typing import Dict, List, Optional
 from app.brokers.alpaca import AlpacaBroker
 from app.config.loader import load_config
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
-from app.data.alpaca_intraday_store import get_intraday_bars, get_latest_intraday_prices
+from app.data.alpaca_intraday_store import (
+    filter_intraday_bars_until,
+    get_intraday_bars,
+    get_latest_intraday_prices,
+)
 from app.market.filters import market_filter_decision
 from app.portfolio.sizing import compute_qty_with_guards
 from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
@@ -280,12 +284,39 @@ def run_live(
                     bars_intraday[0].get("timestamp") if bars_intraday else None,
                     bars_intraday[-1].get("timestamp") if bars_intraday else None,
                 )
+        bars_intraday_entry = bars_intraday
+        # If confirmation is enabled, ensure we have enough intraday bars to evaluate it.
+        # Otherwise a run at (e.g.) 09:35 will incorrectly treat "not yet" as "failed confirmation".
+        if confirm_move_bps > 0 and confirm_minutes > 0:
+            try:
+                entry_time_str = entry_time_et or str(params.get("entry_time_et") or "09:35")
+                entry_dt = ensure_et(dt.datetime.combine(dt.date.fromisoformat(tgt), parse_time_hhmm(entry_time_str)))
+                cutoff_dt = entry_dt + dt.timedelta(minutes=confirm_minutes)
+                cutoff_time_et = cutoff_dt.strftime("%H:%M")
+                if bars_intraday:
+                    # Parity with replay/backtests: only include bars strictly before the cutoff time.
+                    bars_intraday_entry = filter_intraday_bars_until(bars_intraday, tgt, cutoff_time_et)
+                required_last = cutoff_dt - dt.timedelta(minutes=1)
+                last_ts = None
+                if bars_intraday_entry:
+                    last_ts = _parse_iso_ts(str(bars_intraday_entry[-1].get("timestamp") or ""))
+                if last_ts is None or last_ts < required_last:
+                    _log_debug(
+                        "symbol=%s confirm_pending last_bar=%s required_last=%s (run after cutoff to evaluate confirm)",
+                        symbol,
+                        last_ts,
+                        required_last,
+                    )
+                    continue
+            except Exception:
+                # If anything about the timestamps is weird, just fall back to the existing behavior.
+                pass
         plan = build_trade(
             signal,
             cfg,
             data_store,
             context="live",
-            bars_intraday=bars_intraday,
+            bars_intraday=bars_intraday_entry,
             entry_time_override=entry_time_et,
             param_overrides=symbol_overrides.get(symbol) or None,
         )

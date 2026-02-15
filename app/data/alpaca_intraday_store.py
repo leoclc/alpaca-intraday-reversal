@@ -212,28 +212,70 @@ def get_intraday_bars(
     if cache_key in _MEM_CACHE:
         return _MEM_CACHE[cache_key]
     refresh = bool(cfg.get("minute_bars_refresh", False))
+
+    def _has_open_bar(rows: List[Dict[str, Any]]) -> bool:
+        params = cfg.get("daily_trend_reversal") or {}
+        session_open_et = str(params.get("session_open_et") or "09:30")
+        open_time = parse_time_hhmm(session_open_et)
+        for row in rows or []:
+            ts = _parse_timestamp(row.get("timestamp") or row.get("t") or row.get("time") or row.get("date"))
+            if not ts:
+                continue
+            ts_et = ensure_et(ts)
+            if ts_et.hour == open_time.hour and ts_et.minute == open_time.minute:
+                return True
+        return False
+
+    def _slice_to_minutes(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        params = cfg.get("daily_trend_reversal") or {}
+        session_open_et = str(params.get("session_open_et") or "09:30")
+        try:
+            open_dt = ensure_et(dt.datetime.combine(session_dt, parse_time_hhmm(session_open_et)))
+            cutoff_dt = open_dt + dt.timedelta(minutes=max(1, int(minutes)))
+            cutoff_time_et = cutoff_dt.strftime("%H:%M")
+        except Exception:
+            # Fallback: if timestamps are weird, just return full cached slice.
+            return list(rows)
+        return filter_intraday_bars_until(rows, session_dt, cutoff_time_et)
+
+    def _find_alt_cache_file() -> Optional[Path]:
+        # If an exact (symbol, date, minutes) cache doesn't exist, try reusing a cached slice with
+        # >= minutes and then slicing down. This speeds up parameter sweeps where minutes_needed changes.
+        if refresh:
+            return None
+        sym_dir = (cache_dir / str(symbol).upper().strip())
+        if not sym_dir.exists():
+            return None
+        date_prefix = f"{session_dt.isoformat()}_"
+        candidates: List[Tuple[int, Path]] = []
+        try:
+            for p in sym_dir.glob(f"{session_dt.isoformat()}_*m.json"):
+                name = p.name
+                if not name.startswith(date_prefix):
+                    continue
+                # Expected: YYYY-MM-DD_<minutes>m.json
+                try:
+                    rest = name[len(date_prefix) :]
+                    if not rest.endswith("m.json"):
+                        continue
+                    mins_str = rest[: -len("m.json")]
+                    m = int(mins_str)
+                except Exception:
+                    continue
+                if m >= minutes:
+                    candidates.append((m, p))
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        candidates.sort(key=lambda t: t[0])
+        return candidates[0][1]
+
     if cache_file.exists() and not refresh:
         try:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
             if isinstance(cached, list):
-                # Cache safety: older runs used a broken pytz tzinfo attach which can shift the
-                # session window after DST and make backtests silently stop trading.
-                #
-                # If the cached slice doesn't include the session open bar (e.g. 09:30 ET),
-                # treat it as stale and refetch.
-                params = cfg.get("daily_trend_reversal") or {}
-                session_open_et = str(params.get("session_open_et") or "09:30")
-                open_time = parse_time_hhmm(session_open_et)
-                has_open = False
-                for row in cached:
-                    ts = _parse_timestamp(row.get("timestamp") or row.get("t") or row.get("time") or row.get("date"))
-                    if not ts:
-                        continue
-                    ts_et = ensure_et(ts)
-                    if ts_et.hour == open_time.hour and ts_et.minute == open_time.minute:
-                        has_open = True
-                        break
-                if not has_open:
+                if not _has_open_bar(cached):
                     # Stale cache is not an error; we will refetch below. Keep this at DEBUG to
                     # avoid spamming INFO logs during large backtests.
                     logging.debug(
@@ -247,6 +289,25 @@ def get_intraday_bars(
                     return cached
         except Exception:
             pass
+    # If exact cache is missing or stale, try reusing a larger cached slice and slice it down.
+    if not refresh:
+        alt = _find_alt_cache_file()
+        if alt is not None and alt.exists():
+            try:
+                cached = json.loads(alt.read_text(encoding="utf-8"))
+                if isinstance(cached, list) and cached and _has_open_bar(cached):
+                    sliced = _slice_to_minutes(cached)
+                    _MEM_CACHE[cache_key] = sliced
+                    # Persist the sliced result so subsequent runs can hit the exact cache file directly.
+                    try:
+                        if sliced and not cache_file.exists():
+                            cache_file.parent.mkdir(parents=True, exist_ok=True)
+                            cache_file.write_text(json.dumps(sliced), encoding="utf-8")
+                    except Exception:
+                        pass
+                    return sliced
+            except Exception:
+                pass
     if not allow_fetch:
         return []
     try:

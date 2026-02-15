@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional
 
 from app.utils.time import ensure_date, ensure_et, parse_time_hhmm
 
+_SMA_CACHE: Dict[tuple, Optional[float]] = {}
+_ATR_CACHE: Dict[tuple, Optional[float]] = {}
+
 
 def _find_bar_index(bars: List[Dict[str, Any]], date_str: str) -> Optional[int]:
     for idx, bar in enumerate(bars):
@@ -24,25 +27,39 @@ def _parse_intraday_ts(bar: Dict[str, Any]) -> Optional[dt.datetime]:
 
 
 def compute_sma(bars: List[Dict[str, Any]], period: int, end_index: int) -> Optional[float]:
+    cache_key = (id(bars), int(period), int(end_index))
+    if cache_key in _SMA_CACHE:
+        return _SMA_CACHE[cache_key]
     if period <= 0 or end_index < 0:
+        _SMA_CACHE[cache_key] = None
         return None
     start = end_index - period + 1
     if start < 0:
+        _SMA_CACHE[cache_key] = None
         return None
     try:
         closes = [float(bars[i]["close"]) for i in range(start, end_index + 1)]
     except Exception:
+        _SMA_CACHE[cache_key] = None
         return None
     if not closes:
+        _SMA_CACHE[cache_key] = None
         return None
-    return sum(closes) / float(len(closes))
+    val = sum(closes) / float(len(closes))
+    _SMA_CACHE[cache_key] = val
+    return val
 
 
 def compute_atr_daily(bars: List[Dict[str, Any]], period: int, end_index: int) -> Optional[float]:
+    cache_key = (id(bars), int(period), int(end_index))
+    if cache_key in _ATR_CACHE:
+        return _ATR_CACHE[cache_key]
     if period <= 0 or end_index <= 0:
+        _ATR_CACHE[cache_key] = None
         return None
     start = end_index - period + 1
     if start < 1:
+        _ATR_CACHE[cache_key] = None
         return None
     trs: List[float] = []
     for i in range(start, end_index + 1):
@@ -51,12 +68,16 @@ def compute_atr_daily(bars: List[Dict[str, Any]], period: int, end_index: int) -
             low = float(bars[i]["low"])
             prev_close = float(bars[i - 1]["close"])
         except Exception:
+            _ATR_CACHE[cache_key] = None
             return None
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     if not trs:
+        _ATR_CACHE[cache_key] = None
         return None
-    return sum(trs) / float(len(trs))
+    val = sum(trs) / float(len(trs))
+    _ATR_CACHE[cache_key] = val
+    return val
 
 
 def simulate_entry(
@@ -145,16 +166,39 @@ def simulate_exit(
     if entry_idx is None:
         return None
     params = cfg.get("daily_trend_reversal") or {}
+    intraday_only = bool(params.get("intraday_only", False))
     time_stop_minutes = int(params.get("time_stop_minutes") or 0)
-    if bars_intraday and time_stop_minutes > 0:
-        entry_time = parse_time_hhmm(trade_plan.entry_time_et)
-        entry_dt = ensure_et(dt.datetime.combine(ensure_date(trade_plan.entry_date), entry_time))
-        cutoff = entry_dt + dt.timedelta(minutes=time_stop_minutes)
+    require_intraday_exit = bool(params.get("require_intraday_exit", intraday_only or time_stop_minutes > 0))
+
+    entry_time = parse_time_hhmm(trade_plan.entry_time_et)
+    entry_dt = ensure_et(dt.datetime.combine(ensure_date(trade_plan.entry_date), entry_time))
+
+    time_stop_cutoff: Optional[dt.datetime] = None
+    if time_stop_minutes > 0:
+        time_stop_cutoff = entry_dt + dt.timedelta(minutes=time_stop_minutes)
+
+    flatten_dt: Optional[dt.datetime] = None
+    if intraday_only:
+        session_close_et = str(params.get("session_close_et") or "16:00")
+        flatten_buffer = int(params.get("flatten_buffer_minutes") or 0)
+        close_dt = ensure_et(dt.datetime.combine(ensure_date(trade_plan.entry_date), parse_time_hhmm(session_close_et)))
+        flatten_dt = close_dt - dt.timedelta(minutes=max(0, flatten_buffer))
+
+    cutoff: Optional[dt.datetime] = time_stop_cutoff
+    if flatten_dt is not None:
+        cutoff = flatten_dt if cutoff is None else min(cutoff, flatten_dt)
+
+    # Intraday exit simulation: resolves stop/target ordering without falling back to daily OHLC.
+    # If intraday is required but unavailable, skip the trade (no "guessing" from daily bars).
+    if cutoff is not None and require_intraday_exit:
+        if not bars_intraday:
+            return None
         stop_first = bool(params.get("stop_first_when_both", True))
         direction = str(trade_plan.direction).lower()
         mfe_val = 0.0
         mae_val = 0.0
         last_bar = None
+        last_ts = None
         for bar in bars_intraday:
             ts = _parse_intraday_ts(bar)
             if not ts:
@@ -162,9 +206,11 @@ def simulate_exit(
             ts = ensure_et(ts)
             if ts < entry_dt:
                 continue
-            if ts > cutoff:
+            # Strict parity: at the cutoff timestamp you do not yet have the in-progress bar.
+            if ts >= cutoff:
                 break
             last_bar = bar
+            last_ts = ts
             high = float(bar.get("high") or bar.get("h") or bar.get("High") or 0.0)
             low = float(bar.get("low") or bar.get("l") or bar.get("Low") or 0.0)
             if direction == "long":
@@ -192,6 +238,7 @@ def simulate_exit(
                     "mae_pct": mae_pct,
                     "mfe_r": mfe_r,
                     "mae_r": mae_r,
+                    "exit_ts": last_ts.isoformat() if last_ts else None,
                 }
             if hit_stop:
                 return {
@@ -202,6 +249,7 @@ def simulate_exit(
                     "mae_pct": mae_pct,
                     "mfe_r": mfe_r,
                     "mae_r": mae_r,
+                    "exit_ts": last_ts.isoformat() if last_ts else None,
                 }
             if hit_target:
                 return {
@@ -212,23 +260,30 @@ def simulate_exit(
                     "mae_pct": mae_pct,
                     "mfe_r": mfe_r,
                     "mae_r": mae_r,
+                    "exit_ts": last_ts.isoformat() if last_ts else None,
                 }
-        if last_bar:
-            close_price = float(last_bar.get("close") or last_bar.get("c") or last_bar.get("Close") or 0.0)
-            mfe_pct = (mfe_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
-            mae_pct = (mae_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
-            mfe_r = (mfe_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
-            mae_r = (mae_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
-            return {
-                "exit_date": trade_plan.entry_date,
-                "exit_price": close_price,
-                "exit_reason": "time_stop",
-                "mfe_pct": mfe_pct,
-                "mae_pct": mae_pct,
-                "mfe_r": mfe_r,
-                "mae_r": mae_r,
-            }
-    intraday_only = bool((cfg.get("daily_trend_reversal") or {}).get("intraday_only", False))
+        if not last_bar:
+            return None
+        close_price = float(last_bar.get("close") or last_bar.get("c") or last_bar.get("Close") or 0.0)
+        mfe_pct = (mfe_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
+        mae_pct = (mae_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
+        mfe_r = (mfe_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
+        mae_r = (mae_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
+        exit_reason = "time_stop"
+        if intraday_only and flatten_dt is not None and cutoff == flatten_dt:
+            if time_stop_cutoff is None or flatten_dt <= time_stop_cutoff:
+                exit_reason = "eod_flat"
+        return {
+            "exit_date": trade_plan.entry_date,
+            "exit_price": close_price,
+            "exit_reason": exit_reason,
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "mfe_r": mfe_r,
+            "mae_r": mae_r,
+            "exit_ts": last_ts.isoformat() if last_ts else None,
+        }
+
     if intraday_only:
         exit_idx = entry_idx
     else:

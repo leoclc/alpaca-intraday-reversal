@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import os
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from app.data.alpaca_intraday_store import get_intraday_bars
@@ -11,6 +14,93 @@ from app.utils.time import ensure_date, ensure_et, parse_time_hhmm
 
 _TARGET_CACHE: Dict[tuple, Optional[Dict[str, float]]] = {}
 _TARGET_DAY_CACHE: Dict[tuple, Dict[str, Optional[float]]] = {}
+_TARGET_DAY_CACHE_LOADED: set[tuple] = set()
+
+
+def _safe_cache_token(val: str) -> str:
+    s = str(val or "").strip().replace(":", "")
+    out: List[str] = []
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_"):
+            out.append(ch)
+    return "".join(out) or "x"
+
+
+def _target_window_cache_dir(cfg: Dict) -> Path:
+    # Disk cache for derived intraday stats (not raw bars). This speeds up repeated runs dramatically.
+    base = (cfg.get("target_window_cache_dir") or cfg.get("target_window_mfe_cache_dir") or "cache/target_window_mfe")
+    path = Path(str(base))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _target_day_cache_path(
+    *,
+    cfg: Dict,
+    symbol: str,
+    direction: str,
+    entry_time_et: str,
+    price_mode: str,
+    window_minutes: int,
+    session_open_et: str,
+) -> Path:
+    sym = _safe_cache_token(str(symbol).upper())
+    direc = _safe_cache_token(str(direction).lower())
+    et = _safe_cache_token(entry_time_et)
+    pm = _safe_cache_token(price_mode)
+    open_tok = _safe_cache_token(session_open_et)
+    alp = cfg.get("alpaca") or {}
+    feed = _safe_cache_token(str(alp.get("data_feed") or ""))
+    adj = _safe_cache_token(str(alp.get("adjustment") or ""))
+    suffix = ""
+    if feed:
+        suffix += f"_{feed}"
+    if adj:
+        suffix += f"_{adj}"
+    fname = f"{et}_{pm}_{int(window_minutes)}m_open{open_tok}{suffix}.json"
+    return _target_window_cache_dir(cfg) / sym / direc / fname
+
+
+def _load_target_day_cache(path: Path) -> Dict[str, Optional[float]]:
+    if not path.exists() or path.stat().st_size <= 0:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    data = payload
+    if isinstance(payload, dict) and isinstance(payload.get("mfe_by_day"), dict):
+        data = payload.get("mfe_by_day")  # type: ignore[assignment]
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, Optional[float]] = {}
+    for k, v in data.items():
+        day = str(k or "")
+        if not day:
+            continue
+        if v is None:
+            out[day] = None
+            continue
+        try:
+            out[day] = float(v)
+        except Exception:
+            out[day] = None
+    return out
+
+
+def _save_target_day_cache(path: Path, day_cache: Dict[str, Optional[float]], meta: Dict[str, object]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"meta": meta, "mfe_by_day": day_cache}
+        tmp = path.parent / f"{path.name}.tmp.{os.getpid()}"
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        try:
+            if "tmp" in locals() and tmp.exists():
+                tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _prior_trading_days(end_date: dt.date, count: int) -> List[dt.date]:
@@ -75,7 +165,8 @@ def _compute_symbol_window_mfe_for_day(
             continue
         if ts < entry_dt:
             continue
-        if ts > window_end:
+        # Window is [entry_dt, window_end) (exclusive): at window_end you do not include the next minute bar.
+        if ts >= window_end:
             break
         if entry_price is None:
             if price_mode == "close":
@@ -138,7 +229,22 @@ def _compute_symbol_window_avg(
         session_open_et,
     )
     day_cache = _TARGET_DAY_CACHE.setdefault(day_cache_key, {})
+    if day_cache_key not in _TARGET_DAY_CACHE_LOADED:
+        _TARGET_DAY_CACHE_LOADED.add(day_cache_key)
+        path = _target_day_cache_path(
+            cfg=cfg,
+            symbol=symbol_u,
+            direction=direction_u,
+            entry_time_et=str(entry_time_et),
+            price_mode=_entry_price_mode_base(entry_mode),
+            window_minutes=int(window_minutes),
+            session_open_et=session_open_et,
+        )
+        loaded = _load_target_day_cache(path)
+        if loaded:
+            day_cache.update(loaded)
     samples: List[float] = []
+    dirty = False
     for day in days:
         day_str = day.isoformat()
         if day_str not in day_cache:
@@ -151,11 +257,34 @@ def _compute_symbol_window_avg(
                 window_minutes,
                 cfg,
             )
+            dirty = True
         mfe = day_cache.get(day_str)
         if mfe is None:
             continue
         if mfe > 0:
             samples.append(mfe)
+    if dirty:
+        path = _target_day_cache_path(
+            cfg=cfg,
+            symbol=symbol_u,
+            direction=direction_u,
+            entry_time_et=str(entry_time_et),
+            price_mode=_entry_price_mode_base(entry_mode),
+            window_minutes=int(window_minutes),
+            session_open_et=session_open_et,
+        )
+        _save_target_day_cache(
+            path,
+            day_cache,
+            meta={
+                "symbol": symbol_u,
+                "direction": direction_u,
+                "entry_time_et": str(entry_time_et),
+                "price_mode": _entry_price_mode_base(entry_mode),
+                "window_minutes": int(window_minutes),
+                "session_open_et": session_open_et,
+            },
+        )
     if len(samples) < min_samples:
         _TARGET_CACHE[cache_key] = None
         return None
@@ -460,8 +589,11 @@ def build_trade(
     if param_overrides:
         params.update(param_overrides)
     entry_time_et = str(params.get("entry_time_et") or "09:35")
-    entry_start_et = str(params.get("entry_start_et") or entry_time_et)
-    entry_end_et = str(params.get("entry_end_et") or entry_time_et)
+    entry_start_raw = params.get("entry_start_et")
+    entry_end_raw = params.get("entry_end_et")
+    entry_start_et = str(entry_start_raw or entry_time_et)
+    entry_end_et = str(entry_end_raw or entry_time_et)
+    has_entry_window_limits = entry_start_raw is not None or entry_end_raw is not None
     entry_times_raw = params.get("entry_times_et")
     if entry_time_override:
         entry_times = [str(entry_time_override)]
@@ -497,8 +629,30 @@ def build_trade(
     confirm_minutes = int(params.get("confirm_minutes") or 0)
     confirm_apply_in_watchlist = bool(params.get("confirm_apply_in_watchlist", True))
     confirm_entry_price_mode = str(params.get("confirm_entry_price_mode") or "close").lower()
+    try:
+        max_confirm_hit_bps = float(params["max_confirm_hit_bps"]) if params.get("max_confirm_hit_bps") is not None else None
+    except Exception:
+        max_confirm_hit_bps = None
+    # Favorable gap means gap aligned with our mean-reversion direction:
+    # - long: gap down is favorable  => gap_fav_bps = -gap_bps
+    # - short: gap up is favorable  => gap_fav_bps = +gap_bps
+    #
+    # These keys are optional; if not present we don't apply the filter (to preserve parity with older configs).
+    try:
+        min_gap_fav_bps_long = float(params["min_gap_fav_bps_long"]) if params.get("min_gap_fav_bps_long") is not None else None
+    except Exception:
+        min_gap_fav_bps_long = None
+    try:
+        min_gap_fav_bps_short = float(params["min_gap_fav_bps_short"]) if params.get("min_gap_fav_bps_short") is not None else None
+    except Exception:
+        min_gap_fav_bps_short = None
     min_gap_bps_long = float(params.get("min_gap_bps_long") or 0.0)
     min_gap_bps_short = float(params.get("min_gap_bps_short") or 0.0)
+    min_stop_atr = float(params.get("min_stop_atr") or 0.0)
+    try:
+        min_stop_atr_filter = float(params.get("min_stop_atr_filter") or 0.0)
+    except Exception:
+        min_stop_atr_filter = 0.0
     reversal_lookback_days = int(params.get("reversal_lookback_days") or 1)
     early_range_minutes = int(params.get("early_range_minutes") or 0)
     max_early_pullback_bps = float(params.get("max_early_pullback_bps") or 0.0)
@@ -580,6 +734,14 @@ def build_trade(
             return None
         entry_dt = ensure_et(dt.datetime.combine(ensure_date(entry_date_str), parse_time_hhmm(entry_time_str)))
         cutoff_dt = entry_dt + dt.timedelta(minutes=confirm_minutes)
+        # Confirmation semantics (parity with live scheduling):
+        # - Evaluate confirmation over the fixed window [entry_dt, cutoff_dt)
+        # - If the move threshold is hit at any point in the window, enter at the end of the window
+        #   (using the last completed bar before cutoff_dt).
+        max_hit_bps: Optional[float] = None
+        last_row_before_cutoff: Optional[Dict] = None
+        last_ts_before_cutoff: Optional[dt.datetime] = None
+        saw_any_in_window = False
         for row in bars_intraday_local:
             ts_raw = row.get("timestamp") or row.get("datetime") or row.get("time") or row.get("date")
             if not ts_raw:
@@ -588,22 +750,39 @@ def build_trade(
                 ts = ensure_et(dt.datetime.fromisoformat(str(ts_raw)))
             except Exception:
                 continue
+            # Window is exclusive of cutoff_dt because at cutoff_dt you do not yet have the in-progress bar.
+            if ts >= cutoff_dt:
+                break
+            if last_ts_before_cutoff is None or ts > last_ts_before_cutoff:
+                last_ts_before_cutoff = ts
+                last_row_before_cutoff = row
             if ts < entry_dt:
                 continue
-            if ts > cutoff_dt:
-                break
+            saw_any_in_window = True
             high = float(row.get("high") or row.get("h") or 0.0)
             low = float(row.get("low") or row.get("l") or 0.0)
             if direction_local == "long":
                 hit_bps = ((high - entry_price_local) / entry_price_local) * 10000.0
-                if hit_bps >= confirm_move_bps:
-                    confirm_price = float(row.get("close") or row.get("c") or 0.0) if confirm_entry_price_mode == "close" else float(row.get("open") or row.get("o") or 0.0)
-                    return {"entry_price": confirm_price, "entry_time_et": ts.strftime("%H:%M"), "confirm_hit_bps": hit_bps}
             else:
                 hit_bps = ((entry_price_local - low) / entry_price_local) * 10000.0
-                if hit_bps >= confirm_move_bps:
-                    confirm_price = float(row.get("close") or row.get("c") or 0.0) if confirm_entry_price_mode == "close" else float(row.get("open") or row.get("o") or 0.0)
-                    return {"entry_price": confirm_price, "entry_time_et": ts.strftime("%H:%M"), "confirm_hit_bps": hit_bps}
+            if max_hit_bps is None or hit_bps > max_hit_bps:
+                max_hit_bps = hit_bps
+        if not saw_any_in_window or max_hit_bps is None or max_hit_bps < confirm_move_bps:
+            return None
+        if not last_row_before_cutoff:
+            return None
+        confirm_price = (
+            float(last_row_before_cutoff.get("close") or last_row_before_cutoff.get("c") or 0.0)
+            if confirm_entry_price_mode == "close"
+            else float(last_row_before_cutoff.get("open") or last_row_before_cutoff.get("o") or 0.0)
+        )
+        if confirm_price <= 0:
+            return None
+        return {
+            "entry_price": confirm_price,
+            "entry_time_et": cutoff_dt.strftime("%H:%M"),
+            "confirm_hit_bps": max_hit_bps,
+        }
         return None
 
     signal_return_pct = float(signal.return_pct)
@@ -611,6 +790,19 @@ def build_trade(
         if entry_start_et and entry_end_et:
             if not (entry_start_et <= entry_time_et <= entry_end_et):
                 continue
+            if apply_confirm and has_entry_window_limits:
+                # With confirmation enabled, orders are placed at entry_time + confirm_minutes.
+                # Keep the allowed entry window consistent with the actual order placement time.
+                try:
+                    cutoff_dt = ensure_et(
+                        dt.datetime.combine(ensure_date(signal.signal_date), parse_time_hhmm(entry_time_et))
+                        + dt.timedelta(minutes=confirm_minutes)
+                    )
+                    cutoff_time_et = cutoff_dt.strftime("%H:%M")
+                    if not (entry_start_et <= cutoff_time_et <= entry_end_et):
+                        continue
+                except Exception:
+                    pass
         entry_info = simulate_entry(signal, entry_time_et, "daily", bars, None, cfg)
         if not entry_info:
             continue
@@ -652,6 +844,11 @@ def build_trade(
             entry_price = float(confirm["entry_price"])
             entry_time_et = str(confirm["entry_time_et"])
             confirm_hit_bps = float(confirm["confirm_hit_bps"]) if confirm.get("confirm_hit_bps") is not None else None
+            if max_confirm_hit_bps is not None and max_confirm_hit_bps > 0 and confirm_hit_bps is not None:
+                # Avoid chasing: if the reversal move within the confirm window is already too large,
+                # entering at the cutoff tends to be late (mean reversion already happened).
+                if confirm_hit_bps > max_confirm_hit_bps:
+                    continue
         if apply_confirm:
             entry_price_mode_used = f"confirm_{confirm_entry_price_mode}"
         elif apply_intraday_entry:
@@ -659,20 +856,46 @@ def build_trade(
         else:
             entry_price_mode_used = f"daily_{str((cfg.get('daily_trend_reversal') or {}).get('entry_price_mode') or 'open').lower()}"
         gap_bps = None
-        if entry_idx is not None and entry_idx > 0:
-            try:
-                prev_close = float(bars[entry_idx - 1]["close"])
-                open_price = float(bars[entry_idx]["open"])
-            except Exception:
-                prev_close = 0.0
-                open_price = 0.0
-            if prev_close > 0 and open_price > 0:
+        # Gap is defined using prior close vs current session open. In backtests we have a daily
+        # bar with the open; in live we may only have minute bars so we fall back to the first 1m open.
+        try:
+            entry_bar_idx = None
+            for idx, bar in enumerate(bars):
+                if str(bar.get("date")) == str(signal.signal_date):
+                    entry_bar_idx = idx
+                    break
+            prev_close = None
+            open_price = None
+            if entry_bar_idx is not None and entry_bar_idx > 0:
+                prev_close = float(bars[entry_bar_idx - 1]["close"])
+                open_price = float(bars[entry_bar_idx]["open"])
+            else:
+                # Live: daily bar for today not present yet; use last known daily close and first intraday open.
+                for row in bars:
+                    if str(row.get("date")) < str(signal.signal_date):
+                        prev_close = float(row.get("close"))
+                if bars_intraday:
+                    first = bars_intraday[0]
+                    open_price = float(first.get("open") or first.get("o") or 0.0)
+            if prev_close and prev_close > 0 and open_price and open_price > 0:
                 gap_bps = ((open_price - prev_close) / prev_close) * 10000.0
-                if apply_gap_filter:
-                    if direction == "long" and min_gap_bps_long > 0 and gap_bps < min_gap_bps_long:
-                        continue
-                    if direction == "short" and min_gap_bps_short > 0 and gap_bps > -min_gap_bps_short:
-                        continue
+        except Exception:
+            gap_bps = None
+
+        # Legacy (existing) gap filters.
+        if gap_bps is not None and apply_gap_filter:
+            if direction == "long" and min_gap_bps_long > 0 and gap_bps < min_gap_bps_long:
+                continue
+            if direction == "short" and min_gap_bps_short > 0 and gap_bps > -min_gap_bps_short:
+                continue
+
+        # New: direction-aware favorable-gap filter (optional; only applied when configured).
+        if gap_bps is not None and (min_gap_fav_bps_long is not None or min_gap_fav_bps_short is not None):
+            gap_fav_bps = gap_bps if direction == "short" else -gap_bps
+            if direction == "long" and (min_gap_fav_bps_long is not None) and gap_fav_bps < float(min_gap_fav_bps_long):
+                continue
+            if direction == "short" and (min_gap_fav_bps_short is not None) and gap_fav_bps < float(min_gap_fav_bps_short):
+                continue
         early_pullback_bps = None
         if apply_early_filter and early_range_minutes > 0 and max_early_pullback_bps > 0:
             if not bars_intraday and intraday_filter_require:
@@ -743,6 +966,18 @@ def build_trade(
                 stop_distance = target_distance / max(target_rr, 0.0001)
                 if stop_distance <= 0:
                     continue
+            stop_distance_pre_floor = stop_distance
+            if (
+                min_stop_atr_filter > 0
+                and atr is not None
+                and atr > 0
+                and stop_distance_pre_floor is not None
+                and (stop_distance_pre_floor / atr) < min_stop_atr_filter
+            ):
+                continue
+            # Optional floor on stop_distance vs daily ATR to avoid ultra-tight stops.
+            if min_stop_atr > 0 and atr is not None and atr > 0 and stop_distance < (atr * min_stop_atr):
+                stop_distance = atr * min_stop_atr
             target_rr = target_distance / stop_distance
             if direction == "long":
                 stop_price = entry_price - stop_distance
@@ -757,6 +992,18 @@ def build_trade(
                 stop_distance = atr * stop_atr_mult * stop_r
                 if stop_distance <= 0:
                     continue
+            stop_distance_pre_floor = stop_distance
+            if (
+                min_stop_atr_filter > 0
+                and atr is not None
+                and atr > 0
+                and stop_distance_pre_floor is not None
+                and (stop_distance_pre_floor / atr) < min_stop_atr_filter
+            ):
+                continue
+            # Optional floor on stop_distance vs daily ATR to avoid ultra-tight stops.
+            if min_stop_atr > 0 and atr is not None and atr > 0 and stop_distance < (atr * min_stop_atr):
+                stop_distance = atr * min_stop_atr
             if direction == "long":
                 stop_price = entry_price - stop_distance
                 target_price = entry_price + stop_distance * target_rr

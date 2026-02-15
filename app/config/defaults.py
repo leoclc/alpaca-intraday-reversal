@@ -49,8 +49,26 @@ DEFAULT_CONFIG: dict = {
         "intraday_filter_enabled": False,
         "intraday_filter_require_bars": False,
         "intraday_filter_apply_in_watchlist": False,
+        # Entry confirmation (optional). When enabled, evaluate the window after `entry_time_et`
+        # (length `confirm_minutes`) and only enter if price moves in our favor by at least
+        # `confirm_move_bps` at any point during that window.
+        "confirm_move_bps": 0.0,
+        "confirm_minutes": 0,
+        "confirm_apply_in_watchlist": True,
+        "confirm_entry_price_mode": "close",
+        # Optional "don't chase" cap for confirmation mode: if the favorable move within the confirm
+        # window exceeds this (in bps), skip the trade (to avoid entering after the move already happened).
+        # If unset/0, disabled.
+        "max_confirm_hit_bps": None,
+        # Gap filters.
         "min_gap_bps_long": 0.0,
         "min_gap_bps_short": 0.0,
+        # Favorable gap means gap aligned with our mean-reversion direction:
+        # - long: gap down is favorable  => gap_fav_bps = -gap_bps
+        # - short: gap up is favorable  => gap_fav_bps = +gap_bps
+        # If unset/None, the filter is disabled (to preserve behavior of older configs).
+        "min_gap_fav_bps_long": None,
+        "min_gap_fav_bps_short": None,
         "early_range_minutes": 0,
         "max_early_pullback_bps": 0.0,
         "session_close_et": "16:00",
@@ -64,6 +82,13 @@ DEFAULT_CONFIG: dict = {
         "entry_order_type": "market",
         "order_tif": "day",
         "use_brackets": True,
+        # Optional floor on stop_distance vs daily ATR (stop_distance / ATR).
+        # If 0, disabled.
+        "min_stop_atr": 0.0,
+        # Optional filter (skip trade) when stop_distance / ATR is too small.
+        # This is distinct from `min_stop_atr` (which widens the stop); this one rejects the setup.
+        # If 0, disabled.
+        "min_stop_atr_filter": 0.0,
         "fixed_qty": None,
     },
     "watchlist": {

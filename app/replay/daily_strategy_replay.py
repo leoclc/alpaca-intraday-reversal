@@ -95,35 +95,69 @@ def run_replay(
             entry_times = [str(t) for t in entry_times_raw if t]
         else:
             entry_times = [str(params.get("entry_time_et") or "09:35")]
+        # Watchlist may include per-symbol entry-time overrides (from the daily builder). Make sure we
+        # fetch enough intraday minutes to cover the latest entry time in the watchlist too.
+        wl_entry_times = [str(t) for t in symbol_entry_time.values() if t]
+        entry_times_for_fetch = sorted({t for t in (entry_times + wl_entry_times) if t})
         intraday_filter_enabled = bool(params.get("intraday_filter_enabled", False))
         early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
         time_stop_minutes = int(params.get("time_stop_minutes") or 0)
+        intraday_only = bool(params.get("intraday_only", False))
         confirm_move_bps = float(params.get("confirm_move_bps") or 0.0)
         confirm_minutes = int(params.get("confirm_minutes") or 0)
         apply_confirm = confirm_move_bps > 0 and confirm_minutes > 0
         minutes_needed = 0
         if early_range_minutes > 0:
             minutes_needed = max(minutes_needed, early_range_minutes)
+        use_intraday_entry = bool(params.get("use_intraday_entry", False))
         max_entry_minutes = 0
         try:
             session_open_et = str(params.get("session_open_et") or "09:30")
             open_time = parse_time_hhmm(session_open_et)
-            for entry_time_et in entry_times:
+            # Precompute the flatten cutoff (intraday_only) in "minutes from open".
+            flatten_minutes_from_open = None
+            if intraday_only:
+                try:
+                    session_close_et = str(params.get("session_close_et") or "16:00")
+                    flatten_buffer = int(params.get("flatten_buffer_minutes") or 0)
+                    open_dt = dt.datetime.combine(dt.date.today(), open_time)
+                    close_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_close_et))
+                    flatten_dt = close_dt - dt.timedelta(minutes=max(0, flatten_buffer))
+                    flatten_minutes_from_open = int((flatten_dt - open_dt).total_seconds() / 60)
+                    flatten_minutes_from_open = max(1, flatten_minutes_from_open)
+                except Exception:
+                    flatten_minutes_from_open = None
+
+            confirm_pad = confirm_minutes if apply_confirm else 0
+            for entry_time_et in entry_times_for_fetch:
                 entry_time = parse_time_hhmm(entry_time_et)
-                entry_minutes = int(
+                entry_minutes_raw = int(
                     (dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds()
                     / 60
                 )
-                entry_minutes = max(1, entry_minutes + 1)
-                max_entry_minutes = max(max_entry_minutes, entry_minutes)
+                entry_minutes_raw = max(0, entry_minutes_raw)
+
+                # Ensure we can reference the last completed bar before the entry timestamp.
+                max_entry_minutes = max(max_entry_minutes, max(1, entry_minutes_raw + 1))
+
+                # Confirmation needs bars through (entry + confirm) to evaluate [entry, cutoff).
+                if apply_confirm:
+                    minutes_needed = max(minutes_needed, max(1, entry_minutes_raw + confirm_pad + 1))
+
+                # Exit simulation needs intraday bars through the effective cutoff (time-stop and/or flatten).
+                cutoff_minutes = None
+                if time_stop_minutes > 0:
+                    cutoff_minutes = entry_minutes_raw + confirm_pad + time_stop_minutes
+                if intraday_only and flatten_minutes_from_open is not None:
+                    cutoff_minutes = flatten_minutes_from_open if cutoff_minutes is None else min(cutoff_minutes, flatten_minutes_from_open)
+                if cutoff_minutes is not None and cutoff_minutes > 0:
+                    # +1 to safely include the last completed bar before the cutoff even if the data API treats
+                    # end timestamps as exclusive.
+                    minutes_needed = max(minutes_needed, cutoff_minutes + 1)
         except Exception:
             max_entry_minutes = max(max_entry_minutes, 1)
-        if bool(params.get("use_intraday_entry", False)):
+        if use_intraday_entry:
             minutes_needed = max(minutes_needed, max_entry_minutes)
-        if time_stop_minutes > 0:
-            minutes_needed = max(minutes_needed, max_entry_minutes + time_stop_minutes)
-        if apply_confirm:
-            minutes_needed = max(minutes_needed, max_entry_minutes + confirm_minutes)
         for symbol in symbols:
             signals = generate_signals([symbol], date_str, date_str, cfg, data_store)
             if not signals:

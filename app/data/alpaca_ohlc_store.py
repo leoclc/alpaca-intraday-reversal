@@ -39,9 +39,18 @@ class AlpacaOHLCStore:
         base = base_dir or (cfg or {}).get("daily_bars_cache_dir") or "alpaca-ohlc"
         self.base_dir = Path(base)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        # In-process cache to avoid re-reading the same CSVs repeatedly during large backtests.
+        # This does not change results; it just eliminates redundant disk IO.
+        self._mem_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def load_symbol_bars(self, symbol: str) -> List[Dict[str, Any]]:
-        path = _symbol_path(self.base_dir, symbol)
+        sym = str(symbol).upper().strip()
+        if not sym:
+            return []
+        if sym in self._mem_cache:
+            return self._mem_cache[sym]
+
+        path = _symbol_path(self.base_dir, sym)
         if not path.exists():
             return []
         rows: List[Dict[str, Any]] = []
@@ -70,10 +79,12 @@ class AlpacaOHLCStore:
                 except Exception:
                     continue
         rows.sort(key=lambda r: r["date"])
+        self._mem_cache[sym] = rows
         return rows
 
     def write_symbol_bars(self, symbol: str, bars: Iterable[Dict[str, Any]]) -> Path:
-        existing = {row["date"]: row for row in self.load_symbol_bars(symbol)}
+        sym = str(symbol).upper().strip()
+        existing = {row["date"]: row for row in self.load_symbol_bars(sym)}
         for bar in bars:
             if not bar.get("date"):
                 continue
@@ -94,6 +105,8 @@ class AlpacaOHLCStore:
             writer.writeheader()
             for row in merged:
                 writer.writerow(row)
+        # Keep in-process cache in sync with disk.
+        self._mem_cache[sym] = merged
         return path
 
     def _dates_covered(self, bars: List[Dict[str, Any]]) -> Optional[tuple]:

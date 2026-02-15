@@ -1,20 +1,39 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import datetime as dt
 import time
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intraday_bars
 from app.execution.daily_execution_model import simulate_exit
 from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date, generate_signals
-from app.strategies.types import TradeResult
 from app.utils.time import ensure_date, parse_time_hhmm
 from app.watchlist.node_assets import fetch_asset_symbols, resolve_watchlist_asset_filters, resolve_watchlist_builder_base
 from app.watchlist.storage import expected_watchlist_date_str, write_watchlist
+
+
+@dataclass(frozen=True)
+class TradeLite:
+    pnl_pct: float
+    r_multiple: float
+
+
+# Cache of per-signal trade outcomes used for watchlist scoring. This is safe (no lookahead) because keys include
+# the signal date; the caller still decides which dates are eligible for a given target day.
+_TRADE_LITE_CACHE: Dict[Tuple[str, str, str, str, str], Optional[TradeLite]] = {}
+
+
+def _trade_cache_key(symbol: str, signal_date: str, direction: str, entry_time: str, overrides: Dict) -> Tuple[str, str, str, str, str]:
+    try:
+        overrides_key = json.dumps(overrides or {}, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        overrides_key = str(overrides or {})
+    return (str(symbol).upper(), str(signal_date), str(direction).lower(), str(entry_time), overrides_key)
 
 
 def _lookback_start_date(target_date: dt.date, lookback_days: int) -> dt.date:
@@ -59,7 +78,7 @@ def _expand_param_grid(grid: Dict) -> List[Dict]:
     return combos
 
 
-def _compute_stats(trades: List[TradeResult]) -> Dict[str, float]:
+def _compute_stats(trades: List[TradeLite]) -> Dict[str, float]:
     trades_count = len(trades)
     if trades_count == 0:
         return {
@@ -171,6 +190,7 @@ def build_watchlist(
     intraday_filter_enabled = bool(params.get("intraday_filter_enabled", False))
     early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
     time_stop_minutes = int(params.get("time_stop_minutes") or 0)
+    intraday_only = bool(params.get("intraday_only", False))
     confirm_move_bps = float(params.get("confirm_move_bps") or 0.0)
     confirm_minutes = int(params.get("confirm_minutes") or 0)
     confirm_apply_in_watchlist = bool(params.get("confirm_apply_in_watchlist", True))
@@ -178,27 +198,52 @@ def build_watchlist(
     use_intraday_entry = bool(params.get("use_intraday_entry", False))
     session_open_et = str(params.get("session_open_et") or "09:30")
     max_entry_minutes = 0
-    for t in entry_times:
-        try:
-            entry_time = parse_time_hhmm(t)
-            open_time = parse_time_hhmm(session_open_et)
-            entry_minutes = int(
-                (dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds()
-                / 60
-            )
-            entry_minutes = max(1, entry_minutes + 1)
-            max_entry_minutes = max(max_entry_minutes, entry_minutes)
-        except Exception:
-            max_entry_minutes = max(max_entry_minutes, 1)
     minutes_needed_base = 0
     if early_range_minutes > 0:
         minutes_needed_base = max(minutes_needed_base, early_range_minutes)
+    try:
+        open_time = parse_time_hhmm(session_open_et)
+        open_dt = dt.datetime.combine(dt.date.today(), open_time)
+        flatten_minutes_from_open = None
+        if intraday_only:
+            try:
+                session_close_et = str(params.get("session_close_et") or "16:00")
+                flatten_buffer = int(params.get("flatten_buffer_minutes") or 0)
+                close_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_close_et))
+                flatten_dt = close_dt - dt.timedelta(minutes=max(0, flatten_buffer))
+                flatten_minutes_from_open = int((flatten_dt - open_dt).total_seconds() / 60)
+                flatten_minutes_from_open = max(1, flatten_minutes_from_open)
+            except Exception:
+                flatten_minutes_from_open = None
+
+        confirm_pad = confirm_minutes if apply_confirm else 0
+        for t in entry_times:
+            try:
+                entry_time = parse_time_hhmm(t)
+            except Exception:
+                continue
+            entry_minutes_raw = int((dt.datetime.combine(dt.date.today(), entry_time) - open_dt).total_seconds() / 60)
+            entry_minutes_raw = max(0, entry_minutes_raw)
+
+            # Ensure we can reference the last completed bar before entry_dt.
+            max_entry_minutes = max(max_entry_minutes, max(1, entry_minutes_raw + 1))
+
+            # Confirmation evaluates [entry_dt, cutoff_dt). Ensure we have bars up to cutoff.
+            if apply_confirm:
+                minutes_needed_base = max(minutes_needed_base, max(1, entry_minutes_raw + confirm_pad + 1))
+
+            cutoff_minutes = None
+            if time_stop_minutes > 0:
+                cutoff_minutes = entry_minutes_raw + confirm_pad + time_stop_minutes
+            if intraday_only and flatten_minutes_from_open is not None:
+                cutoff_minutes = flatten_minutes_from_open if cutoff_minutes is None else min(cutoff_minutes, flatten_minutes_from_open)
+            if cutoff_minutes is not None and cutoff_minutes > 0:
+                # +1 to be robust if the data API treats end timestamps as exclusive.
+                minutes_needed_base = max(minutes_needed_base, cutoff_minutes + 1)
+    except Exception:
+        max_entry_minutes = max(max_entry_minutes, 1)
     if use_intraday_entry:
         minutes_needed_base = max(minutes_needed_base, max_entry_minutes)
-    if time_stop_minutes > 0:
-        minutes_needed_base = max(minutes_needed_base, max_entry_minutes + time_stop_minutes)
-    if apply_confirm:
-        minutes_needed_base = max(minutes_needed_base, max_entry_minutes + confirm_minutes)
 
     tgt_date = ensure_date(tgt)
     lookback_start = _lookback_start_date(tgt_date, lookback_days)
@@ -243,28 +288,52 @@ def build_watchlist(
         funnel["scanned_symbols"] += 1
         signals = generate_signals([symbol], start_date, end_date, cfg, data_store)
         funnel["signals_found"] += len(signals)
-        trades_by_candidate: Dict[tuple, List[TradeResult]] = {}
+        trades_by_candidate: Dict[tuple, List[TradeLite]] = {}
         for entry_time in entry_times:
             for grid_idx in range(len(param_grid)):
                 trades_by_candidate[(entry_time, grid_idx)] = []
         for signal in signals:
+            # We only need intraday bars if we are going to compute any missing candidates for this signal.
             bars_intraday = None
+            cached_by_candidate: Dict[Tuple[str, int], Optional[TradeLite]] = {}
+            any_missing = False
+            for entry_time in entry_times:
+                for grid_idx, overrides in enumerate(param_grid):
+                    cache_key = _trade_cache_key(symbol, signal.signal_date, signal.direction, entry_time, overrides)
+                    if cache_key in _TRADE_LITE_CACHE:
+                        cached_by_candidate[(entry_time, grid_idx)] = _TRADE_LITE_CACHE[cache_key]
+                    else:
+                        any_missing = True
+            if not any_missing:
+                for (entry_time, grid_idx), cached in cached_by_candidate.items():
+                    if cached is not None:
+                        trades_by_candidate[(entry_time, grid_idx)].append(cached)
+                continue
             if minutes_needed_base > 0:
                 bars_intraday = get_intraday_bars(symbol, signal.signal_date, minutes_needed_base, cfg=cfg, allow_fetch=True)
                 if not bars_intraday:
                     continue
+            intraday_entry_cache: Dict[str, List[dict]] = {}
             for entry_time in entry_times:
+                cutoff_time = entry_time
+                if apply_confirm:
+                    cutoff_time = _add_minutes(entry_time, confirm_minutes)
+                if bars_intraday and entry_time and entry_time not in intraday_entry_cache:
+                    intraday_entry_cache[entry_time] = filter_intraday_bars_until(
+                        bars_intraday,
+                        signal.signal_date,
+                        cutoff_time,
+                    )
                 for grid_idx, overrides in enumerate(param_grid):
+                    cache_key = _trade_cache_key(symbol, signal.signal_date, signal.direction, entry_time, overrides)
+                    if cache_key in _TRADE_LITE_CACHE:
+                        cached = _TRADE_LITE_CACHE[cache_key]
+                        if cached is not None:
+                            trades_by_candidate[(entry_time, grid_idx)].append(cached)
+                        continue
                     bars_intraday_entry = bars_intraday
                     if bars_intraday and entry_time:
-                        cutoff_time = entry_time
-                        if apply_confirm:
-                            cutoff_time = _add_minutes(entry_time, confirm_minutes)
-                        bars_intraday_entry = filter_intraday_bars_until(
-                            bars_intraday,
-                            signal.signal_date,
-                            cutoff_time,
-                        )
+                        bars_intraday_entry = intraday_entry_cache.get(entry_time) or []
                     plan = build_trade(
                         signal,
                         cfg,
@@ -275,24 +344,19 @@ def build_watchlist(
                         param_overrides=overrides,
                     )
                     if not plan:
+                        _TRADE_LITE_CACHE[cache_key] = None
                         continue
                     exit_info = simulate_exit(plan, "daily", bars, bars_intraday, cfg)
                     if not exit_info:
+                        _TRADE_LITE_CACHE[cache_key] = None
                         continue
                     direction_mult = 1.0 if plan.direction == "long" else -1.0
                     pnl = (float(exit_info["exit_price"]) - plan.entry_price) * direction_mult
                     pnl_pct = (pnl / plan.entry_price) * 100.0
                     r_multiple = pnl / plan.stop_distance
-                    trades_by_candidate[(entry_time, grid_idx)].append(
-                        TradeResult(
-                            plan=plan,
-                            exit_date=str(exit_info["exit_date"]),
-                            exit_price=float(exit_info["exit_price"]),
-                            exit_reason=str(exit_info["exit_reason"]),
-                            pnl_pct=pnl_pct,
-                            r_multiple=r_multiple,
-                        )
-                    )
+                    lite = TradeLite(pnl_pct=pnl_pct, r_multiple=r_multiple)
+                    _TRADE_LITE_CACHE[cache_key] = lite
+                    trades_by_candidate[(entry_time, grid_idx)].append(lite)
         total_trades_sim = sum(len(t) for t in trades_by_candidate.values())
         funnel["trades_simulated"] += total_trades_sim
         # Pick best entry time + param combo per symbol.
