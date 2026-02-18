@@ -4,9 +4,9 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from app.data.alpaca_intraday_store import get_intraday_bars
+from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intraday_bars
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.execution.daily_execution_model import compute_atr_daily, compute_sma, simulate_entry
 from app.strategies.types import Signal, TradePlan
@@ -15,6 +15,7 @@ from app.utils.time import ensure_date, ensure_et, parse_time_hhmm
 _TARGET_CACHE: Dict[tuple, Optional[Dict[str, float]]] = {}
 _TARGET_DAY_CACHE: Dict[tuple, Dict[str, Optional[float]]] = {}
 _TARGET_DAY_CACHE_LOADED: set[tuple] = set()
+_SIGNALS_CACHE: Dict[Tuple[Any, ...], Tuple[str, int, List[Signal]]] = {}
 
 
 def _safe_cache_token(val: str) -> str:
@@ -132,6 +133,66 @@ def _minutes_needed_for_window(entry_time_et: str, window_minutes: int, session_
     except Exception:
         entry_minutes = 0
     return max(1, entry_minutes + max(1, window_minutes))
+
+
+def _signals_cache_key(symbol: str, cfg: Dict) -> Tuple[Any, ...]:
+    params = cfg.get("daily_trend_reversal") or {}
+    trend_ma_days = int(params.get("trend_ma_days") or 200)
+    reversal_mode = str(params.get("reversal_mode") or "").lower().strip()
+    reversal_threshold_pct = float(params.get("reversal_threshold_pct") or 0.0)
+    reversal_threshold_atr = float(params.get("reversal_threshold_atr") or 0.0)
+    atr_period = int(params.get("atr_period") or 14)
+    reversal_lookback_days = int(params.get("reversal_lookback_days") or 1)
+    reversal_quantile = float(params.get("reversal_quantile") or 0.2)
+    reversal_quantile_lookback_days = int(params.get("reversal_quantile_lookback_days") or 60)
+    trend_fast_len = int(params.get("trend_fast_len") or 0)
+    trend_slow_len = int(params.get("trend_slow_len") or 0)
+    trend_min_slope_bps = float(params.get("trend_min_slope_bps") or 0.0)
+    trend_min_distance_atr = float(params.get("trend_min_distance_atr") or 0.0)
+    volume_lookback_days = int(params.get("volume_lookback_days") or 0)
+    volume_min_ratio = float(params.get("volume_min_ratio") or 0.0)
+    if not reversal_mode:
+        reversal_mode = "atr" if reversal_threshold_atr > 0 else "pct"
+    return (
+        str(symbol).upper(),
+        trend_ma_days,
+        reversal_mode,
+        reversal_threshold_pct,
+        reversal_threshold_atr,
+        atr_period,
+        reversal_lookback_days,
+        reversal_quantile,
+        reversal_quantile_lookback_days,
+        trend_fast_len,
+        trend_slow_len,
+        trend_min_slope_bps,
+        trend_min_distance_atr,
+        volume_lookback_days,
+        volume_min_ratio,
+    )
+
+
+def generate_signals_cached(symbol: str, cfg: Dict, data_store: AlpacaOHLCStore) -> List[Signal]:
+    sym = str(symbol or "").upper()
+    if not sym:
+        return []
+
+    key = _signals_cache_key(sym, cfg)
+    bars = data_store.get_daily_bars(sym, None, None, cfg=cfg, allow_fetch=True)
+    if not bars:
+        _SIGNALS_CACHE[key] = ("", 0, [])
+        return []
+
+    last_date = str(bars[-1].get("date") or "")
+    bars_len = len(bars)
+    cached = _SIGNALS_CACHE.get(key)
+    if cached and cached[0] == last_date and cached[1] == bars_len:
+        return cached[2]
+
+    start_date = str(bars[0].get("date") or last_date)
+    signals = generate_signals([sym], start_date, last_date, cfg, data_store)
+    _SIGNALS_CACHE[key] = (last_date, bars_len, signals)
+    return signals
 
 
 def _compute_symbol_window_mfe_for_day(
@@ -633,6 +694,22 @@ def build_trade(
         max_confirm_hit_bps = float(params["max_confirm_hit_bps"]) if params.get("max_confirm_hit_bps") is not None else None
     except Exception:
         max_confirm_hit_bps = None
+    try:
+        max_confirm_hit_bps_long = (
+            float(params["max_confirm_hit_bps_long"]) if params.get("max_confirm_hit_bps_long") is not None else None
+        )
+    except Exception:
+        max_confirm_hit_bps_long = None
+    try:
+        max_confirm_hit_bps_short = (
+            float(params["max_confirm_hit_bps_short"]) if params.get("max_confirm_hit_bps_short") is not None else None
+        )
+    except Exception:
+        max_confirm_hit_bps_short = None
+    if max_confirm_hit_bps_long is None:
+        max_confirm_hit_bps_long = max_confirm_hit_bps
+    if max_confirm_hit_bps_short is None:
+        max_confirm_hit_bps_short = max_confirm_hit_bps
     # Favorable gap means gap aligned with our mean-reversion direction:
     # - long: gap down is favorable  => gap_fav_bps = -gap_bps
     # - short: gap up is favorable  => gap_fav_bps = +gap_bps
@@ -650,12 +727,43 @@ def build_trade(
     min_gap_bps_short = float(params.get("min_gap_bps_short") or 0.0)
     min_stop_atr = float(params.get("min_stop_atr") or 0.0)
     try:
+        min_stop_atr_long = float(params["min_stop_atr_long"]) if params.get("min_stop_atr_long") is not None else None
+    except Exception:
+        min_stop_atr_long = None
+    try:
+        min_stop_atr_short = float(params["min_stop_atr_short"]) if params.get("min_stop_atr_short") is not None else None
+    except Exception:
+        min_stop_atr_short = None
+    if min_stop_atr_long is None:
+        min_stop_atr_long = min_stop_atr
+    if min_stop_atr_short is None:
+        min_stop_atr_short = min_stop_atr
+    try:
         min_stop_atr_filter = float(params.get("min_stop_atr_filter") or 0.0)
     except Exception:
         min_stop_atr_filter = 0.0
     reversal_lookback_days = int(params.get("reversal_lookback_days") or 1)
     early_range_minutes = int(params.get("early_range_minutes") or 0)
     max_early_pullback_bps = float(params.get("max_early_pullback_bps") or 0.0)
+    # Optional early-reversal filter: require the price to have reversed off the early extreme
+    # *before* entry (does not delay entry time).
+    min_early_reversal_bps = float(params.get("min_early_reversal_bps") or 0.0)
+    try:
+        min_early_reversal_bps_long = (
+            float(params["min_early_reversal_bps_long"]) if params.get("min_early_reversal_bps_long") is not None else None
+        )
+    except Exception:
+        min_early_reversal_bps_long = None
+    try:
+        min_early_reversal_bps_short = (
+            float(params["min_early_reversal_bps_short"]) if params.get("min_early_reversal_bps_short") is not None else None
+        )
+    except Exception:
+        min_early_reversal_bps_short = None
+    if min_early_reversal_bps_long is None:
+        min_early_reversal_bps_long = min_early_reversal_bps
+    if min_early_reversal_bps_short is None:
+        min_early_reversal_bps_short = min_early_reversal_bps
     session_open_et = str(params.get("session_open_et") or "09:30")
     use_intraday_entry = bool(params.get("use_intraday_entry", False))
     intraday_entry_in_watchlist = bool(params.get("intraday_entry_in_watchlist", False))
@@ -663,6 +771,7 @@ def build_trade(
     if not bars:
         return None
     direction = signal.direction.lower()
+    min_stop_atr_dir = min_stop_atr_long if direction == "long" else min_stop_atr_short
     apply_gap_filter = (min_gap_bps_long > 0) or (min_gap_bps_short > 0)
     apply_early_filter = intraday_filter_enabled
     if context == "watchlist" and not intraday_filter_apply_watchlist:
@@ -671,8 +780,46 @@ def build_trade(
     apply_confirm = confirm_move_bps > 0 and confirm_minutes > 0
     if context == "watchlist" and not confirm_apply_in_watchlist:
         apply_confirm = False
+
+    # Fast reject: if gap filters are enabled and we can compute the session gap from daily bars,
+    # apply them before fetching intraday bars. This avoids expensive intraday fetches for signals
+    # that will be rejected anyway.
+    gap_bps_pre: Optional[float] = None
+    try:
+        entry_bar_idx = None
+        for idx, bar in enumerate(bars):
+            if str(bar.get("date")) == str(signal.signal_date):
+                entry_bar_idx = idx
+                break
+        if entry_bar_idx is not None and entry_bar_idx > 0:
+            prev_close = float(bars[entry_bar_idx - 1]["close"])
+            open_price = float(bars[entry_bar_idx]["open"])
+            if prev_close > 0 and open_price > 0:
+                gap_bps_pre = ((open_price - prev_close) / prev_close) * 10000.0
+    except Exception:
+        gap_bps_pre = None
+    if gap_bps_pre is not None:
+        if apply_gap_filter:
+            if direction == "long" and min_gap_bps_long > 0 and gap_bps_pre < min_gap_bps_long:
+                return None
+            if direction == "short" and min_gap_bps_short > 0 and gap_bps_pre > -min_gap_bps_short:
+                return None
+        if min_gap_fav_bps_long is not None or min_gap_fav_bps_short is not None:
+            gap_fav_bps = gap_bps_pre if direction == "short" else -gap_bps_pre
+            if direction == "long" and (min_gap_fav_bps_long is not None) and gap_fav_bps < float(min_gap_fav_bps_long):
+                return None
+            if direction == "short" and (min_gap_fav_bps_short is not None) and gap_fav_bps < float(min_gap_fav_bps_short):
+                return None
     minutes_needed = 0
-    if apply_early_filter and early_range_minutes > 0 and max_early_pullback_bps > 0:
+    if (
+        apply_early_filter
+        and early_range_minutes > 0
+        and (
+            max_early_pullback_bps > 0
+            or (min_early_reversal_bps_long is not None and min_early_reversal_bps_long > 0)
+            or (min_early_reversal_bps_short is not None and min_early_reversal_bps_short > 0)
+        )
+    ):
         minutes_needed = early_range_minutes
     max_entry_minutes = 0
     for t in entry_times:
@@ -844,10 +991,14 @@ def build_trade(
             entry_price = float(confirm["entry_price"])
             entry_time_et = str(confirm["entry_time_et"])
             confirm_hit_bps = float(confirm["confirm_hit_bps"]) if confirm.get("confirm_hit_bps") is not None else None
-            if max_confirm_hit_bps is not None and max_confirm_hit_bps > 0 and confirm_hit_bps is not None:
+            if direction == "long":
+                max_confirm_hit_bps_dir = max_confirm_hit_bps_long
+            else:
+                max_confirm_hit_bps_dir = max_confirm_hit_bps_short
+            if max_confirm_hit_bps_dir is not None and max_confirm_hit_bps_dir > 0 and confirm_hit_bps is not None:
                 # Avoid chasing: if the reversal move within the confirm window is already too large,
                 # entering at the cutoff tends to be late (mean reversion already happened).
-                if confirm_hit_bps > max_confirm_hit_bps:
+                if confirm_hit_bps > max_confirm_hit_bps_dir:
                     continue
         if apply_confirm:
             entry_price_mode_used = f"confirm_{confirm_entry_price_mode}"
@@ -855,68 +1006,107 @@ def build_trade(
             entry_price_mode_used = f"intraday_{entry_price_mode}"
         else:
             entry_price_mode_used = f"daily_{str((cfg.get('daily_trend_reversal') or {}).get('entry_price_mode') or 'open').lower()}"
-        gap_bps = None
-        # Gap is defined using prior close vs current session open. In backtests we have a daily
-        # bar with the open; in live we may only have minute bars so we fall back to the first 1m open.
-        try:
-            entry_bar_idx = None
-            for idx, bar in enumerate(bars):
-                if str(bar.get("date")) == str(signal.signal_date):
-                    entry_bar_idx = idx
-                    break
-            prev_close = None
-            open_price = None
-            if entry_bar_idx is not None and entry_bar_idx > 0:
-                prev_close = float(bars[entry_bar_idx - 1]["close"])
-                open_price = float(bars[entry_bar_idx]["open"])
-            else:
-                # Live: daily bar for today not present yet; use last known daily close and first intraday open.
-                for row in bars:
-                    if str(row.get("date")) < str(signal.signal_date):
-                        prev_close = float(row.get("close"))
-                if bars_intraday:
-                    first = bars_intraday[0]
-                    open_price = float(first.get("open") or first.get("o") or 0.0)
-            if prev_close and prev_close > 0 and open_price and open_price > 0:
-                gap_bps = ((open_price - prev_close) / prev_close) * 10000.0
-        except Exception:
-            gap_bps = None
+        gap_bps = gap_bps_pre
+        if gap_bps is None:
+            # Gap is defined using prior close vs current session open. In backtests we have a daily
+            # bar with the open; in live we may only have minute bars so we fall back to the first 1m open.
+            try:
+                entry_bar_idx = None
+                for idx, bar in enumerate(bars):
+                    if str(bar.get("date")) == str(signal.signal_date):
+                        entry_bar_idx = idx
+                        break
+                prev_close = None
+                open_price = None
+                if entry_bar_idx is not None and entry_bar_idx > 0:
+                    prev_close = float(bars[entry_bar_idx - 1]["close"])
+                    open_price = float(bars[entry_bar_idx]["open"])
+                else:
+                    # Live: daily bar for today not present yet; use last known daily close and first intraday open.
+                    for row in bars:
+                        if str(row.get("date")) < str(signal.signal_date):
+                            prev_close = float(row.get("close"))
+                    if bars_intraday:
+                        first = bars_intraday[0]
+                        open_price = float(first.get("open") or first.get("o") or 0.0)
+                if prev_close and prev_close > 0 and open_price and open_price > 0:
+                    gap_bps = ((open_price - prev_close) / prev_close) * 10000.0
+            except Exception:
+                gap_bps = None
 
-        # Legacy (existing) gap filters.
-        if gap_bps is not None and apply_gap_filter:
-            if direction == "long" and min_gap_bps_long > 0 and gap_bps < min_gap_bps_long:
-                continue
-            if direction == "short" and min_gap_bps_short > 0 and gap_bps > -min_gap_bps_short:
-                continue
+            # Legacy (existing) gap filters.
+            if gap_bps is not None and apply_gap_filter:
+                if direction == "long" and min_gap_bps_long > 0 and gap_bps < min_gap_bps_long:
+                    continue
+                if direction == "short" and min_gap_bps_short > 0 and gap_bps > -min_gap_bps_short:
+                    continue
 
-        # New: direction-aware favorable-gap filter (optional; only applied when configured).
-        if gap_bps is not None and (min_gap_fav_bps_long is not None or min_gap_fav_bps_short is not None):
-            gap_fav_bps = gap_bps if direction == "short" else -gap_bps
-            if direction == "long" and (min_gap_fav_bps_long is not None) and gap_fav_bps < float(min_gap_fav_bps_long):
-                continue
-            if direction == "short" and (min_gap_fav_bps_short is not None) and gap_fav_bps < float(min_gap_fav_bps_short):
-                continue
+            # New: direction-aware favorable-gap filter (optional; only applied when configured).
+            if gap_bps is not None and (min_gap_fav_bps_long is not None or min_gap_fav_bps_short is not None):
+                gap_fav_bps = gap_bps if direction == "short" else -gap_bps
+                if direction == "long" and (min_gap_fav_bps_long is not None) and gap_fav_bps < float(min_gap_fav_bps_long):
+                    continue
+                if direction == "short" and (min_gap_fav_bps_short is not None) and gap_fav_bps < float(min_gap_fav_bps_short):
+                    continue
         early_pullback_bps = None
-        if apply_early_filter and early_range_minutes > 0 and max_early_pullback_bps > 0:
+        early_reversal_bps = None
+        if (
+            apply_early_filter
+            and early_range_minutes > 0
+            and (
+                max_early_pullback_bps > 0
+                or (min_early_reversal_bps_long is not None and min_early_reversal_bps_long > 0)
+                or (min_early_reversal_bps_short is not None and min_early_reversal_bps_short > 0)
+            )
+        ):
             if not bars_intraday and intraday_filter_require:
                 continue
             if bars_intraday:
-                slice_end = min(len(bars_intraday), early_range_minutes)
-                window = bars_intraday[:slice_end]
+                # Parity: never use intraday bars at/after the entry timestamp when deciding whether to enter.
+                # The "early range" window is [session_open, session_open+early_range_minutes) but truncated at
+                # entry_dt because at entry_dt you do not yet have the in-progress bar.
+                try:
+                    open_dt = ensure_et(
+                        dt.datetime.combine(ensure_date(signal.signal_date), parse_time_hhmm(session_open_et))
+                    )
+                    entry_dt = ensure_et(
+                        dt.datetime.combine(ensure_date(signal.signal_date), parse_time_hhmm(str(entry_time_et)))
+                    )
+                    early_cutoff_dt = open_dt + dt.timedelta(minutes=max(1, int(early_range_minutes)))
+                    window_end_dt = min(entry_dt, early_cutoff_dt)
+                    window_end_time_et = window_end_dt.strftime("%H:%M")
+                except Exception:
+                    window_end_time_et = str(entry_time_et)
+                window = filter_intraday_bars_until(bars_intraday, signal.signal_date, window_end_time_et)
                 lows = [float(b.get("low") or b.get("l") or 0.0) for b in window]
                 highs = [float(b.get("high") or b.get("h") or 0.0) for b in window]
                 min_low = min(lows) if lows else None
                 max_high = max(highs) if highs else None
-                if direction == "long" and min_low is not None and entry_price > 0:
-                    pullback_bps = ((entry_price - min_low) / entry_price) * 10000.0
-                    early_pullback_bps = pullback_bps
-                    if pullback_bps >= max_early_pullback_bps:
-                        continue
-                if direction == "short" and max_high is not None and entry_price > 0:
-                    pullback_bps = ((max_high - entry_price) / entry_price) * 10000.0
-                    early_pullback_bps = pullback_bps
-                    if pullback_bps >= max_early_pullback_bps:
-                        continue
+                last_close = None
+                if window:
+                    last_close = float(window[-1].get("close") or window[-1].get("c") or 0.0)
+                if direction == "long":
+                    if max_early_pullback_bps > 0 and min_low is not None and entry_price > 0:
+                        pullback_bps = ((entry_price - min_low) / entry_price) * 10000.0
+                        early_pullback_bps = pullback_bps
+                        if pullback_bps >= max_early_pullback_bps:
+                            continue
+                    if min_early_reversal_bps_long is not None and min_early_reversal_bps_long > 0 and min_low is not None:
+                        if last_close and last_close > 0:
+                            early_reversal_bps = ((last_close - min_low) / last_close) * 10000.0
+                            if early_reversal_bps < float(min_early_reversal_bps_long):
+                                continue
+                else:
+                    if max_early_pullback_bps > 0 and max_high is not None and entry_price > 0:
+                        pullback_bps = ((max_high - entry_price) / entry_price) * 10000.0
+                        early_pullback_bps = pullback_bps
+                        if pullback_bps >= max_early_pullback_bps:
+                            continue
+                    if min_early_reversal_bps_short is not None and min_early_reversal_bps_short > 0 and max_high is not None:
+                        if last_close and last_close > 0:
+                            early_reversal_bps = ((max_high - last_close) / last_close) * 10000.0
+                            if early_reversal_bps < float(min_early_reversal_bps_short):
+                                continue
         atr_end_idx = entry_idx - 1
         if entry_info.get("entry_source_date") != entry_date:
             atr_end_idx = entry_idx
@@ -976,8 +1166,8 @@ def build_trade(
             ):
                 continue
             # Optional floor on stop_distance vs daily ATR to avoid ultra-tight stops.
-            if min_stop_atr > 0 and atr is not None and atr > 0 and stop_distance < (atr * min_stop_atr):
-                stop_distance = atr * min_stop_atr
+            if min_stop_atr_dir > 0 and atr is not None and atr > 0 and stop_distance < (atr * min_stop_atr_dir):
+                stop_distance = atr * min_stop_atr_dir
             target_rr = target_distance / stop_distance
             if direction == "long":
                 stop_price = entry_price - stop_distance
@@ -1002,8 +1192,8 @@ def build_trade(
             ):
                 continue
             # Optional floor on stop_distance vs daily ATR to avoid ultra-tight stops.
-            if min_stop_atr > 0 and atr is not None and atr > 0 and stop_distance < (atr * min_stop_atr):
-                stop_distance = atr * min_stop_atr
+            if min_stop_atr_dir > 0 and atr is not None and atr > 0 and stop_distance < (atr * min_stop_atr_dir):
+                stop_distance = atr * min_stop_atr_dir
             if direction == "long":
                 stop_price = entry_price - stop_distance
                 target_price = entry_price + stop_distance * target_rr
@@ -1040,6 +1230,7 @@ def build_trade(
             target_window_samples=target_window_samples,
             gap_bps=gap_bps,
             early_pullback_bps=early_pullback_bps,
+            early_reversal_bps=early_reversal_bps,
             confirm_move_bps=confirm_move_bps if apply_confirm else None,
             confirm_minutes=confirm_minutes if apply_confirm else None,
             confirm_hit_bps=confirm_hit_bps,

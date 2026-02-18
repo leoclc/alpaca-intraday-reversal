@@ -1,0 +1,515 @@
+{
+  "date": "2025-02-05",
+  "watchlist": [
+    {
+      "symbol": "LYB",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 3,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999922,
+      "profit_factor": 3.5999999999999766,
+      "total_pnl_pct": 0.9427630134273091
+    },
+    {
+      "symbol": "AA",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.1987445551757931,
+      "profit_factor": 2.3974891103515863,
+      "total_pnl_pct": 0.9307567564693384
+    },
+    {
+      "symbol": "TTD",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.5,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.1,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.19999999999999,
+      "profit_factor": 2.39999999999998,
+      "total_pnl_pct": 0.6779325790920752
+    },
+    {
+      "symbol": "NOV",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.5,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999993,
+      "profit_factor": 2.3999999999999986,
+      "total_pnl_pct": 0.6468951109719859
+    },
+    {
+      "symbol": "TPG",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.200000000000015,
+      "profit_factor": 2.40000000000003,
+      "total_pnl_pct": 0.6404077777937172
+    },
+    {
+      "symbol": "MRVL",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.1,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1390489651549764,
+      "profit_factor": 1.1390489651549764,
+      "total_pnl_pct": 0.6249825517264332
+    },
+    {
+      "symbol": "AVGO",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999982,
+      "profit_factor": 1.1999999999999982,
+      "total_pnl_pct": 0.6022638452919915
+    },
+    {
+      "symbol": "WBD",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.199999999999995,
+      "profit_factor": 1.199999999999995,
+      "total_pnl_pct": 0.5429271972124946
+    },
+    {
+      "symbol": "SU",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.2000000000000086,
+      "profit_factor": 2.4000000000000172,
+      "total_pnl_pct": 0.5309023482212886
+    },
+    {
+      "symbol": "AMD",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 3,
+      "win_rate": 0.6666666666666666,
+      "avgR": 0.4666666666666604,
+      "profit_factor": 2.399999999999958,
+      "total_pnl_pct": 0.5196112048803403
+    },
+    {
+      "symbol": "BMY",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 4,
+      "win_rate": 0.75,
+      "avgR": 0.6499999999999776,
+      "profit_factor": 3.5999999999998282,
+      "total_pnl_pct": 0.5080338616707659
+    },
+    {
+      "symbol": "CMCSA",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.2000000000000217,
+      "profit_factor": 2.4000000000000434,
+      "total_pnl_pct": 0.49541274162204857
+    },
+    {
+      "symbol": "AEO",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.2000000000000164,
+      "profit_factor": 1.2000000000000164,
+      "total_pnl_pct": 0.4691147529862808
+    },
+    {
+      "symbol": "CVX",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.199999999999985,
+      "profit_factor": 2.39999999999997,
+      "total_pnl_pct": 0.4663747727965085
+    },
+    {
+      "symbol": "QCOM",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.2000000000000146,
+      "profit_factor": 1.2000000000000146,
+      "total_pnl_pct": 0.4260692210706224
+    },
+    {
+      "symbol": "FTV",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.5,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 1.0,
+      "avgR": 1.199999999999962,
+      "profit_factor": 2.399999999999924,
+      "total_pnl_pct": 0.4190873373809554
+    },
+    {
+      "symbol": "MCHP",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.200000000000001,
+      "profit_factor": 1.200000000000001,
+      "total_pnl_pct": 0.3824805038886539
+    },
+    {
+      "symbol": "DXCM",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 19.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999802,
+      "profit_factor": 1.1999999999999802,
+      "total_pnl_pct": 0.37070093810950044
+    },
+    {
+      "symbol": "MGM",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 22.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999857,
+      "profit_factor": 1.1999999999999857,
+      "total_pnl_pct": 0.3655590302552967
+    },
+    {
+      "symbol": "PYPL",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999809,
+      "profit_factor": 1.1999999999999809,
+      "total_pnl_pct": 0.3475241624867144
+    },
+    {
+      "symbol": "TECK",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999929,
+      "profit_factor": 1.1999999999999929,
+      "total_pnl_pct": 0.33483041064409963
+    },
+    {
+      "symbol": "PANW",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.199999999999982,
+      "profit_factor": 1.199999999999982,
+      "total_pnl_pct": 0.30773728526500255
+    },
+    {
+      "symbol": "XOM",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 22.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 4,
+      "win_rate": 0.5,
+      "avgR": 0.10000000000000911,
+      "profit_factor": 1.2000000000000222,
+      "total_pnl_pct": 0.30747082171873424
+    },
+    {
+      "symbol": "SCHW",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 22.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.199999999999978,
+      "profit_factor": 1.199999999999978,
+      "total_pnl_pct": 0.2880698371866791
+    },
+    {
+      "symbol": "ENTG",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.5,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999968,
+      "profit_factor": 1.1999999999999968,
+      "total_pnl_pct": 0.2759063515772093
+    },
+    {
+      "symbol": "DHR",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 22.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.200000000000013,
+      "profit_factor": 1.200000000000013,
+      "total_pnl_pct": 0.27279360861132346
+    },
+    {
+      "symbol": "AMCR",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.199999999999982,
+      "profit_factor": 1.199999999999982,
+      "total_pnl_pct": 0.2697427569766969
+    },
+    {
+      "symbol": "GE",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999817,
+      "profit_factor": 1.1999999999999817,
+      "total_pnl_pct": 0.25394105877250617
+    },
+    {
+      "symbol": "NVDA",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 22.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 2,
+      "win_rate": 0.5,
+      "avgR": 0.1000000000000068,
+      "profit_factor": 1.2000000000000182,
+      "total_pnl_pct": 0.2475640730305173
+    },
+    {
+      "symbol": "IP",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.2,
+        "min_stop_atr_long": 0.08,
+        "min_stop_atr_short": 0.05,
+        "max_confirm_hit_bps_short": 17.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 1,
+      "win_rate": 1.0,
+      "avgR": 1.1999999999999948,
+      "profit_factor": 1.1999999999999948,
+      "total_pnl_pct": 0.24511517830496718
+    }
+  ]
+}

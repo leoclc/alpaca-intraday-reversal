@@ -18,11 +18,21 @@ def market_filter_decision(
         return False, {}
 
     symbol = str(mf.get("symbol") or "SPY").upper()
-    bars = data_store.get_daily_bars(symbol, None, None, cfg=cfg, allow_fetch=True)
+    # Fetch a bounded history window so symbols not already cached on disk (e.g. SPY) still
+    # have enough bars for ATR/SMA computations (otherwise Alpaca may return only recent bars).
+    try:
+        tgt = ensure_date(date_str)
+    except Exception:
+        return False, {"reason": "invalid_date", "date": date_str, "symbol": symbol}
+    atr_period = int(mf.get("atr_period") or 14)
+    trend_days = int(mf.get("trend_ma_days") or 200)
+    # Use calendar days with a weekend buffer; trading-day exactness isn't required here.
+    lookback_days = max(atr_period + 10, trend_days + 10, 90)
+    start = (tgt - dt.timedelta(days=int(lookback_days * 3))).isoformat()
+    bars = data_store.get_daily_bars(symbol, start, date_str, cfg=cfg, allow_fetch=True)
     if not bars:
         return False, {"reason": "no_market_bars"}
 
-    tgt = ensure_date(date_str)
     idx = None
     for i, bar in enumerate(bars):
         if ensure_date(str(bar.get("date"))) == tgt:

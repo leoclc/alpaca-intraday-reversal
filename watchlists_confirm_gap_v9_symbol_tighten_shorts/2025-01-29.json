@@ -1,0 +1,65 @@
+{
+  "date": "2025-01-29",
+  "watchlist": [
+    {
+      "symbol": "NVDA",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.7,
+        "target_rr": 1.4,
+        "min_stop_atr": 0.1,
+        "max_confirm_hit_bps_short": 25.0
+      },
+      "trades_count": 4,
+      "win_rate": 0.75,
+      "avgR": 0.7090236426082842,
+      "profit_factor": 3.8360945704330986,
+      "total_pnl_pct": 1.1716980453007353
+    },
+    {
+      "symbol": "CVX",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.6,
+        "target_rr": 1.4,
+        "min_stop_atr": 0.08,
+        "max_confirm_hit_bps_short": 25.0
+      },
+      "trades_count": 6,
+      "win_rate": 0.8333333333333334,
+      "avgR": 0.9999999999999974,
+      "profit_factor": 7.000000000000273,
+      "total_pnl_pct": 1.021378104394024
+    },
+    {
+      "symbol": "AVGO",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.7,
+        "target_rr": 1.4,
+        "min_stop_atr": 0.08,
+        "max_confirm_hit_bps_short": 22.0
+      },
+      "trades_count": 3,
+      "win_rate": 0.6666666666666666,
+      "avgR": 0.6000000000000023,
+      "profit_factor": 2.800000000000029,
+      "total_pnl_pct": 0.8215063788127993
+    },
+    {
+      "symbol": "BMY",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.7,
+        "target_rr": 1.4,
+        "min_stop_atr": 0.08,
+        "max_confirm_hit_bps_short": 18.0
+      },
+      "trades_count": 4,
+      "win_rate": 0.75,
+      "avgR": 0.7999999999999842,
+      "profit_factor": 4.199999999999836,
+      "total_pnl_pct": 0.6260700717261789
+    }
+  ]
+}

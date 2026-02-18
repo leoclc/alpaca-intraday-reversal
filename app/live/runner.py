@@ -16,6 +16,7 @@ from app.market.filters import market_filter_decision
 from app.portfolio.sizing import compute_qty_with_guards
 from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
 from app.utils.time import ensure_et, et_now, parse_time_hhmm
+from app.watchlist.day_filter import day_filter_decision
 from app.watchlist.storage import expected_watchlist_date_str, read_watchlist
 
 
@@ -206,6 +207,10 @@ def run_live(
         logging.info("[LIVE] market filter skip date=%s info=%s", tgt, info)
         return ([], []) if return_plans else []
     symbols = [str(r.get("symbol") or "").upper() for r in wl.get("watchlist") or [] if r.get("symbol")]
+    skip_day, day_info = day_filter_decision(wl.get("watchlist") or [], cfg, meta=wl.get("meta"))
+    if skip_day:
+        logging.info("[LIVE] day_filter skip date=%s info=%s", tgt, day_info)
+        return ([], []) if return_plans else []
     symbol_overrides = {
         str(r.get("symbol") or "").upper(): (r.get("param_overrides") or {})
         for r in wl.get("watchlist") or []

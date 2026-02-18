@@ -13,6 +13,7 @@ from app.market.filters import market_filter_decision
 from app.strategies.daily_trend_reversal import build_trade, generate_signals
 from app.strategies.types import TradeResult
 from app.utils.time import iter_trading_days, parse_time_hhmm
+from app.watchlist.day_filter import day_filter_decision
 from app.watchlist.storage import read_watchlist
 
 _DEFAULT_RUN_ID: Optional[str] = None
@@ -63,6 +64,10 @@ def run_replay(
             continue
         wl = read_watchlist(date_str, cfg)
         wl_rows = wl.get("watchlist") or []
+        skip_day, day_info = day_filter_decision(wl_rows, cfg, meta=wl.get("meta"))
+        if skip_day:
+            logging.info("[REPLAY] day_filter skip date=%s info=%s", date_str, day_info)
+            continue
         symbol_entry_time = {
             str(r.get("symbol") or "").upper(): str(r.get("entry_time_et") or "")
             for r in wl_rows
@@ -256,6 +261,7 @@ def run_replay(
                         "target_window_samples": getattr(plan, "target_window_samples", None),
                         "gap_bps": getattr(plan, "gap_bps", None),
                         "early_pullback_bps": getattr(plan, "early_pullback_bps", None),
+                        "early_reversal_bps": getattr(plan, "early_reversal_bps", None),
                         "confirm_move_bps": getattr(plan, "confirm_move_bps", None),
                         "confirm_minutes": getattr(plan, "confirm_minutes", None),
                         "confirm_hit_bps": getattr(plan, "confirm_hit_bps", None),

@@ -236,6 +236,8 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "entry_date",
         "symbol",
         "direction",
+        "entry_time_et",
+        "entry_price_mode",
         "exit_reason",
         "r_multiple",
         "pnl_total",
@@ -247,6 +249,10 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "entry_price",
         "gap_bps",
         "early_pullback_bps",
+        "early_reversal_bps",
+        "confirm_move_bps",
+        "confirm_minutes",
+        "confirm_hit_bps",
         "mfe_r",
         "mae_r",
         "day_mfe_r",
@@ -270,9 +276,24 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         by_month[str(t.get("_month") or "")].append(t)
     month_rows: List[Dict[str, Any]] = []
 
-    # Month equity return from daily curve (preferred), falling back to trade pnl.
+    # Month equity return from backtest_monthly.csv (preferred; exact), then daily curve fallback.
     month_equity: Dict[str, Dict[str, Any]] = {}
-    if daily_rows:
+    monthly_bt_path = run_dir / "backtest_monthly.csv"
+    monthly_bt_rows = _read_csv_rows(monthly_bt_path) if monthly_bt_path.exists() else []
+    if monthly_bt_rows:
+        for row in monthly_bt_rows:
+            m = _iso_month(row.get("month") or "")
+            if not m:
+                continue
+            start_eq = _safe_float(row.get("start_equity"))
+            end_eq = _safe_float(row.get("end_equity"))
+            month_equity[m] = {
+                "start_equity": start_eq,
+                "end_equity": end_eq,
+                "equity_change": end_eq - start_eq,
+                "equity_return_pct": ((end_eq - start_eq) / start_eq * 100.0) if start_eq > 0 else None,
+            }
+    elif daily_rows:
         by_month_daily: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         for row in daily_rows:
             by_month_daily[_iso_month(row.get("date") or "")].append(row)
@@ -305,6 +326,8 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
                 "win_rate": a["win_rate"],
                 "avgR": a["avgR"],
                 "pnl_total": a["pnl_total"],
+                "start_equity": eq.get("start_equity"),
+                "end_equity": eq.get("end_equity"),
                 "equity_return_pct": eq.get("equity_return_pct"),
                 "stops": a["stops"],
                 "targets": a["targets"],
@@ -322,6 +345,8 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
             "win_rate",
             "avgR",
             "pnl_total",
+            "start_equity",
+            "end_equity",
             "equity_return_pct",
             "stops",
             "targets",
@@ -571,4 +596,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

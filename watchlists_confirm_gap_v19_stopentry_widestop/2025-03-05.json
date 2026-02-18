@@ -1,0 +1,82 @@
+{
+  "date": "2025-03-05",
+  "watchlist": [
+    {
+      "symbol": "BHP",
+      "direction": "short",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 1.2,
+        "target_rr": 1.2,
+        "confirm_move_bps": 4.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 10,
+      "win_rate": 0.7,
+      "avgR": 0.13076886568008386,
+      "stdR": 0.8091715053668749,
+      "avgR_stderr": 0.2558824974666486,
+      "profit_factor": 1.435896218933608,
+      "total_pnl_pct": 0.46405040829716704
+    },
+    {
+      "symbol": "EPD",
+      "direction": "long",
+      "entry_time_et": "09:40",
+      "param_overrides": {
+        "target_window_mult": 0.8,
+        "target_rr": 1.2,
+        "confirm_move_bps": 4.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 10,
+      "win_rate": 0.5,
+      "avgR": 0.10000000000001333,
+      "stdR": 1.1000000000000094,
+      "avgR_stderr": 0.34785054261852466,
+      "profit_factor": 1.2000000000000275,
+      "total_pnl_pct": 0.12759156397454413
+    }
+  ],
+  "meta": {
+    "funnel": {
+      "scanned_symbols": 169,
+      "signals_found": 4673,
+      "trades_simulated": 23056,
+      "symbols_passing_filters": 2,
+      "watchlist_size": 2
+    },
+    "reject_counts": {
+      "min_trades": 166,
+      "neg_pnl": 46,
+      "min_pf": 40,
+      "min_avg_r": 15,
+      "min_win_rate": 36
+    },
+    "selected_summary": {
+      "size": 2,
+      "avg_selected_avgR": 0.1153844328400486,
+      "avg_selected_win_rate": 0.6,
+      "avg_selected_profit_factor": 1.3179481094668177,
+      "avg_selected_total_pnl_pct": 0.2958209861358556,
+      "long_count": 1,
+      "short_count": 1
+    },
+    "entry_time_counts": {
+      "09:35": 1,
+      "09:40": 1
+    },
+    "filters": {
+      "minTrades": 10,
+      "reject_negative_pnl": true,
+      "minProfitFactor": 0.6,
+      "minAvgR": -0.05,
+      "minWinRate": 0.35,
+      "top_k": 30,
+      "entry_time_rank_by": "avgr",
+      "top_k_rank_by": "avgr_lcb",
+      "param_rank_by": "avgr_lcb",
+      "directional_history_only": true
+    }
+  }
+}

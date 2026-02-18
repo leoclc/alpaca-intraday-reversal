@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import datetime as dt
+import hashlib
+import os
 import time
 import json
 import logging
@@ -11,8 +13,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intraday_bars
 from app.execution.daily_execution_model import simulate_exit
-from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date, generate_signals
+from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date, generate_signals_cached
 from app.utils.time import ensure_date, parse_time_hhmm
+from app.watchlist.day_filter import summarize_watchlist_rows
 from app.watchlist.node_assets import fetch_asset_symbols, resolve_watchlist_asset_filters, resolve_watchlist_builder_base
 from app.watchlist.storage import expected_watchlist_date_str, write_watchlist
 
@@ -23,17 +26,197 @@ class TradeLite:
     r_multiple: float
 
 
+@dataclass
+class CandidateAcc:
+    trades_count: int = 0
+    wins: int = 0
+    sum_r: float = 0.0
+    sum_r2: float = 0.0
+    sum_pnl_pct: float = 0.0
+    gross_profit_r: float = 0.0
+    gross_loss_r: float = 0.0  # abs(sum(neg r))
+
+
+@dataclass
+class SymbolRollingState:
+    # All signals for this symbol keyed by signal_date (YYYY-MM-DD).
+    signals_by_date: Dict[str, object]
+    # The set of signal_dates currently included in the rolling lookback window.
+    window_signal_dates: set[str]
+    # Rolling aggregates for each candidate (entry_time, grid_idx) over window_signal_dates.
+    acc_by_candidate: Dict[Tuple[str, int], CandidateAcc]
+    window_start_date: str = ""
+    window_end_date: str = ""
+
+
+# Per-symbol rolling cache so backtest watchlists don't rescan 252 days of signals on every trading day.
+# Keyed by (symbol, direction_key) where direction_key is either "all" (non-directional history)
+# or the specific direction ("long"/"short") when directional_history_only=True.
+_ROLLING_STATE: Dict[Tuple[str, str], SymbolRollingState] = {}
+
+# Cache signals_by_date per symbol so direction-specific rolling states can share it without recomputing.
+_SIGNALS_BY_SYMBOL: Dict[str, Dict[str, object]] = {}
+
+
 # Cache of per-signal trade outcomes used for watchlist scoring. This is safe (no lookahead) because keys include
 # the signal date; the caller still decides which dates are eligible for a given target day.
-_TRADE_LITE_CACHE: Dict[Tuple[str, str, str, str, str], Optional[TradeLite]] = {}
+_TRADE_LITE_CACHE: Dict[Tuple[str, str, str, str, str, str], Optional[TradeLite]] = {}
+_TRADE_LITE_DISK_LOADED: set[Tuple[str, str, str, str]] = set()
+
+# Bump this whenever the trade-lite computation logic changes so we don't reuse stale caches.
+_TRADE_LITE_CACHE_VERSION = 3
 
 
-def _trade_cache_key(symbol: str, signal_date: str, direction: str, entry_time: str, overrides: Dict) -> Tuple[str, str, str, str, str]:
+def _trade_lite_namespace(cfg: Dict) -> str:
+    """Namespace trade-lite caches by strategy params so we don't mix outcomes across configs."""
+    params = cfg.get("daily_trend_reversal") or {}
     try:
-        overrides_key = json.dumps(overrides or {}, sort_keys=True, separators=(",", ":"))
+        raw = json.dumps({"v": _TRADE_LITE_CACHE_VERSION, "params": params}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     except Exception:
-        overrides_key = str(overrides or {})
-    return (str(symbol).upper(), str(signal_date), str(direction).lower(), str(entry_time), overrides_key)
+        raw = f"v={_TRADE_LITE_CACHE_VERSION}|{str(params)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _trade_lite_cache_dir(cfg: Dict) -> Path:
+    base = cfg.get("trade_lite_cache_dir") or "cache/trade_lites"
+    path = Path(str(base))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _trade_lite_disk_path(cfg: Dict, *, namespace: str, symbol: str, signal_date: str, direction: str) -> Path:
+    sym = str(symbol).upper().strip()
+    direc = str(direction).lower().strip() or "x"
+    ns = str(namespace)
+    # One file per (namespace, symbol, signal_date, direction) storing all candidates for that signal.
+    return _trade_lite_cache_dir(cfg) / ns / sym / f"{str(signal_date)}_{direc}.json"
+
+
+def _load_trade_lite_disk_cache(path: Path) -> Dict[str, Dict[str, Optional[TradeLite]]]:
+    if not path.exists() or path.stat().st_size <= 0:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, dict):
+        return {}
+    out: Dict[str, Dict[str, Optional[TradeLite]]] = {}
+    for entry_time, mapping in candidates.items():
+        if not isinstance(mapping, dict):
+            continue
+        et = str(entry_time or "")
+        if not et:
+            continue
+        inner: Dict[str, Optional[TradeLite]] = {}
+        for overrides_key, val in mapping.items():
+            ok = str(overrides_key)
+            if val is None:
+                inner[ok] = None
+                continue
+            if isinstance(val, list) and len(val) == 2:
+                try:
+                    inner[ok] = TradeLite(pnl_pct=float(val[0]), r_multiple=float(val[1]))
+                except Exception:
+                    inner[ok] = None
+                continue
+            if isinstance(val, dict):
+                try:
+                    inner[ok] = TradeLite(pnl_pct=float(val.get("pnl_pct") or 0.0), r_multiple=float(val.get("r_multiple") or 0.0))
+                except Exception:
+                    inner[ok] = None
+                continue
+        if inner:
+            out[et] = inner
+    return out
+
+
+def _save_trade_lite_disk_cache(
+    path: Path,
+    *,
+    namespace: str,
+    symbol: str,
+    signal_date: str,
+    direction: str,
+    updates: Dict[str, Dict[str, Optional[TradeLite]]],
+) -> None:
+    if not updates:
+        return
+    try:
+        existing: Dict[str, object] = {}
+        if path.exists() and path.stat().st_size > 0:
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        candidates: Dict[str, Dict[str, object]] = {}
+        if isinstance(existing.get("candidates"), dict):
+            for k, v in existing.get("candidates", {}).items():  # type: ignore[assignment]
+                if isinstance(v, dict):
+                    candidates[str(k)] = {str(ok): v[ok] for ok in v}
+
+        for entry_time, mapping in updates.items():
+            et = str(entry_time or "")
+            if not et or not isinstance(mapping, dict):
+                continue
+            row = candidates.get(et) or {}
+            for overrides_key, lite in mapping.items():
+                ok = str(overrides_key)
+                if lite is None:
+                    row[ok] = None
+                else:
+                    row[ok] = [float(lite.pnl_pct), float(lite.r_multiple)]
+            candidates[et] = row
+
+        existing["meta"] = {
+            "namespace": str(namespace),
+            "symbol": str(symbol).upper(),
+            "signal_date": str(signal_date),
+            "direction": str(direction).lower(),
+        }
+        existing["candidates"] = candidates
+        payload = json.dumps(existing, separators=(",", ":"), sort_keys=True)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        try:
+            if "tmp" in locals() and tmp.exists():
+                tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _overrides_key(overrides: Dict) -> str:
+    try:
+        return json.dumps(overrides or {}, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(overrides or {})
+
+
+def _trade_cache_key(
+    namespace: str, symbol: str, signal_date: str, direction: str, entry_time: str, overrides: Dict
+) -> Tuple[str, str, str, str, str, str]:
+    try:
+        ok = _overrides_key(overrides)
+    except Exception:
+        ok = str(overrides or {})
+    return (
+        str(namespace),
+        str(symbol).upper(),
+        str(signal_date),
+        str(direction).lower(),
+        str(entry_time),
+        ok,
+    )
 
 
 def _lookback_start_date(target_date: dt.date, lookback_days: int) -> dt.date:
@@ -104,6 +287,67 @@ def _compute_stats(trades: List[TradeLite]) -> Dict[str, float]:
     }
 
 
+def _acc_add(acc: CandidateAcc, lite: TradeLite) -> None:
+    acc.trades_count += 1
+    acc.sum_r += float(lite.r_multiple)
+    r = float(lite.r_multiple)
+    acc.sum_r2 += r * r
+    acc.sum_pnl_pct += float(lite.pnl_pct)
+    if r > 0:
+        acc.wins += 1
+        acc.gross_profit_r += r
+    elif r < 0:
+        acc.gross_loss_r += abs(r)
+
+
+def _acc_sub(acc: CandidateAcc, lite: TradeLite) -> None:
+    acc.trades_count -= 1
+    acc.sum_r -= float(lite.r_multiple)
+    r = float(lite.r_multiple)
+    acc.sum_r2 -= r * r
+    acc.sum_pnl_pct -= float(lite.pnl_pct)
+    if r > 0:
+        acc.wins -= 1
+        acc.gross_profit_r -= r
+    elif r < 0:
+        acc.gross_loss_r -= abs(r)
+
+
+def _stats_from_acc(acc: CandidateAcc) -> Dict[str, float]:
+    import math
+
+    if acc.trades_count <= 0:
+        return {
+            "trades_count": 0,
+            "win_rate": 0.0,
+            "avgR": 0.0,
+            "stdR": 0.0,
+            "avgR_stderr": 0.0,
+            "profit_factor": 0.0,
+            "total_pnl_pct": 0.0,
+        }
+    win_rate = float(acc.wins) / float(acc.trades_count) if acc.trades_count > 0 else 0.0
+    n = float(acc.trades_count)
+    avg_r = float(acc.sum_r) / n if n > 0 else 0.0
+    # Population std is fine for ranking; we primarily want a monotonic penalty for small-N and volatile series.
+    var_r = max((float(acc.sum_r2) / n) - (avg_r * avg_r), 0.0) if n > 0 else 0.0
+    std_r = math.sqrt(var_r)
+    avg_r_stderr = (std_r / math.sqrt(n)) if n > 1 else std_r
+    if acc.gross_loss_r > 0:
+        profit_factor = float(acc.gross_profit_r) / float(acc.gross_loss_r)
+    else:
+        profit_factor = float(acc.gross_profit_r) if acc.gross_profit_r > 0 else 0.0
+    return {
+        "trades_count": int(acc.trades_count),
+        "win_rate": win_rate,
+        "avgR": avg_r,
+        "stdR": std_r,
+        "avgR_stderr": avg_r_stderr,
+        "profit_factor": profit_factor,
+        "total_pnl_pct": float(acc.sum_pnl_pct),
+    }
+
+
 def _add_minutes(time_str: str, minutes: int) -> str:
     if not time_str or minutes <= 0:
         return time_str
@@ -115,6 +359,127 @@ def _add_minutes(time_str: str, minutes: int) -> str:
         return time_str
 
 
+def _trade_lites_for_signal(
+    symbol: str,
+    signal: object,
+    *,
+    trade_ns: str,
+    cfg: Dict,
+    data_store: AlpacaOHLCStore,
+    bars_daily: List[Dict],
+    entry_times: List[str],
+    param_grid: List[Dict],
+    minutes_needed_base: int,
+    apply_confirm: bool,
+    confirm_minutes: int,
+) -> Dict[Tuple[str, int], Optional[TradeLite]]:
+    # Return per-candidate trade outcome for a given signal_date, computing missing candidates and
+    # caching results in _TRADE_LITE_CACHE. Keys are (entry_time, grid_idx).
+    sym = str(symbol).upper()
+    signal_date = str(getattr(signal, "signal_date", "") or "")
+    direction = str(getattr(signal, "direction", "") or "").lower()
+
+    disk_key = (str(trade_ns), sym, signal_date, direction)
+    if disk_key not in _TRADE_LITE_DISK_LOADED and signal_date and direction:
+        path = _trade_lite_disk_path(cfg, namespace=trade_ns, symbol=sym, signal_date=signal_date, direction=direction)
+        loaded = _load_trade_lite_disk_cache(path)
+        if loaded:
+            for entry_time, mapping in loaded.items():
+                for ok, lite in mapping.items():
+                    cache_key = (str(trade_ns), sym, signal_date, direction, str(entry_time), str(ok))
+                    _TRADE_LITE_CACHE.setdefault(cache_key, lite)
+        _TRADE_LITE_DISK_LOADED.add(disk_key)
+
+    cached_by_candidate: Dict[Tuple[str, int], Optional[TradeLite]] = {}
+    any_missing = False
+    for entry_time in entry_times:
+        for grid_idx, overrides in enumerate(param_grid):
+            cache_key = _trade_cache_key(trade_ns, sym, signal_date, direction, entry_time, overrides)
+            if cache_key in _TRADE_LITE_CACHE:
+                cached_by_candidate[(entry_time, grid_idx)] = _TRADE_LITE_CACHE[cache_key]
+            else:
+                any_missing = True
+    if not any_missing:
+        return cached_by_candidate
+
+    bars_intraday = None
+    if minutes_needed_base > 0:
+        bars_intraday = get_intraday_bars(sym, signal_date, minutes_needed_base, cfg=cfg, allow_fetch=True)
+        if not bars_intraday:
+            # Preserve existing semantics: treat as "no trade" for this signal (do not cache),
+            # allowing future attempts if data becomes available.
+            return cached_by_candidate
+
+    intraday_entry_cache: Dict[str, List[dict]] = {}
+    for entry_time in entry_times:
+        cutoff_time = entry_time
+        if apply_confirm:
+            cutoff_time = _add_minutes(entry_time, confirm_minutes)
+        if bars_intraday and entry_time and entry_time not in intraday_entry_cache:
+            intraday_entry_cache[entry_time] = filter_intraday_bars_until(
+                bars_intraday,
+                signal_date,
+                cutoff_time,
+            )
+        for grid_idx, overrides in enumerate(param_grid):
+            cache_key = _trade_cache_key(trade_ns, sym, signal_date, direction, entry_time, overrides)
+            if cache_key in _TRADE_LITE_CACHE:
+                cached_by_candidate[(entry_time, grid_idx)] = _TRADE_LITE_CACHE[cache_key]
+                continue
+            bars_intraday_entry = bars_intraday
+            if bars_intraday and entry_time:
+                bars_intraday_entry = intraday_entry_cache.get(entry_time) or []
+            plan = build_trade(
+                signal,
+                cfg,
+                data_store,
+                context="watchlist",
+                bars_intraday=bars_intraday_entry,
+                entry_time_override=entry_time,
+                param_overrides=overrides,
+            )
+            if not plan:
+                _TRADE_LITE_CACHE[cache_key] = None
+                cached_by_candidate[(entry_time, grid_idx)] = None
+                continue
+            exit_info = simulate_exit(plan, "daily", bars_daily, bars_intraday, cfg)
+            if not exit_info:
+                _TRADE_LITE_CACHE[cache_key] = None
+                cached_by_candidate[(entry_time, grid_idx)] = None
+                continue
+            direction_mult = 1.0 if plan.direction == "long" else -1.0
+            pnl = (float(exit_info["exit_price"]) - plan.entry_price) * direction_mult
+            pnl_pct = (pnl / plan.entry_price) * 100.0
+            r_multiple = pnl / plan.stop_distance
+            lite = TradeLite(pnl_pct=pnl_pct, r_multiple=r_multiple)
+            _TRADE_LITE_CACHE[cache_key] = lite
+            cached_by_candidate[(entry_time, grid_idx)] = lite
+
+    # Persist newly computed candidates so subsequent runs can resume quickly without recomputing.
+    if bars_intraday and signal_date and direction:
+        updates: Dict[str, Dict[str, Optional[TradeLite]]] = {}
+        for entry_time in entry_times:
+            inner: Dict[str, Optional[TradeLite]] = {}
+            for overrides in param_grid:
+                ok = _overrides_key(overrides)
+                ck = (str(trade_ns), sym, signal_date, direction, str(entry_time), ok)
+                if ck in _TRADE_LITE_CACHE:
+                    inner[ok] = _TRADE_LITE_CACHE[ck]
+            if inner:
+                updates[str(entry_time)] = inner
+        if updates:
+            path = _trade_lite_disk_path(cfg, namespace=trade_ns, symbol=sym, signal_date=signal_date, direction=direction)
+            _save_trade_lite_disk_cache(
+                path,
+                namespace=trade_ns,
+                symbol=sym,
+                signal_date=signal_date,
+                direction=direction,
+                updates=updates,
+            )
+    return cached_by_candidate
+
+
 def build_watchlist(
     cfg: Dict,
     target_date: Optional[str] = None,
@@ -124,6 +489,7 @@ def build_watchlist(
 ) -> List[Dict]:
     data_store = data_store or AlpacaOHLCStore(cfg=cfg)
     watch_cfg = cfg.get("watchlist") or {}
+    trade_ns = _trade_lite_namespace(cfg)
     lookback_days = int(watch_cfg.get("lookback_days") or 90)
     min_trades = int(watch_cfg.get("minTrades") or 0)
     reject_negative_pnl = bool(watch_cfg.get("reject_negative_pnl", False))
@@ -138,7 +504,12 @@ def build_watchlist(
         min_avg_r = None
     top_k = int(watch_cfg.get("top_k") or 0)
     top_k_rank_by = str(watch_cfg.get("top_k_rank_by") or "total_pnl_pct").lower()
+    directional_history_only = bool(watch_cfg.get("directional_history_only", False))
     report_enabled = bool(watch_cfg.get("report_enabled", False) or cfg.get("watchlist_report_enabled", False))
+    try:
+        rank_lcb_z = float(watch_cfg.get("rank_lcb_z") or 1.0)
+    except Exception:
+        rank_lcb_z = 1.0
     param_grid = _expand_param_grid(watch_cfg.get("param_grid") or {})
     progress_interval_sec = int(watch_cfg.get("progress_interval_sec") or 60)
     tgt = expected_watchlist_date_str(target_date)
@@ -278,104 +649,148 @@ def build_watchlist(
         start_date = str(bars[start_idx]["date"])
         end_date = str(bars[end_idx]["date"])
 
+        signals_by_date = _SIGNALS_BY_SYMBOL.get(symbol)
+        if signals_by_date is None:
+            signals_all = generate_signals_cached(symbol, cfg, data_store)
+            if not signals_all:
+                continue
+            signals_by_date = {str(s.signal_date): s for s in signals_all}
+            _SIGNALS_BY_SYMBOL[symbol] = signals_by_date
+
         # Only include symbols that have a signal for the target trading day.
         # This keeps parity with live: the watchlist for day D is the set of symbols we would actually
         # attempt to trade on day D (signal uses daily data through D-1 close only).
-        signal_today = generate_signal_for_date(symbol, tgt, cfg, data_store)
+        signal_today = signals_by_date.get(str(tgt))
+        if signal_today is None:
+            # Support building a watchlist for the "next" trading day before a daily bar exists for that date.
+            signal_today = generate_signal_for_date(symbol, tgt, cfg, data_store)
         if signal_today is None:
             continue
 
+        signal_today_direction = ""
+        direction_key = "all"
+        if directional_history_only:
+            signal_today_direction = str(getattr(signal_today, "direction", "") or "").lower()
+            direction_key = signal_today_direction or "x"
+
+        state = _ROLLING_STATE.get((symbol, direction_key))
+        if state is None:
+            state = SymbolRollingState(signals_by_date=signals_by_date, window_signal_dates=set(), acc_by_candidate={})
+            _ROLLING_STATE[(symbol, direction_key)] = state
+
         funnel["scanned_symbols"] += 1
-        signals = generate_signals([symbol], start_date, end_date, cfg, data_store)
-        funnel["signals_found"] += len(signals)
-        trades_by_candidate: Dict[tuple, List[TradeLite]] = {}
-        for entry_time in entry_times:
-            for grid_idx in range(len(param_grid)):
-                trades_by_candidate[(entry_time, grid_idx)] = []
-        for signal in signals:
-            # We only need intraday bars if we are going to compute any missing candidates for this signal.
-            bars_intraday = None
-            cached_by_candidate: Dict[Tuple[str, int], Optional[TradeLite]] = {}
-            any_missing = False
+
+        # Signal dates eligible for scoring are only through D-1 (end_date).
+        if directional_history_only:
+            new_window_dates = {
+                d
+                for d, sig in signals_by_date.items()
+                if start_date <= d <= end_date and str(getattr(sig, "direction", "") or "").lower() == signal_today_direction
+            }
+        else:
+            new_window_dates = {d for d in signals_by_date.keys() if start_date <= d <= end_date}
+        funnel["signals_found"] += len(new_window_dates)
+
+        # Initialize rolling accumulators once per symbol.
+        if not state.acc_by_candidate:
             for entry_time in entry_times:
-                for grid_idx, overrides in enumerate(param_grid):
-                    cache_key = _trade_cache_key(symbol, signal.signal_date, signal.direction, entry_time, overrides)
-                    if cache_key in _TRADE_LITE_CACHE:
-                        cached_by_candidate[(entry_time, grid_idx)] = _TRADE_LITE_CACHE[cache_key]
-                    else:
-                        any_missing = True
-            if not any_missing:
-                for (entry_time, grid_idx), cached in cached_by_candidate.items():
-                    if cached is not None:
-                        trades_by_candidate[(entry_time, grid_idx)].append(cached)
+                for grid_idx in range(len(param_grid)):
+                    state.acc_by_candidate[(entry_time, grid_idx)] = CandidateAcc()
+
+        # If callers move backwards in time (or window jumps earlier), rebuild from scratch for safety.
+        if state.window_start_date and (start_date < state.window_start_date or end_date < state.window_end_date):
+            state.window_signal_dates = set()
+            for k in list(state.acc_by_candidate.keys()):
+                state.acc_by_candidate[k] = CandidateAcc()
+
+        removed_dates = state.window_signal_dates - new_window_dates
+        added_dates = new_window_dates - state.window_signal_dates
+
+        # Remove dropped signal dates using only cached outcomes (do not fetch intraday here).
+        for d in sorted(removed_dates):
+            sig = signals_by_date.get(d)
+            if sig is None:
                 continue
-            if minutes_needed_base > 0:
-                bars_intraday = get_intraday_bars(symbol, signal.signal_date, minutes_needed_base, cfg=cfg, allow_fetch=True)
-                if not bars_intraday:
-                    continue
-            intraday_entry_cache: Dict[str, List[dict]] = {}
             for entry_time in entry_times:
-                cutoff_time = entry_time
-                if apply_confirm:
-                    cutoff_time = _add_minutes(entry_time, confirm_minutes)
-                if bars_intraday and entry_time and entry_time not in intraday_entry_cache:
-                    intraday_entry_cache[entry_time] = filter_intraday_bars_until(
-                        bars_intraday,
-                        signal.signal_date,
-                        cutoff_time,
-                    )
                 for grid_idx, overrides in enumerate(param_grid):
-                    cache_key = _trade_cache_key(symbol, signal.signal_date, signal.direction, entry_time, overrides)
-                    if cache_key in _TRADE_LITE_CACHE:
-                        cached = _TRADE_LITE_CACHE[cache_key]
-                        if cached is not None:
-                            trades_by_candidate[(entry_time, grid_idx)].append(cached)
-                        continue
-                    bars_intraday_entry = bars_intraday
-                    if bars_intraday and entry_time:
-                        bars_intraday_entry = intraday_entry_cache.get(entry_time) or []
-                    plan = build_trade(
-                        signal,
-                        cfg,
-                        data_store,
-                        context="watchlist",
-                        bars_intraday=bars_intraday_entry,
-                        entry_time_override=entry_time,
-                        param_overrides=overrides,
+                    cache_key = _trade_cache_key(
+                        trade_ns,
+                        symbol,
+                        d,
+                        str(getattr(sig, "direction", "") or "").lower(),
+                        entry_time,
+                        overrides,
                     )
-                    if not plan:
-                        _TRADE_LITE_CACHE[cache_key] = None
-                        continue
-                    exit_info = simulate_exit(plan, "daily", bars, bars_intraday, cfg)
-                    if not exit_info:
-                        _TRADE_LITE_CACHE[cache_key] = None
-                        continue
-                    direction_mult = 1.0 if plan.direction == "long" else -1.0
-                    pnl = (float(exit_info["exit_price"]) - plan.entry_price) * direction_mult
-                    pnl_pct = (pnl / plan.entry_price) * 100.0
-                    r_multiple = pnl / plan.stop_distance
-                    lite = TradeLite(pnl_pct=pnl_pct, r_multiple=r_multiple)
-                    _TRADE_LITE_CACHE[cache_key] = lite
-                    trades_by_candidate[(entry_time, grid_idx)].append(lite)
-        total_trades_sim = sum(len(t) for t in trades_by_candidate.values())
-        funnel["trades_simulated"] += total_trades_sim
+                    lite = _TRADE_LITE_CACHE.get(cache_key)
+                    if lite is not None:
+                        _acc_sub(state.acc_by_candidate[(entry_time, grid_idx)], lite)
+
+        # Add newly included signal dates (compute missing candidates as needed).
+        for d in sorted(added_dates):
+            sig = signals_by_date.get(d)
+            if sig is None:
+                continue
+            lites = _trade_lites_for_signal(
+                symbol,
+                sig,
+                trade_ns=trade_ns,
+                cfg=cfg,
+                data_store=data_store,
+                bars_daily=bars,
+                entry_times=entry_times,
+                param_grid=param_grid,
+                minutes_needed_base=minutes_needed_base,
+                apply_confirm=apply_confirm,
+                confirm_minutes=confirm_minutes,
+            )
+            for entry_time in entry_times:
+                for grid_idx in range(len(param_grid)):
+                    lite = lites.get((entry_time, grid_idx))
+                    if lite is not None:
+                        _acc_add(state.acc_by_candidate[(entry_time, grid_idx)], lite)
+
+        state.window_signal_dates = new_window_dates
+        state.window_start_date = start_date
+        state.window_end_date = end_date
+
+        total_trades_sim = sum(acc.trades_count for acc in state.acc_by_candidate.values())
+        funnel["trades_simulated"] += int(total_trades_sim)
+
         # Pick best entry time + param combo per symbol.
+        # Important: when minTrades is configured, prefer candidates that already satisfy it.
+        # This avoids selecting a high-score/low-sample candidate and rejecting the symbol later.
         best_time = entry_times[0]
         best_params = param_grid[0] if param_grid else {}
-        best_stats = _compute_stats(trades_by_candidate.get((best_time, 0), []))
+        best_stats = _stats_from_acc(state.acc_by_candidate.get((best_time, 0), CandidateAcc()))
+
         def _score(stats: Dict[str, float]) -> float:
             if param_rank_by in ("total_pnl_pct", "pnl", "total_pnl"):
                 return float(stats.get("total_pnl_pct") or 0.0)
             if param_rank_by in ("profit_factor", "pf"):
                 return float(stats.get("profit_factor") or 0.0)
+            if param_rank_by in ("avgr_lcb", "avgr-lcb", "avgR_lcb", "avgR-lcb", "lcb"):
+                base = float(stats.get("avgR") or 0.0)
+                se = float(stats.get("avgR_stderr") or 0.0)
+                return base - (rank_lcb_z * se)
             return float(stats.get("avgR") or 0.0)
+
+        candidates: List[Tuple[str, Dict, Dict[str, float]]] = []
         for entry_time in entry_times:
             for grid_idx, overrides in enumerate(param_grid):
-                stats = _compute_stats(trades_by_candidate.get((entry_time, grid_idx), []))
-                if _score(stats) > _score(best_stats):
-                    best_time = entry_time
-                    best_params = overrides
-                    best_stats = stats
+                stats = _stats_from_acc(state.acc_by_candidate.get((entry_time, grid_idx), CandidateAcc()))
+                candidates.append((entry_time, overrides, stats))
+
+        eligible = candidates
+        if min_trades > 0:
+            with_min_trades = [c for c in candidates if int(c[2].get("trades_count") or 0) >= min_trades]
+            if with_min_trades:
+                eligible = with_min_trades
+
+        for entry_time, overrides, stats in eligible:
+            if _score(stats) > _score(best_stats):
+                best_time = entry_time
+                best_params = overrides
+                best_stats = stats
         stats = best_stats
         trades_samples.append(int(stats["trades_count"]))
         pnl_samples.append(float(stats["total_pnl_pct"]))
@@ -410,6 +825,7 @@ def build_watchlist(
             report_rows.append(
                 {
                     "symbol": symbol,
+                    "direction": str(getattr(signal_today, "direction", "") or "").lower(),
                     "entry_time_et": best_time,
                     "param_overrides": best_params,
                     **stats,
@@ -434,7 +850,15 @@ def build_watchlist(
                 last_log_ts = now_ts
             continue
         funnel["symbols_passing_filters"] += 1
-        watchlist.append({"symbol": symbol, "entry_time_et": best_time, "param_overrides": best_params, **stats})
+        watchlist.append(
+            {
+                "symbol": symbol,
+                "direction": str(getattr(signal_today, "direction", "") or "").lower(),
+                "entry_time_et": best_time,
+                "param_overrides": best_params,
+                **stats,
+            }
+        )
         now_ts = time.time()
         if progress_interval_sec > 0 and (now_ts - last_log_ts) >= progress_interval_sec:
             elapsed = int(now_ts - start_ts)
@@ -455,6 +879,10 @@ def build_watchlist(
         def _rank_key(row: Dict) -> float:
             if top_k_rank_by in ("avgR", "avgr"):
                 return float(row.get("avgR") or 0.0)
+            if top_k_rank_by in ("avgr_lcb", "avgr-lcb", "avgR_lcb", "avgR-lcb", "lcb"):
+                base = float(row.get("avgR") or 0.0)
+                se = float(row.get("avgR_stderr") or 0.0)
+                return base - (rank_lcb_z * se)
             if top_k_rank_by in ("profit_factor", "pf"):
                 return float(row.get("profit_factor") or 0.0)
             if top_k_rank_by in ("win_rate", "winrate"):
@@ -514,17 +942,38 @@ def build_watchlist(
                 pf_samples[int(len(pf_samples) * 0.9) - 1],
                 pf_samples[-1],
             )
+    entry_time_counts: Dict[str, int] = {}
     if watchlist:
-        write_watchlist(watchlist, cfg, date_str=tgt)
-    else:
-        logging.warning("[WATCHLIST] empty watchlist date=%s; no fallback applied", tgt)
-        # Overwrite any stale watchlist for this date so replay can't pick up old symbols.
-        write_watchlist([], cfg, date_str=tgt)
-    if watchlist:
-        entry_time_counts: Dict[str, int] = {}
         for row in watchlist:
             et = str(row.get("entry_time_et") or "")
             entry_time_counts[et] = entry_time_counts.get(et, 0) + 1
+
+    watchlist_meta = {
+        "funnel": dict(funnel),
+        "reject_counts": dict(reject_counts),
+        "selected_summary": summarize_watchlist_rows(watchlist),
+        "entry_time_counts": entry_time_counts,
+        "filters": {
+            "minTrades": min_trades,
+            "reject_negative_pnl": reject_negative_pnl,
+            "minProfitFactor": min_profit_factor,
+            "minAvgR": min_avg_r,
+            "minWinRate": min_win_rate,
+            "top_k": top_k,
+            "entry_time_rank_by": entry_time_rank_by,
+            "top_k_rank_by": top_k_rank_by,
+            "param_rank_by": param_rank_by,
+            "directional_history_only": directional_history_only,
+        },
+    }
+
+    if watchlist:
+        write_watchlist(watchlist, cfg, date_str=tgt, meta=watchlist_meta)
+    else:
+        logging.warning("[WATCHLIST] empty watchlist date=%s; no fallback applied", tgt)
+        # Overwrite any stale watchlist for this date so replay can't pick up old symbols.
+        write_watchlist([], cfg, date_str=tgt, meta=watchlist_meta)
+    if watchlist:
         logging.info("[WATCHLIST_ENTRY_TIMES] date=%s %s", tgt, entry_time_counts)
     if report_enabled:
         logs_dir = Path(str(cfg.get("logs_dir") or "logs"))
@@ -549,6 +998,7 @@ def build_watchlist(
                 "top_k_rank_by": top_k_rank_by,
                 "param_rank_by": param_rank_by,
                 "param_grid": watch_cfg.get("param_grid") or {},
+                "directional_history_only": directional_history_only,
             },
             "summary": {
                 **funnel,

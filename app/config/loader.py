@@ -23,7 +23,11 @@ def _repo_root() -> Path:
 def _resolve_config_path() -> Path:
     # Allow explicit override, but default to the repo-local config (next to `app/`),
     # not whatever directory the user happened to run from.
-    env_path = os.environ.get("APP_CONFIG_PATH") or os.environ.get("ALPACA_OHLC_CONFIG")
+    env_path = (
+        os.environ.get("APP_CONFIG_PATH")
+        or os.environ.get("APP_CONFIG_FILE")
+        or os.environ.get("ALPACA_OHLC_CONFIG")
+    )
     if env_path:
         return Path(env_path)
 
@@ -66,11 +70,13 @@ def _read_json_file(path: Path) -> dict:
     if not path.exists() or path.stat().st_size <= 0:
         return {}
     try:
-        raw = path.read_text(encoding="utf-8").strip()
+        # Accept BOM-prefixed UTF-8 files too (common when edited on Windows).
+        raw = path.read_text(encoding="utf-8-sig").strip()
         if not raw:
             return {}
         parsed = json.loads(raw)
-    except Exception:
+    except Exception as exc:
+        _LOG.warning("[CONFIG] failed to parse %s error=%s", path, exc)
         return {}
     return parsed if isinstance(parsed, dict) else {}
 

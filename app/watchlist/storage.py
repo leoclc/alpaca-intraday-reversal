@@ -23,9 +23,16 @@ def watchlist_path(date_str: Optional[str] = None, cfg: Optional[dict] = None) -
     return _watchlists_dir(cfg) / f"{dt_str}.json"
 
 
-def write_watchlist(watchlist: list, cfg: Optional[dict] = None, date_str: Optional[str] = None) -> Path:
+def write_watchlist(
+    watchlist: list,
+    cfg: Optional[dict] = None,
+    date_str: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> Path:
     path = watchlist_path(date_str, cfg)
     payload = {"date": expected_watchlist_date_str(date_str), "watchlist": watchlist}
+    if isinstance(meta, dict):
+        payload["meta"] = meta
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
 
@@ -37,10 +44,14 @@ def read_watchlist(date_str: Optional[str] = None, cfg: Optional[dict] = None) -
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            return {"date": data.get("date"), "watchlist": data.get("watchlist") or []}
+            return {
+                "date": data.get("date"),
+                "watchlist": data.get("watchlist") or [],
+                "meta": data.get("meta") if isinstance(data.get("meta"), dict) else {},
+            }
     except Exception:
         pass
-    return {"date": None, "watchlist": []}
+    return {"date": None, "watchlist": [], "meta": {}}
 
 
 def watchlist_is_current(date_str: Optional[str] = None, target_date: Optional[str] = None) -> bool:

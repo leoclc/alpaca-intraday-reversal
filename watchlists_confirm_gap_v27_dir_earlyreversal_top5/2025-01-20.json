@@ -1,0 +1,146 @@
+{
+  "date": "2025-01-20",
+  "watchlist": [
+    {
+      "symbol": "GME",
+      "direction": "long",
+      "entry_time_et": "09:40",
+      "param_overrides": {
+        "target_window_mult": 0.8,
+        "target_rr": 1.2,
+        "confirm_move_bps": 0.0,
+        "min_early_reversal_bps_long": 0.0,
+        "min_early_reversal_bps_short": 10.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 11,
+      "win_rate": 0.8181818181818182,
+      "avgR": 0.8700125416834763,
+      "stdR": 0.7190079344967581,
+      "avgR_stderr": 0.21678904909219815,
+      "profit_factor": 8.781472747128518,
+      "total_pnl_pct": 7.715903962954166
+    },
+    {
+      "symbol": "MOS",
+      "direction": "short",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.8,
+        "target_rr": 1.0,
+        "confirm_move_bps": 0.0,
+        "min_early_reversal_bps_long": 0.0,
+        "min_early_reversal_bps_short": 20.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 10,
+      "win_rate": 0.9,
+      "avgR": 0.7809278708359713,
+      "stdR": 0.5963596761452246,
+      "avgR_stderr": 0.1885854881299293,
+      "profit_factor": 8.809278708359635,
+      "total_pnl_pct": 3.8510013913653935
+    },
+    {
+      "symbol": "EXE",
+      "direction": "long",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 1.0,
+        "target_rr": 1.2,
+        "confirm_move_bps": 0.0,
+        "min_early_reversal_bps_long": 0.0,
+        "min_early_reversal_bps_short": 10.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 12,
+      "win_rate": 0.8333333333333334,
+      "avgR": 0.6831331621875772,
+      "stdR": 0.7870435998953206,
+      "avgR_stderr": 0.22719991713176774,
+      "profit_factor": 5.098798973125523,
+      "total_pnl_pct": 4.0631301493605445
+    },
+    {
+      "symbol": "FCX",
+      "direction": "short",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 1.2,
+        "target_rr": 1.2,
+        "confirm_move_bps": 0.0,
+        "min_early_reversal_bps_long": 0.0,
+        "min_early_reversal_bps_short": 10.0,
+        "min_gap_fav_bps_short": 0.0
+      },
+      "trades_count": 10,
+      "win_rate": 0.8,
+      "avgR": 0.6649851909690305,
+      "stdR": 0.8724823935161864,
+      "avgR_stderr": 0.2759031581906473,
+      "profit_factor": 4.401219553592721,
+      "total_pnl_pct": 3.603141952589768
+    },
+    {
+      "symbol": "HAL",
+      "direction": "short",
+      "entry_time_et": "09:35",
+      "param_overrides": {
+        "target_window_mult": 0.8,
+        "target_rr": 1.2,
+        "confirm_move_bps": 0.0,
+        "min_early_reversal_bps_long": 0.0,
+        "min_early_reversal_bps_short": 20.0,
+        "min_gap_fav_bps_short": 10.0
+      },
+      "trades_count": 11,
+      "win_rate": 0.7272727272727273,
+      "avgR": 0.6534426527036249,
+      "stdR": 0.9041817752135937,
+      "avgR_stderr": 0.27262106278735987,
+      "profit_factor": 3.9798836445217014,
+      "total_pnl_pct": 2.875020455033483
+    }
+  ],
+  "meta": {
+    "funnel": {
+      "scanned_symbols": 126,
+      "signals_found": 3289,
+      "trades_simulated": 68804,
+      "symbols_passing_filters": 36,
+      "watchlist_size": 5
+    },
+    "reject_counts": {
+      "min_trades": 80,
+      "neg_pnl": 34,
+      "min_pf": 26,
+      "min_avg_r": 8,
+      "min_win_rate": 24
+    },
+    "selected_summary": {
+      "size": 5,
+      "avg_selected_avgR": 0.730500283675936,
+      "avg_selected_win_rate": 0.8157575757575758,
+      "avg_selected_profit_factor": 6.21413072534562,
+      "avg_selected_total_pnl_pct": 4.4216395822606716,
+      "long_count": 2,
+      "short_count": 3
+    },
+    "entry_time_counts": {
+      "09:40": 1,
+      "09:35": 4
+    },
+    "filters": {
+      "minTrades": 10,
+      "reject_negative_pnl": true,
+      "minProfitFactor": 0.6,
+      "minAvgR": -0.05,
+      "minWinRate": 0.35,
+      "top_k": 5,
+      "entry_time_rank_by": "avgr",
+      "top_k_rank_by": "avgr_lcb",
+      "param_rank_by": "avgr_lcb",
+      "directional_history_only": true
+    }
+  }
+}

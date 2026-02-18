@@ -32,6 +32,7 @@ class TradePlan:
     target_window_samples: int | None = None
     gap_bps: float | None = None
     early_pullback_bps: float | None = None
+    early_reversal_bps: float | None = None
     confirm_move_bps: float | None = None
     confirm_minutes: int | None = None
     confirm_hit_bps: float | None = None

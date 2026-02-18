@@ -1,0 +1,42 @@
+{
+  "date": "2025-01-06",
+  "watchlist": [],
+  "meta": {
+    "funnel": {
+      "scanned_symbols": 127,
+      "signals_found": 7800,
+      "trades_simulated": 2688,
+      "symbols_passing_filters": 0,
+      "watchlist_size": 0
+    },
+    "reject_counts": {
+      "min_trades": 127,
+      "neg_pnl": 60,
+      "min_pf": 56,
+      "min_avg_r": 0,
+      "min_win_rate": 56
+    },
+    "selected_summary": {
+      "size": 0,
+      "avg_selected_avgR": 0.0,
+      "avg_selected_win_rate": 0.0,
+      "avg_selected_profit_factor": 0.0,
+      "avg_selected_total_pnl_pct": 0.0,
+      "long_count": 0,
+      "short_count": 0
+    },
+    "entry_time_counts": {},
+    "filters": {
+      "minTrades": 10,
+      "reject_negative_pnl": true,
+      "minProfitFactor": 0.6,
+      "minAvgR": -0.05,
+      "minWinRate": 0.35,
+      "top_k": 30,
+      "entry_time_rank_by": "avgr",
+      "top_k_rank_by": "avgr",
+      "param_rank_by": "avgr",
+      "directional_history_only": true
+    }
+  }
+}
