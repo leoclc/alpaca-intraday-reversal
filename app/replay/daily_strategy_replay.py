@@ -78,6 +78,20 @@ def run_replay(
             for r in wl_rows
             if r.get("symbol")
         }
+        symbol_watchlist_stats = {}
+        for idx, row in enumerate(wl_rows, start=1):
+            sym = str((row or {}).get("symbol") or "").upper()
+            if not sym:
+                continue
+            symbol_watchlist_stats[sym] = {
+                "rank": idx,
+                "avgR": row.get("avgR"),
+                "avgR_stderr": row.get("avgR_stderr"),
+                "win_rate": row.get("win_rate"),
+                "profit_factor": row.get("profit_factor"),
+                "trades_count": row.get("trades_count"),
+                "total_pnl_pct": row.get("total_pnl_pct"),
+            }
         symbols = list(symbol_entry_time.keys())
         day_trades = 0
         skip_counts = {
@@ -228,6 +242,9 @@ def run_replay(
                         last_ts_entry,
                     )
                 continue
+            # Persist watchlist scoring context used for this symbol so sizing can be quality-aware
+            # without introducing lookahead (stats are from the rolling window ending at D-1).
+            plan.watchlist_stats = symbol_watchlist_stats.get(symbol) or None
             bars = data_store.get_daily_bars(symbol, None, None, cfg=cfg, allow_fetch=True)
             exit_info = simulate_exit(plan, "daily", bars, bars_intraday, cfg)
             if not exit_info:
@@ -241,6 +258,7 @@ def run_replay(
                 day_details.append(
                     {
                         "symbol": symbol,
+                        "param_overrides": getattr(plan, "param_overrides", None),
                         "signal_date": signal.signal_date,
                         "direction": signal.direction,
                         "trend_state": signal.trend_state,
@@ -268,15 +286,39 @@ def run_replay(
                         "signal_return_pct": getattr(plan, "signal_return_pct", None),
                         "signal_return_atr": getattr(plan, "signal_return_atr", None),
                         "atr": getattr(plan, "atr", None),
+                        "watchlist_rank": (plan.watchlist_stats or {}).get("rank") if getattr(plan, "watchlist_stats", None) else None,
+                        "watchlist_avgR": (plan.watchlist_stats or {}).get("avgR") if getattr(plan, "watchlist_stats", None) else None,
+                        "watchlist_avgR_stderr": (plan.watchlist_stats or {}).get("avgR_stderr")
+                        if getattr(plan, "watchlist_stats", None)
+                        else None,
+                        "watchlist_win_rate": (plan.watchlist_stats or {}).get("win_rate")
+                        if getattr(plan, "watchlist_stats", None)
+                        else None,
+                        "watchlist_profit_factor": (plan.watchlist_stats or {}).get("profit_factor")
+                        if getattr(plan, "watchlist_stats", None)
+                        else None,
+                        "watchlist_trades_count": (plan.watchlist_stats or {}).get("trades_count")
+                        if getattr(plan, "watchlist_stats", None)
+                        else None,
+                        "watchlist_total_pnl_pct": (plan.watchlist_stats or {}).get("total_pnl_pct")
+                        if getattr(plan, "watchlist_stats", None)
+                        else None,
                         "exit_date": str(exit_info["exit_date"]),
                         "exit_price": float(exit_info["exit_price"]),
                         "exit_reason": str(exit_info["exit_reason"]),
+                        "exit_ts": exit_info.get("exit_ts"),
+                        "stop_hit_ts": exit_info.get("stop_hit_ts"),
+                        "target_hit_ts": exit_info.get("target_hit_ts"),
                         "pnl_pct": pnl_pct,
                         "r_multiple": r_multiple,
                         "mfe_pct": exit_info.get("mfe_pct"),
                         "mae_pct": exit_info.get("mae_pct"),
                         "mfe_r": exit_info.get("mfe_r"),
                         "mae_r": exit_info.get("mae_r"),
+                        "mfe_r_full": exit_info.get("mfe_r_full"),
+                        "mae_r_full": exit_info.get("mae_r_full"),
+                        "mfe_r_before_stop": exit_info.get("mfe_r_before_stop"),
+                        "mae_r_to_target": exit_info.get("mae_r_to_target"),
                     }
                 )
             trades.append(
@@ -291,6 +333,13 @@ def run_replay(
                     mae_pct=exit_info.get("mae_pct"),
                     mfe_r=exit_info.get("mfe_r"),
                     mae_r=exit_info.get("mae_r"),
+                    exit_ts=exit_info.get("exit_ts"),
+                    stop_hit_ts=exit_info.get("stop_hit_ts"),
+                    target_hit_ts=exit_info.get("target_hit_ts"),
+                    mfe_r_full=exit_info.get("mfe_r_full"),
+                    mae_r_full=exit_info.get("mae_r_full"),
+                    mfe_r_before_stop=exit_info.get("mfe_r_before_stop"),
+                    mae_r_to_target=exit_info.get("mae_r_to_target"),
                 )
             )
             day_trades += 1

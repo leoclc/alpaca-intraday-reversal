@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+_CUTOFF_EXIT_REASONS = {"time_stop", "eod_flat", "time_exit"}
+_TARGET_R_GRID = [0.25, 0.50, 0.75, 1.00, 1.20]
+_STOP_MULT_GRID = [1.10, 1.25, 1.50, 2.00]
+
 
 def _read_ndjson(path: Path) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -61,6 +65,31 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _stable_json(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except Exception:
+        try:
+            return str(value)
+        except Exception:
+            return ""
+
+
+def _longest_negative_streak(values: List[float]) -> int:
+    best = 0
+    run = 0
+    for v in values:
+        if float(v) < 0:
+            run += 1
+            if run > best:
+                best = run
+        else:
+            run = 0
+    return best
 
 
 @dataclass(frozen=True)
@@ -135,6 +164,27 @@ def _enrich_trade(t: Dict[str, Any]) -> Dict[str, Any]:
     out["_stop_atr"] = stop_atr
     out["_gap_fav_bps"] = gap_fav_bps
     out["_early_pullback_bps"] = _safe_float(pb, default=0.0) if pb is not None else None
+    po = t.get("param_overrides")
+    out["param_overrides_json"] = _stable_json(po) if isinstance(po, dict) and po else ""
+    # Prefer persisted watchlist stats from the trade record when available.
+    if t.get("watchlist_rank") is not None:
+        out["_watchlist_rank"] = _safe_int(t.get("watchlist_rank"), default=0)
+    if t.get("watchlist_avgR") is not None:
+        out["_watchlist_avgR"] = _safe_float(t.get("watchlist_avgR"), default=0.0)
+    if t.get("watchlist_avgR_stderr") is not None:
+        out["_watchlist_avgR_stderr"] = _safe_float(t.get("watchlist_avgR_stderr"), default=0.0)
+    if t.get("watchlist_win_rate") is not None:
+        out["_watchlist_win_rate"] = _safe_float(t.get("watchlist_win_rate"), default=0.0)
+    if t.get("watchlist_profit_factor") is not None:
+        out["_watchlist_profit_factor"] = _safe_float(t.get("watchlist_profit_factor"), default=0.0)
+    if t.get("watchlist_trades_count") is not None:
+        out["_watchlist_trades_count"] = _safe_int(t.get("watchlist_trades_count"), default=0)
+    if t.get("watchlist_total_pnl_pct") is not None:
+        out["_watchlist_total_pnl_pct"] = _safe_float(t.get("watchlist_total_pnl_pct"), default=0.0)
+    if t.get("quality_risk_mult") is not None:
+        out["_quality_risk_mult"] = _safe_float(t.get("quality_risk_mult"), default=0.0)
+    if t.get("quality_score") is not None:
+        out["_quality_score"] = _safe_float(t.get("quality_score"), default=0.0)
     # Loss classification for stopouts: did the day ever reach the target distance after entry?
     if str(t.get("exit_reason") or "") == "stop" and target_r is not None and t.get("day_mfe_r") is not None:
         try:
@@ -143,6 +193,30 @@ def _enrich_trade(t: Dict[str, Any]) -> Dict[str, Any]:
             out["_stop_shakeout_day_hit_target"] = None
     else:
         out["_stop_shakeout_day_hit_target"] = None
+
+    # "What would make this trade win" (safe, bar-based statements only).
+    exit_reason = str(t.get("exit_reason") or "")
+    r_mult = _safe_float(t.get("r_multiple"), default=0.0)
+    mfe_r_before_stop = None if t.get("mfe_r_before_stop") is None else _safe_float(t.get("mfe_r_before_stop"))
+    mae_r_to_target = None if t.get("mae_r_to_target") is None else _safe_float(t.get("mae_r_to_target"))
+    mfe_r_full = None if t.get("mfe_r_full") is None else _safe_float(t.get("mfe_r_full"))
+
+    out["_flip_target_r_max_before_stop"] = None
+    if exit_reason == "stop" and mfe_r_before_stop is not None:
+        out["_flip_target_r_max_before_stop"] = mfe_r_before_stop
+
+    out["_flip_stop_mult_needed_for_original_target"] = None
+    if (
+        exit_reason == "stop"
+        and t.get("target_hit_ts") is not None
+        and mae_r_to_target is not None
+        and mae_r_to_target < 0
+    ):
+        out["_flip_stop_mult_needed_for_original_target"] = -mae_r_to_target
+
+    out["_flip_target_r_max_by_cutoff"] = None
+    if exit_reason in {"time_stop", "eod_flat", "time_exit"} and r_mult <= 0 and mfe_r_full is not None:
+        out["_flip_target_r_max_by_cutoff"] = mfe_r_full
     return out
 
 
@@ -221,24 +295,48 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
             row = wl_index.lookup(date, sym)
             if row is None:
                 continue
-            t["_watchlist_rank"] = row.rank
-            t["_watchlist_avgR"] = row.avgR
-            t["_watchlist_win_rate"] = row.win_rate
-            t["_watchlist_profit_factor"] = row.profit_factor
-            t["_watchlist_trades_count"] = row.trades_count
-            t["_watchlist_total_pnl_pct"] = row.total_pnl_pct
+            if t.get("_watchlist_rank") is None:
+                t["_watchlist_rank"] = row.rank
+            if t.get("_watchlist_avgR") is None:
+                t["_watchlist_avgR"] = row.avgR
+            if t.get("_watchlist_win_rate") is None:
+                t["_watchlist_win_rate"] = row.win_rate
+            if t.get("_watchlist_profit_factor") is None:
+                t["_watchlist_profit_factor"] = row.profit_factor
+            if t.get("_watchlist_trades_count") is None:
+                t["_watchlist_trades_count"] = row.trades_count
+            if t.get("_watchlist_total_pnl_pct") is None:
+                t["_watchlist_total_pnl_pct"] = row.total_pnl_pct
 
     analysis_dir = run_dir / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
     # Trade table (trade-by-trade).
+    po_keys = sorted(
+        {
+            str(k)
+            for t in trades
+            for k in ((t.get("param_overrides") or {}).keys() if isinstance(t.get("param_overrides"), dict) else [])
+        }
+    )
+    if po_keys:
+        for t in trades:
+            po = t.get("param_overrides")
+            po_map = po if isinstance(po, dict) else {}
+            for key in po_keys:
+                t[f"po__{key}"] = po_map.get(key)
+
     trade_fields = [
         "entry_date",
         "symbol",
         "direction",
         "entry_time_et",
         "entry_price_mode",
+        "param_overrides_json",
         "exit_reason",
+        "exit_ts",
+        "stop_hit_ts",
+        "target_hit_ts",
         "r_multiple",
         "pnl_total",
         "equity_before",
@@ -255,19 +353,30 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "confirm_hit_bps",
         "mfe_r",
         "mae_r",
+        "mfe_r_full",
+        "mae_r_full",
+        "mfe_r_before_stop",
+        "mae_r_to_target",
         "day_mfe_r",
         "day_mae_r",
         "_target_r",
         "_stop_atr",
         "_gap_fav_bps",
         "_stop_shakeout_day_hit_target",
+        "_flip_target_r_max_before_stop",
+        "_flip_stop_mult_needed_for_original_target",
+        "_flip_target_r_max_by_cutoff",
         "_watchlist_rank",
         "_watchlist_avgR",
+        "_watchlist_avgR_stderr",
         "_watchlist_win_rate",
         "_watchlist_profit_factor",
         "_watchlist_trades_count",
         "_watchlist_total_pnl_pct",
+        "_quality_risk_mult",
+        "_quality_score",
     ]
+    trade_fields.extend([f"po__{k}" for k in po_keys])
     _write_csv(analysis_dir / "trades_enriched.csv", trade_fields, trades)
 
     # Month-by-month summary.
@@ -409,6 +518,457 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         symbol_rows,
     )
 
+    # Per-symbol equity-curve proxies (cumulative PnL and cumulative R).
+    symbol_month_rows: List[Dict[str, Any]] = []
+    symbol_curve_rows: List[Dict[str, Any]] = []
+    for sym, ts in by_sym.items():
+        # Trade-by-trade curve (sorted by entry date/time).
+        ts_sorted = sorted(ts, key=lambda t: (str(t.get("entry_date") or ""), str(t.get("entry_time_et") or "")))
+        cum_pnl = 0.0
+        cum_r = 0.0
+        for t in ts_sorted:
+            pnl = _safe_float(t.get("pnl_total"))
+            r = _safe_float(t.get("r_multiple"))
+            cum_pnl += pnl
+            cum_r += r
+            symbol_curve_rows.append(
+                {
+                    "symbol": sym,
+                    "entry_date": str(t.get("entry_date") or ""),
+                    "entry_time_et": str(t.get("entry_time_et") or ""),
+                    "exit_reason": str(t.get("exit_reason") or ""),
+                    "r_multiple": r,
+                    "pnl_total": pnl,
+                    "cum_pnl_total": cum_pnl,
+                    "cum_r": cum_r,
+                    "param_overrides_json": str(t.get("param_overrides_json") or ""),
+                }
+            )
+
+        # Month-by-month curve.
+        by_sym_month: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for t in ts:
+            by_sym_month[str(t.get("_month") or "")].append(t)
+        cum_month_pnl = 0.0
+        for m in sorted(by_sym_month.keys()):
+            a = _agg_trades(by_sym_month[m])
+            cum_month_pnl += float(a.get("pnl_total") or 0.0)
+            symbol_month_rows.append(
+                {
+                    "symbol": sym,
+                    "month": m,
+                    "trades": a["trades"],
+                    "win_rate": a["win_rate"],
+                    "avgR": a["avgR"],
+                    "pnl_total": a["pnl_total"],
+                    "cum_pnl_total": cum_month_pnl,
+                    "stops": a["stops"],
+                    "targets": a["targets"],
+                    "time_stop": a["time_stop"],
+                }
+            )
+    if symbol_month_rows:
+        _write_csv(
+            analysis_dir / "symbol_monthly.csv",
+            ["symbol", "month", "trades", "win_rate", "avgR", "pnl_total", "cum_pnl_total", "stops", "targets", "time_stop"],
+            symbol_month_rows,
+        )
+    if symbol_curve_rows:
+        _write_csv(
+            analysis_dir / "symbol_equity_curve.csv",
+            [
+                "symbol",
+                "entry_date",
+                "entry_time_et",
+                "exit_reason",
+                "r_multiple",
+                "pnl_total",
+                "cum_pnl_total",
+                "cum_r",
+                "param_overrides_json",
+            ],
+            symbol_curve_rows,
+        )
+
+    # Per-symbol month-over-month stability (is the symbol curve steadily rising or choppy?).
+    symbol_stability_rows: List[Dict[str, Any]] = []
+    for sym, ts in by_sym.items():
+        by_sym_month: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for t in ts:
+            by_sym_month[str(t.get("_month") or "")].append(t)
+        months_sorted = sorted([m for m in by_sym_month.keys() if m])
+        if not months_sorted:
+            continue
+        month_pnls: List[float] = []
+        cum_pnl = 0.0
+        peak_pnl = 0.0
+        max_monthly_drawdown = 0.0
+        for m in months_sorted:
+            a = _agg_trades(by_sym_month[m])
+            pnl = float(a.get("pnl_total") or 0.0)
+            month_pnls.append(pnl)
+            cum_pnl += pnl
+            if cum_pnl > peak_pnl:
+                peak_pnl = cum_pnl
+            drawdown = peak_pnl - cum_pnl
+            if drawdown > max_monthly_drawdown:
+                max_monthly_drawdown = drawdown
+        positive_months = sum(1 for v in month_pnls if v > 0)
+        non_negative_months = sum(1 for v in month_pnls if v >= 0)
+        negative_months = sum(1 for v in month_pnls if v < 0)
+        symbol_stability_rows.append(
+            {
+                "symbol": sym,
+                "months": len(month_pnls),
+                "positive_months": positive_months,
+                "non_negative_months": non_negative_months,
+                "negative_months": negative_months,
+                "monthly_up_rate": (positive_months / float(len(month_pnls))) if month_pnls else 0.0,
+                "cum_pnl_end": sum(month_pnls),
+                "worst_month_pnl": min(month_pnls) if month_pnls else 0.0,
+                "best_month_pnl": max(month_pnls) if month_pnls else 0.0,
+                "max_monthly_drawdown": max_monthly_drawdown,
+                "longest_negative_streak": _longest_negative_streak(month_pnls),
+            }
+        )
+    if symbol_stability_rows:
+        symbol_stability_rows.sort(
+            key=lambda r: (
+                -float(r.get("monthly_up_rate") or 0.0),
+                -float(r.get("cum_pnl_end") or 0.0),
+                float(r.get("max_monthly_drawdown") or 0.0),
+            )
+        )
+        _write_csv(
+            analysis_dir / "symbol_stability.csv",
+            [
+                "symbol",
+                "months",
+                "positive_months",
+                "non_negative_months",
+                "negative_months",
+                "monthly_up_rate",
+                "cum_pnl_end",
+                "worst_month_pnl",
+                "best_month_pnl",
+                "max_monthly_drawdown",
+                "longest_negative_streak",
+            ],
+            symbol_stability_rows,
+        )
+
+    # Per-symbol parameter-group summary (uses persisted param_overrides from trade records).
+    by_param: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for t in trades:
+        sym = str(t.get("symbol") or "").upper()
+        key = str(t.get("param_overrides_json") or "")
+        if sym:
+            by_param[(sym, key)].append(t)
+    param_rows: List[Dict[str, Any]] = []
+    for (sym, key), ts in by_param.items():
+        a = _agg_trades(ts)
+        param_rows.append(
+            {
+                "symbol": sym,
+                "param_overrides_json": key,
+                "trades": a["trades"],
+                "win_rate": a["win_rate"],
+                "avgR": a["avgR"],
+                "pnl_total": a["pnl_total"],
+                "stops": a["stops"],
+                "targets": a["targets"],
+                "time_stop": a["time_stop"],
+            }
+        )
+    if param_rows:
+        param_rows.sort(key=lambda r: float(r.get("pnl_total") or 0.0))
+        _write_csv(
+            analysis_dir / "symbol_param_groups.csv",
+            ["symbol", "param_overrides_json", "trades", "win_rate", "avgR", "pnl_total", "stops", "targets", "time_stop"],
+            param_rows,
+        )
+
+    # Per-symbol "what would make trades win" summaries (non-directional).
+    symbol_flip_summary_rows: List[Dict[str, Any]] = []
+    symbol_flip_target_grid_rows: List[Dict[str, Any]] = []
+    symbol_flip_stop_grid_rows: List[Dict[str, Any]] = []
+    for sym, ts in by_sym.items():
+        n = len(ts)
+        if n <= 0:
+            continue
+        base_total_r = sum(_safe_float(t.get("r_multiple")) for t in ts)
+        base_win_rate = sum(1 for t in ts if _safe_float(t.get("r_multiple")) > 0) / float(n)
+        base_avg_r = base_total_r / float(n)
+        base_pnl_total = sum(_safe_float(t.get("pnl_total")) for t in ts)
+        stopouts_sym = [t for t in ts if str(t.get("exit_reason") or "") == "stop"]
+        cutoff_losers_sym = [
+            t
+            for t in ts
+            if str(t.get("exit_reason") or "") in _CUTOFF_EXIT_REASONS and _safe_float(t.get("r_multiple")) <= 0
+        ]
+        stop_mfe_before_vals = [
+            _safe_float(t.get("_flip_target_r_max_before_stop"))
+            for t in stopouts_sym
+            if t.get("_flip_target_r_max_before_stop") is not None
+        ]
+        stop_mult_needed_vals = [
+            _safe_float(t.get("_flip_stop_mult_needed_for_original_target"))
+            for t in stopouts_sym
+            if t.get("_flip_stop_mult_needed_for_original_target") is not None
+            and _safe_float(t.get("_flip_stop_mult_needed_for_original_target")) > 0
+        ]
+        cutoff_mfe_vals = [
+            _safe_float(t.get("_flip_target_r_max_by_cutoff"))
+            for t in cutoff_losers_sym
+            if t.get("_flip_target_r_max_by_cutoff") is not None
+        ]
+
+        hard_nonflippable_stopouts = 0
+        for t in stopouts_sym:
+            pre = _safe_float(t.get("_flip_target_r_max_before_stop"), default=0.0)
+            need = _safe_float(t.get("_flip_stop_mult_needed_for_original_target"), default=0.0)
+            if pre <= 0 and need <= 0:
+                hard_nonflippable_stopouts += 1
+
+        symbol_flip_summary_rows.append(
+            {
+                "symbol": sym,
+                "trades": n,
+                "pnl_total": base_pnl_total,
+                "avgR": base_avg_r,
+                "stopouts": len(stopouts_sym),
+                "cutoff_losers": len(cutoff_losers_sym),
+                "stopouts_flipable_any_target": sum(1 for v in stop_mfe_before_vals if v > 0),
+                "stopouts_flipable_target_025R": sum(1 for v in stop_mfe_before_vals if v >= 0.25),
+                "stopouts_flipable_target_050R": sum(1 for v in stop_mfe_before_vals if v >= 0.50),
+                "stopouts_flipable_target_075R": sum(1 for v in stop_mfe_before_vals if v >= 0.75),
+                "stopouts_flipable_target_100R": sum(1 for v in stop_mfe_before_vals if v >= 1.00),
+                "stopouts_reach_original_target_with_wider_stop": len(stop_mult_needed_vals),
+                "stop_mult_needed_p50": _pct(stop_mult_needed_vals, 0.50),
+                "stop_mult_needed_p75": _pct(stop_mult_needed_vals, 0.75),
+                "cutoff_losers_flipable_target_025R": sum(1 for v in cutoff_mfe_vals if v >= 0.25),
+                "cutoff_losers_flipable_target_050R": sum(1 for v in cutoff_mfe_vals if v >= 0.50),
+                "cutoff_losers_flipable_target_075R": sum(1 for v in cutoff_mfe_vals if v >= 0.75),
+                "hard_nonflippable_stopouts": hard_nonflippable_stopouts,
+            }
+        )
+
+        for target_r in _TARGET_R_GRID:
+            stopouts_flipped = 0
+            cutoff_flipped = 0
+            cf_total_r = 0.0
+            cf_wins = 0
+            for t in ts:
+                r_orig = _safe_float(t.get("r_multiple"))
+                r_cf = r_orig
+                exit_reason = str(t.get("exit_reason") or "")
+                if exit_reason == "stop":
+                    max_pre = _safe_float(t.get("_flip_target_r_max_before_stop"), default=-1.0)
+                    if max_pre >= target_r:
+                        r_cf = target_r
+                        stopouts_flipped += 1
+                elif exit_reason in _CUTOFF_EXIT_REASONS and r_orig <= 0:
+                    max_cutoff = _safe_float(t.get("_flip_target_r_max_by_cutoff"), default=-1.0)
+                    if max_cutoff >= target_r:
+                        r_cf = target_r
+                        cutoff_flipped += 1
+                cf_total_r += r_cf
+                if r_cf > 0:
+                    cf_wins += 1
+            cf_avg_r = cf_total_r / float(n)
+            cf_win_rate = cf_wins / float(n)
+            symbol_flip_target_grid_rows.append(
+                {
+                    "symbol": sym,
+                    "target_r": target_r,
+                    "trades": n,
+                    "stopouts": len(stopouts_sym),
+                    "stopouts_flipped": stopouts_flipped,
+                    "stopouts_flip_share": (stopouts_flipped / float(len(stopouts_sym))) if stopouts_sym else 0.0,
+                    "cutoff_losers": len(cutoff_losers_sym),
+                    "cutoff_flipped": cutoff_flipped,
+                    "cutoff_flip_share": (cutoff_flipped / float(len(cutoff_losers_sym))) if cutoff_losers_sym else 0.0,
+                    "base_total_r": base_total_r,
+                    "cf_total_r": cf_total_r,
+                    "delta_total_r": cf_total_r - base_total_r,
+                    "base_avgR": base_avg_r,
+                    "cf_avgR": cf_avg_r,
+                    "delta_avgR": cf_avg_r - base_avg_r,
+                    "base_win_rate": base_win_rate,
+                    "cf_win_rate": cf_win_rate,
+                }
+            )
+
+        for stop_mult in _STOP_MULT_GRID:
+            stopouts_flipped = 0
+            cf_total_r = 0.0
+            cf_wins = 0
+            for t in ts:
+                r_orig = _safe_float(t.get("r_multiple"))
+                r_cf = r_orig
+                if str(t.get("exit_reason") or "") == "stop":
+                    need = _safe_float(t.get("_flip_stop_mult_needed_for_original_target"), default=0.0)
+                    target_r = _safe_float(t.get("_target_r"), default=0.0)
+                    if need > 0 and target_r > 0 and need <= stop_mult:
+                        r_cf = target_r
+                        stopouts_flipped += 1
+                cf_total_r += r_cf
+                if r_cf > 0:
+                    cf_wins += 1
+            cf_avg_r = cf_total_r / float(n)
+            cf_win_rate = cf_wins / float(n)
+            symbol_flip_stop_grid_rows.append(
+                {
+                    "symbol": sym,
+                    "stop_mult": stop_mult,
+                    "trades": n,
+                    "stopouts": len(stopouts_sym),
+                    "stopouts_flipped": stopouts_flipped,
+                    "stopouts_flip_share": (stopouts_flipped / float(len(stopouts_sym))) if stopouts_sym else 0.0,
+                    "base_total_r": base_total_r,
+                    "cf_total_r": cf_total_r,
+                    "delta_total_r": cf_total_r - base_total_r,
+                    "base_avgR": base_avg_r,
+                    "cf_avgR": cf_avg_r,
+                    "delta_avgR": cf_avg_r - base_avg_r,
+                    "base_win_rate": base_win_rate,
+                    "cf_win_rate": cf_win_rate,
+                }
+            )
+
+    if symbol_flip_summary_rows:
+        symbol_flip_summary_rows.sort(key=lambda r: float(r.get("pnl_total") or 0.0))
+        _write_csv(
+            analysis_dir / "symbol_flip_summary.csv",
+            [
+                "symbol",
+                "trades",
+                "pnl_total",
+                "avgR",
+                "stopouts",
+                "cutoff_losers",
+                "stopouts_flipable_any_target",
+                "stopouts_flipable_target_025R",
+                "stopouts_flipable_target_050R",
+                "stopouts_flipable_target_075R",
+                "stopouts_flipable_target_100R",
+                "stopouts_reach_original_target_with_wider_stop",
+                "stop_mult_needed_p50",
+                "stop_mult_needed_p75",
+                "cutoff_losers_flipable_target_025R",
+                "cutoff_losers_flipable_target_050R",
+                "cutoff_losers_flipable_target_075R",
+                "hard_nonflippable_stopouts",
+            ],
+            symbol_flip_summary_rows,
+        )
+    if symbol_flip_target_grid_rows:
+        symbol_flip_target_grid_rows.sort(key=lambda r: (str(r.get("symbol") or ""), float(r.get("target_r") or 0.0)))
+        _write_csv(
+            analysis_dir / "symbol_flip_target_grid.csv",
+            [
+                "symbol",
+                "target_r",
+                "trades",
+                "stopouts",
+                "stopouts_flipped",
+                "stopouts_flip_share",
+                "cutoff_losers",
+                "cutoff_flipped",
+                "cutoff_flip_share",
+                "base_total_r",
+                "cf_total_r",
+                "delta_total_r",
+                "base_avgR",
+                "cf_avgR",
+                "delta_avgR",
+                "base_win_rate",
+                "cf_win_rate",
+            ],
+            symbol_flip_target_grid_rows,
+        )
+    if symbol_flip_stop_grid_rows:
+        symbol_flip_stop_grid_rows.sort(key=lambda r: (str(r.get("symbol") or ""), float(r.get("stop_mult") or 0.0)))
+        _write_csv(
+            analysis_dir / "symbol_flip_stop_grid.csv",
+            [
+                "symbol",
+                "stop_mult",
+                "trades",
+                "stopouts",
+                "stopouts_flipped",
+                "stopouts_flip_share",
+                "base_total_r",
+                "cf_total_r",
+                "delta_total_r",
+                "base_avgR",
+                "cf_avgR",
+                "delta_avgR",
+                "base_win_rate",
+                "cf_win_rate",
+            ],
+            symbol_flip_stop_grid_rows,
+        )
+
+    # Trade-by-trade "flip" table (safe thresholds).
+    flip_rows: List[Dict[str, Any]] = []
+    for t in trades:
+        if (
+            t.get("_flip_target_r_max_before_stop") is None
+            and t.get("_flip_stop_mult_needed_for_original_target") is None
+            and t.get("_flip_target_r_max_by_cutoff") is None
+        ):
+            continue
+        flip_rows.append(
+            {
+                "entry_date": t.get("entry_date"),
+                "symbol": t.get("symbol"),
+                "direction": t.get("direction"),
+                "entry_time_et": t.get("entry_time_et"),
+                "param_overrides_json": t.get("param_overrides_json"),
+                "exit_reason": t.get("exit_reason"),
+                "exit_ts": t.get("exit_ts"),
+                "stop_hit_ts": t.get("stop_hit_ts"),
+                "target_hit_ts": t.get("target_hit_ts"),
+                "r_multiple": t.get("r_multiple"),
+                "pnl_total": t.get("pnl_total"),
+                "_target_r": t.get("_target_r"),
+                "mfe_r_before_stop": t.get("mfe_r_before_stop"),
+                "mae_r_to_target": t.get("mae_r_to_target"),
+                "mfe_r_full": t.get("mfe_r_full"),
+                "mae_r_full": t.get("mae_r_full"),
+                "_flip_target_r_max_before_stop": t.get("_flip_target_r_max_before_stop"),
+                "_flip_stop_mult_needed_for_original_target": t.get("_flip_stop_mult_needed_for_original_target"),
+                "_flip_target_r_max_by_cutoff": t.get("_flip_target_r_max_by_cutoff"),
+            }
+        )
+    if flip_rows:
+        _write_csv(
+            analysis_dir / "trade_flip.csv",
+            [
+                "entry_date",
+                "symbol",
+                "direction",
+                "entry_time_et",
+                "param_overrides_json",
+                "exit_reason",
+                "exit_ts",
+                "stop_hit_ts",
+                "target_hit_ts",
+                "r_multiple",
+                "pnl_total",
+                "_target_r",
+                "mfe_r_before_stop",
+                "mae_r_to_target",
+                "mfe_r_full",
+                "mae_r_full",
+                "_flip_target_r_max_before_stop",
+                "_flip_stop_mult_needed_for_original_target",
+                "_flip_target_r_max_by_cutoff",
+            ],
+            flip_rows,
+        )
+
     # Core diagnostics for report.
     overall = _agg_trades(trades)
     stopouts = [t for t in trades if str(t.get("exit_reason") or "") == "stop"]
@@ -534,12 +1094,65 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
                 f"avgR={float(r['avgR']):.3f} pnl_total=${float(r['pnl_total']):.2f}\n"
             )
 
+    if symbol_stability_rows:
+        lines.append("\n## Symbol Stability\n")
+        lines.append("See `symbol_stability.csv`, `symbol_monthly.csv`, and `symbol_equity_curve.csv`.\n")
+        unstable = sorted(
+            symbol_stability_rows,
+            key=lambda r: (
+                -float(r.get("negative_months") or 0.0),
+                -float(r.get("max_monthly_drawdown") or 0.0),
+                float(r.get("cum_pnl_end") or 0.0),
+            ),
+        )
+        lines.append("\nMost unstable symbols:\n")
+        for r in unstable[:8]:
+            lines.append(
+                f"- {r['symbol']}: months={int(r['months'])} pos={int(r['positive_months'])} neg={int(r['negative_months'])} "
+                f"cum_pnl=${float(r['cum_pnl_end']):.2f} max_monthly_dd=${float(r['max_monthly_drawdown']):.2f} "
+                f"longest_neg_streak={int(r['longest_negative_streak'])}\n"
+            )
+
+    if symbol_flip_summary_rows:
+        lines.append("\n## Flipability Snapshot\n")
+        lines.append(
+            "See `trade_flip.csv`, `symbol_flip_summary.csv`, `symbol_flip_target_grid.csv`, and `symbol_flip_stop_grid.csv`.\n"
+        )
+        t050 = [
+            r
+            for r in symbol_flip_target_grid_rows
+            if abs(float(r.get("target_r") or 0.0) - 0.50) < 1e-9 and float(r.get("delta_total_r") or 0.0) > 0
+        ]
+        t050.sort(key=lambda r: float(r.get("delta_total_r") or 0.0), reverse=True)
+        if t050:
+            lines.append("\nLargest upside if target were 0.50R (counterfactual):\n")
+            for r in t050[:8]:
+                lines.append(
+                    f"- {r['symbol']}: delta_total_r={float(r['delta_total_r']):.3f} "
+                    f"stop_flips={int(r['stopouts_flipped'])}/{int(r['stopouts'])} "
+                    f"cutoff_flips={int(r['cutoff_flipped'])}/{int(r['cutoff_losers'])}\n"
+                )
+        s150 = [
+            r
+            for r in symbol_flip_stop_grid_rows
+            if abs(float(r.get("stop_mult") or 0.0) - 1.50) < 1e-9 and float(r.get("delta_total_r") or 0.0) > 0
+        ]
+        s150.sort(key=lambda r: float(r.get("delta_total_r") or 0.0), reverse=True)
+        if s150:
+            lines.append("\nLargest upside if stop were widened to 1.50x (counterfactual):\n")
+            for r in s150[:8]:
+                lines.append(
+                    f"- {r['symbol']}: delta_total_r={float(r['delta_total_r']):.3f} "
+                    f"flipped_stopouts={int(r['stopouts_flipped'])}/{int(r['stopouts'])}\n"
+                )
+
     # Put actionable diagnostics at the end.
     lines.append("\n## Notes For Tuning\n")
     lines.append("- A large fraction of stopouts have `mfe_r==0` but the day later reaches the target distance.\n")
     lines.append("  That pattern is consistent with entering too early (before reversal starts) and/or needing entry confirmation.\n")
     lines.append("- Trades with very small stop_atr tend to have worse expectancy; consider enforcing a minimum stop distance vs ATR.\n")
-    lines.append("- Gap alignment matters materially; consider direction-aware gap filters (avoid shorts after gap-down, avoid longs after gap-up).\n")
+    lines.append("- Use `symbol_stability.csv` to cap/remove symbols with repeated negative-month streaks and high monthly drawdown.\n")
+    lines.append("- Use `symbol_flip_target_grid.csv` and `symbol_flip_stop_grid.csv` for per-symbol tuning (target/stop), not one-size-fits-all settings.\n")
 
     report_path.write_text("".join(lines), encoding="utf-8")
     return report_path

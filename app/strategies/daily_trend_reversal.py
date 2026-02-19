@@ -1091,22 +1091,24 @@ def build_trade(
                         early_pullback_bps = pullback_bps
                         if pullback_bps >= max_early_pullback_bps:
                             continue
-                    if min_early_reversal_bps_long is not None and min_early_reversal_bps_long > 0 and min_low is not None:
-                        if last_close and last_close > 0:
-                            early_reversal_bps = ((last_close - min_low) / last_close) * 10000.0
-                            if early_reversal_bps < float(min_early_reversal_bps_long):
-                                continue
+                    if min_low is not None and last_close and last_close > 0:
+                        early_reversal_bps = ((last_close - min_low) / last_close) * 10000.0
+                    if min_early_reversal_bps_long is not None and min_early_reversal_bps_long > 0:
+                        # If we can't compute the metric, treat as not meeting the filter.
+                        if early_reversal_bps is None or early_reversal_bps < float(min_early_reversal_bps_long):
+                            continue
                 else:
                     if max_early_pullback_bps > 0 and max_high is not None and entry_price > 0:
                         pullback_bps = ((max_high - entry_price) / entry_price) * 10000.0
                         early_pullback_bps = pullback_bps
                         if pullback_bps >= max_early_pullback_bps:
                             continue
-                    if min_early_reversal_bps_short is not None and min_early_reversal_bps_short > 0 and max_high is not None:
-                        if last_close and last_close > 0:
-                            early_reversal_bps = ((max_high - last_close) / last_close) * 10000.0
-                            if early_reversal_bps < float(min_early_reversal_bps_short):
-                                continue
+                    if max_high is not None and last_close and last_close > 0:
+                        early_reversal_bps = ((max_high - last_close) / last_close) * 10000.0
+                    if min_early_reversal_bps_short is not None and min_early_reversal_bps_short > 0:
+                        # If we can't compute the metric, treat as not meeting the filter.
+                        if early_reversal_bps is None or early_reversal_bps < float(min_early_reversal_bps_short):
+                            continue
         atr_end_idx = entry_idx - 1
         if entry_info.get("entry_source_date") != entry_date:
             atr_end_idx = entry_idx
@@ -1238,5 +1240,6 @@ def build_trade(
             signal_return_atr=signal_return_atr,
             atr=signal_atr,
             entry_price_mode=entry_price_mode_used,
+            param_overrides=(dict(param_overrides) if isinstance(param_overrides, dict) and param_overrides else None),
         )
     return None

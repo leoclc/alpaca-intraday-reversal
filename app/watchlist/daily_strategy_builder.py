@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime as dt
 import hashlib
 import os
@@ -35,6 +35,8 @@ class CandidateAcc:
     sum_pnl_pct: float = 0.0
     gross_profit_r: float = 0.0
     gross_loss_r: float = 0.0  # abs(sum(neg r))
+    month_pnl_pct: Dict[str, float] = field(default_factory=dict)
+    month_trades: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +72,10 @@ _TRADE_LITE_CACHE_VERSION = 3
 def _trade_lite_namespace(cfg: Dict) -> str:
     """Namespace trade-lite caches by strategy params so we don't mix outcomes across configs."""
     params = cfg.get("daily_trend_reversal") or {}
+    # Sizing-only controls do not change simulated entry/exit outcomes for watchlist scoring.
+    # Excluding them keeps trade-lite caches reusable while tuning portfolio risk overlays.
+    if isinstance(params, dict):
+        params = {k: v for k, v in params.items() if not str(k).startswith("quality_sizing_")}
     try:
         raw = json.dumps({"v": _TRADE_LITE_CACHE_VERSION, "params": params}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     except Exception:
@@ -287,7 +293,12 @@ def _compute_stats(trades: List[TradeLite]) -> Dict[str, float]:
     }
 
 
-def _acc_add(acc: CandidateAcc, lite: TradeLite) -> None:
+def _month_key(date_str: str) -> str:
+    s = str(date_str or "")
+    return s[:7] if len(s) >= 7 else ""
+
+
+def _acc_add(acc: CandidateAcc, lite: TradeLite, signal_date: str) -> None:
     acc.trades_count += 1
     acc.sum_r += float(lite.r_multiple)
     r = float(lite.r_multiple)
@@ -298,9 +309,13 @@ def _acc_add(acc: CandidateAcc, lite: TradeLite) -> None:
         acc.gross_profit_r += r
     elif r < 0:
         acc.gross_loss_r += abs(r)
+    month = _month_key(signal_date)
+    if month:
+        acc.month_pnl_pct[month] = float(acc.month_pnl_pct.get(month) or 0.0) + float(lite.pnl_pct)
+        acc.month_trades[month] = int(acc.month_trades.get(month) or 0) + 1
 
 
-def _acc_sub(acc: CandidateAcc, lite: TradeLite) -> None:
+def _acc_sub(acc: CandidateAcc, lite: TradeLite, signal_date: str) -> None:
     acc.trades_count -= 1
     acc.sum_r -= float(lite.r_multiple)
     r = float(lite.r_multiple)
@@ -311,6 +326,29 @@ def _acc_sub(acc: CandidateAcc, lite: TradeLite) -> None:
         acc.gross_profit_r -= r
     elif r < 0:
         acc.gross_loss_r -= abs(r)
+    month = _month_key(signal_date)
+    if month:
+        next_pnl = float(acc.month_pnl_pct.get(month) or 0.0) - float(lite.pnl_pct)
+        next_n = int(acc.month_trades.get(month) or 0) - 1
+        if next_n <= 0:
+            acc.month_trades.pop(month, None)
+            acc.month_pnl_pct.pop(month, None)
+        else:
+            acc.month_trades[month] = next_n
+            acc.month_pnl_pct[month] = next_pnl
+
+
+def _longest_negative_month_streak(values: List[float]) -> int:
+    best = 0
+    run = 0
+    for v in values:
+        if float(v) < 0:
+            run += 1
+            if run > best:
+                best = run
+        else:
+            run = 0
+    return best
 
 
 def _stats_from_acc(acc: CandidateAcc) -> Dict[str, float]:
@@ -325,6 +363,13 @@ def _stats_from_acc(acc: CandidateAcc) -> Dict[str, float]:
             "avgR_stderr": 0.0,
             "profit_factor": 0.0,
             "total_pnl_pct": 0.0,
+            "months_count": 0,
+            "positive_months": 0,
+            "negative_months": 0,
+            "positive_month_rate": 0.0,
+            "worst_month_pnl_pct": 0.0,
+            "max_monthly_drawdown_pct": 0.0,
+            "longest_negative_month_streak": 0,
         }
     win_rate = float(acc.wins) / float(acc.trades_count) if acc.trades_count > 0 else 0.0
     n = float(acc.trades_count)
@@ -337,6 +382,24 @@ def _stats_from_acc(acc: CandidateAcc) -> Dict[str, float]:
         profit_factor = float(acc.gross_profit_r) / float(acc.gross_loss_r)
     else:
         profit_factor = float(acc.gross_profit_r) if acc.gross_profit_r > 0 else 0.0
+    month_keys = sorted([m for m, n in acc.month_trades.items() if int(n or 0) > 0 and str(m)])
+    month_pnls = [float(acc.month_pnl_pct.get(m) or 0.0) for m in month_keys]
+    months_count = len(month_pnls)
+    positive_months = sum(1 for v in month_pnls if v > 0)
+    negative_months = sum(1 for v in month_pnls if v < 0)
+    positive_month_rate = (positive_months / float(months_count)) if months_count > 0 else 0.0
+    worst_month_pnl_pct = min(month_pnls) if month_pnls else 0.0
+    cum_pnl = 0.0
+    peak_pnl = 0.0
+    max_monthly_drawdown_pct = 0.0
+    for pnl in month_pnls:
+        cum_pnl += float(pnl)
+        if cum_pnl > peak_pnl:
+            peak_pnl = cum_pnl
+        drawdown = peak_pnl - cum_pnl
+        if drawdown > max_monthly_drawdown_pct:
+            max_monthly_drawdown_pct = drawdown
+
     return {
         "trades_count": int(acc.trades_count),
         "win_rate": win_rate,
@@ -345,6 +408,13 @@ def _stats_from_acc(acc: CandidateAcc) -> Dict[str, float]:
         "avgR_stderr": avg_r_stderr,
         "profit_factor": profit_factor,
         "total_pnl_pct": float(acc.sum_pnl_pct),
+        "months_count": months_count,
+        "positive_months": positive_months,
+        "negative_months": negative_months,
+        "positive_month_rate": positive_month_rate,
+        "worst_month_pnl_pct": worst_month_pnl_pct,
+        "max_monthly_drawdown_pct": max_monthly_drawdown_pct,
+        "longest_negative_month_streak": _longest_negative_month_streak(month_pnls),
     }
 
 
@@ -502,6 +572,46 @@ def build_watchlist(
         min_avg_r = float(min_avg_r_raw) if min_avg_r_raw is not None else None
     except Exception:
         min_avg_r = None
+    try:
+        min_months_count_raw = watch_cfg.get("min_months_count")
+        min_months_count = int(min_months_count_raw) if min_months_count_raw is not None else 0
+    except Exception:
+        min_months_count = 0
+    try:
+        min_positive_month_rate_raw = watch_cfg.get("min_positive_month_rate")
+        min_positive_month_rate = (
+            float(min_positive_month_rate_raw) if min_positive_month_rate_raw is not None else None
+        )
+    except Exception:
+        min_positive_month_rate = None
+    try:
+        max_negative_months_raw = watch_cfg.get("max_negative_months")
+        max_negative_months = int(max_negative_months_raw) if max_negative_months_raw is not None else None
+    except Exception:
+        max_negative_months = None
+    try:
+        max_monthly_drawdown_pct_raw = watch_cfg.get("max_monthly_drawdown_pct")
+        max_monthly_drawdown_pct = (
+            float(max_monthly_drawdown_pct_raw) if max_monthly_drawdown_pct_raw is not None else None
+        )
+    except Exception:
+        max_monthly_drawdown_pct = None
+    try:
+        max_longest_negative_month_streak_raw = watch_cfg.get("max_longest_negative_month_streak")
+        max_longest_negative_month_streak = (
+            int(max_longest_negative_month_streak_raw)
+            if max_longest_negative_month_streak_raw is not None
+            else None
+        )
+    except Exception:
+        max_longest_negative_month_streak = None
+    try:
+        min_worst_month_pnl_pct_raw = watch_cfg.get("min_worst_month_pnl_pct")
+        min_worst_month_pnl_pct = (
+            float(min_worst_month_pnl_pct_raw) if min_worst_month_pnl_pct_raw is not None else None
+        )
+    except Exception:
+        min_worst_month_pnl_pct = None
     top_k = int(watch_cfg.get("top_k") or 0)
     top_k_rank_by = str(watch_cfg.get("top_k_rank_by") or "total_pnl_pct").lower()
     directional_history_only = bool(watch_cfg.get("directional_history_only", False))
@@ -535,6 +645,12 @@ def build_watchlist(
         "min_pf": 0,
         "min_avg_r": 0,
         "min_win_rate": 0,
+        "min_months_count": 0,
+        "min_positive_month_rate": 0,
+        "max_negative_months": 0,
+        "max_monthly_drawdown_pct": 0,
+        "max_longest_negative_month_streak": 0,
+        "min_worst_month_pnl_pct": 0,
     }
     report_rows: List[Dict] = []
     pass_trades_only = 0
@@ -723,7 +839,7 @@ def build_watchlist(
                     )
                     lite = _TRADE_LITE_CACHE.get(cache_key)
                     if lite is not None:
-                        _acc_sub(state.acc_by_candidate[(entry_time, grid_idx)], lite)
+                        _acc_sub(state.acc_by_candidate[(entry_time, grid_idx)], lite, d)
 
         # Add newly included signal dates (compute missing candidates as needed).
         for d in sorted(added_dates):
@@ -747,7 +863,7 @@ def build_watchlist(
                 for grid_idx in range(len(param_grid)):
                     lite = lites.get((entry_time, grid_idx))
                     if lite is not None:
-                        _acc_add(state.acc_by_candidate[(entry_time, grid_idx)], lite)
+                        _acc_add(state.acc_by_candidate[(entry_time, grid_idx)], lite, d)
 
         state.window_signal_dates = new_window_dates
         state.window_start_date = start_date
@@ -811,6 +927,33 @@ def build_watchlist(
         if min_win_rate > 0 and stats["win_rate"] < min_win_rate:
             reject_counts["min_win_rate"] += 1
             reasons.append("min_win_rate")
+        if min_months_count > 0 and int(stats.get("months_count") or 0) < min_months_count:
+            reject_counts["min_months_count"] += 1
+            reasons.append("min_months_count")
+        if min_positive_month_rate is not None and float(stats.get("positive_month_rate") or 0.0) < min_positive_month_rate:
+            reject_counts["min_positive_month_rate"] += 1
+            reasons.append("min_positive_month_rate")
+        if max_negative_months is not None and int(stats.get("negative_months") or 0) > max_negative_months:
+            reject_counts["max_negative_months"] += 1
+            reasons.append("max_negative_months")
+        if (
+            max_monthly_drawdown_pct is not None
+            and float(stats.get("max_monthly_drawdown_pct") or 0.0) > max_monthly_drawdown_pct
+        ):
+            reject_counts["max_monthly_drawdown_pct"] += 1
+            reasons.append("max_monthly_drawdown_pct")
+        if (
+            max_longest_negative_month_streak is not None
+            and int(stats.get("longest_negative_month_streak") or 0) > max_longest_negative_month_streak
+        ):
+            reject_counts["max_longest_negative_month_streak"] += 1
+            reasons.append("max_longest_negative_month_streak")
+        if (
+            min_worst_month_pnl_pct is not None
+            and float(stats.get("worst_month_pnl_pct") or 0.0) < min_worst_month_pnl_pct
+        ):
+            reject_counts["min_worst_month_pnl_pct"] += 1
+            reasons.append("min_worst_month_pnl_pct")
         if stats["trades_count"] >= min_trades:
             pass_trades_only += 1
             if (not reject_negative_pnl) or stats["total_pnl_pct"] > 0:
@@ -912,6 +1055,34 @@ def build_watchlist(
         )
         if reject_counts["min_win_rate"] > 0:
             logging.info("[WATCHLIST_FILTERS] date=%s reject_min_win_rate=%s", tgt, reject_counts["min_win_rate"])
+        if reject_counts["min_months_count"] > 0:
+            logging.info("[WATCHLIST_FILTERS] date=%s reject_min_months_count=%s", tgt, reject_counts["min_months_count"])
+        if reject_counts["min_positive_month_rate"] > 0:
+            logging.info(
+                "[WATCHLIST_FILTERS] date=%s reject_min_positive_month_rate=%s",
+                tgt,
+                reject_counts["min_positive_month_rate"],
+            )
+        if reject_counts["max_negative_months"] > 0:
+            logging.info("[WATCHLIST_FILTERS] date=%s reject_max_negative_months=%s", tgt, reject_counts["max_negative_months"])
+        if reject_counts["max_monthly_drawdown_pct"] > 0:
+            logging.info(
+                "[WATCHLIST_FILTERS] date=%s reject_max_monthly_drawdown_pct=%s",
+                tgt,
+                reject_counts["max_monthly_drawdown_pct"],
+            )
+        if reject_counts["max_longest_negative_month_streak"] > 0:
+            logging.info(
+                "[WATCHLIST_FILTERS] date=%s reject_max_longest_negative_month_streak=%s",
+                tgt,
+                reject_counts["max_longest_negative_month_streak"],
+            )
+        if reject_counts["min_worst_month_pnl_pct"] > 0:
+            logging.info(
+                "[WATCHLIST_FILTERS] date=%s reject_min_worst_month_pnl_pct=%s",
+                tgt,
+                reject_counts["min_worst_month_pnl_pct"],
+            )
         if trades_samples:
             trades_samples.sort()
             trades_mean = sum(trades_samples) / float(len(trades_samples))
@@ -959,6 +1130,12 @@ def build_watchlist(
             "minProfitFactor": min_profit_factor,
             "minAvgR": min_avg_r,
             "minWinRate": min_win_rate,
+            "min_months_count": min_months_count,
+            "min_positive_month_rate": min_positive_month_rate,
+            "max_negative_months": max_negative_months,
+            "max_monthly_drawdown_pct": max_monthly_drawdown_pct,
+            "max_longest_negative_month_streak": max_longest_negative_month_streak,
+            "min_worst_month_pnl_pct": min_worst_month_pnl_pct,
             "top_k": top_k,
             "entry_time_rank_by": entry_time_rank_by,
             "top_k_rank_by": top_k_rank_by,
@@ -993,6 +1170,12 @@ def build_watchlist(
                 "minProfitFactor": min_profit_factor,
                 "minAvgR": min_avg_r,
                 "minWinRate": min_win_rate,
+                "min_months_count": min_months_count,
+                "min_positive_month_rate": min_positive_month_rate,
+                "max_negative_months": max_negative_months,
+                "max_monthly_drawdown_pct": max_monthly_drawdown_pct,
+                "max_longest_negative_month_streak": max_longest_negative_month_streak,
+                "min_worst_month_pnl_pct": min_worst_month_pnl_pct,
                 "top_k": top_k,
                 "entry_time_rank_by": entry_time_rank_by,
                 "top_k_rank_by": top_k_rank_by,

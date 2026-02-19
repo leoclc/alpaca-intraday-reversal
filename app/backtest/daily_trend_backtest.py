@@ -135,12 +135,17 @@ def _apply_portfolio_sizing(
         equity_before = equity
         equity = equity + pnl_total
         notional = plan.entry_price * qty
-        used_notional += notional
+        capacity_qty = int((state or {}).get("capacity_qty") or qty)
+        capacity_notional = plan.entry_price * capacity_qty
+        used_notional += capacity_notional
         open_positions += 1
+        wl_stats = getattr(plan, "watchlist_stats", None) if isinstance(getattr(plan, "watchlist_stats", None), dict) else {}
+        quality_state = state.get("quality_sizing") if isinstance(state, dict) else {}
         accepted.append(trade)
         sized_records.append(
             {
                 "symbol": plan.symbol,
+                "param_overrides": getattr(plan, "param_overrides", None),
                 "direction": plan.direction,
                 "entry_date": plan.entry_date,
                 "entry_time_et": plan.entry_time_et,
@@ -163,20 +168,37 @@ def _apply_portfolio_sizing(
                 "signal_return_pct": getattr(plan, "signal_return_pct", None),
                 "signal_return_atr": getattr(plan, "signal_return_atr", None),
                 "atr": getattr(plan, "atr", None),
+                "watchlist_rank": wl_stats.get("rank"),
+                "watchlist_avgR": wl_stats.get("avgR"),
+                "watchlist_avgR_stderr": wl_stats.get("avgR_stderr"),
+                "watchlist_win_rate": wl_stats.get("win_rate"),
+                "watchlist_profit_factor": wl_stats.get("profit_factor"),
+                "watchlist_trades_count": wl_stats.get("trades_count"),
+                "watchlist_total_pnl_pct": wl_stats.get("total_pnl_pct"),
                 "exit_date": trade.exit_date,
                 "exit_price": trade.exit_price,
                 "exit_reason": trade.exit_reason,
+                "exit_ts": getattr(trade, "exit_ts", None),
+                "stop_hit_ts": getattr(trade, "stop_hit_ts", None),
+                "target_hit_ts": getattr(trade, "target_hit_ts", None),
                 "qty": qty,
                 "pnl_total": pnl_total,
                 "pnl_pct": trade.pnl_pct,
                 "r_multiple": trade.r_multiple,
+                "quality_risk_mult": (quality_state or {}).get("risk_multiplier"),
+                "quality_score": (quality_state or {}).get("score"),
                 "mfe_pct": getattr(trade, "mfe_pct", None),
                 "mae_pct": getattr(trade, "mae_pct", None),
                 "mfe_r": getattr(trade, "mfe_r", None),
                 "mae_r": getattr(trade, "mae_r", None),
+                "mfe_r_full": getattr(trade, "mfe_r_full", None),
+                "mae_r_full": getattr(trade, "mae_r_full", None),
+                "mfe_r_before_stop": getattr(trade, "mfe_r_before_stop", None),
+                "mae_r_to_target": getattr(trade, "mae_r_to_target", None),
                 "equity_before": equity_before,
                 "equity_after": equity,
                 "notional": notional,
+                "capacity_notional": capacity_notional,
                 "sizing_state": state,
             }
         )
@@ -222,7 +244,24 @@ def run_backtest(
     starting_equity = float(params.get("starting_equity") or 100000.0)
     equity = starting_equity
     run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    days = list(iter_trading_days(start, end))
+    days_all = list(iter_trading_days(start, end))
+    # iter_trading_days() only skips weekends. For parity (and speed), skip market holidays too by
+    # filtering against a reference symbol's daily bars (market holidays are known ahead of time in live).
+    calendar_cfg = cfg.get("market_calendar") or {}
+    calendar_symbol = str(calendar_cfg.get("symbol") or "SPY").upper()
+    try:
+        cal_bars = data_store.get_daily_bars(calendar_symbol, prefetch_start, end, cfg=cfg, allow_fetch=True) or []
+        cal_days = {str(b.get("date")) for b in cal_bars if b.get("date")}
+        days = [d for d in days_all if d.isoformat() in cal_days]
+        if len(days) != len(days_all):
+            logging.info(
+                "[BACKTEST] calendar filter symbol=%s trading_days=%s skipped_weekdays=%s",
+                calendar_symbol,
+                len(days),
+                (len(days_all) - len(days)),
+            )
+    except Exception:
+        days = days_all
     # Prepare output directory early for incremental flush.
     if out_path:
         out_file = Path(out_path)

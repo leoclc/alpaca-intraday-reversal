@@ -195,10 +195,21 @@ def simulate_exit(
             return None
         stop_first = bool(params.get("stop_first_when_both", True))
         direction = str(trade_plan.direction).lower()
-        mfe_val = 0.0
-        mae_val = 0.0
+        entry_price = float(trade_plan.entry_price or 0.0)
+        stop_distance = float(trade_plan.stop_distance or 0.0)
+        mfe_val = 0.0  # max favorable excursion (price units) across scanned bars
+        mae_val = 0.0  # max adverse excursion (negative; price units) across scanned bars
+        mfe_val_to_exit = None
+        mae_val_to_exit = None
+        first_stop_ts: Optional[dt.datetime] = None
+        first_target_ts: Optional[dt.datetime] = None
+        mfe_val_before_stop = None  # excludes stop bar (safe "target would have hit before stop" calc)
+        mae_val_to_target = None  # includes target bar (safe "stop needed to survive to target" calc)
+        exit_reason = None
+        exit_price = None
+        exit_ts = None
         last_bar = None
-        last_ts = None
+        last_ts: Optional[dt.datetime] = None
         for bar in bars_intraday:
             ts = _parse_intraday_ts(bar)
             if not ts:
@@ -211,77 +222,84 @@ def simulate_exit(
                 break
             last_bar = bar
             last_ts = ts
+            mfe_prev = mfe_val
+            mae_prev = mae_val
             high = float(bar.get("high") or bar.get("h") or bar.get("High") or 0.0)
             low = float(bar.get("low") or bar.get("l") or bar.get("Low") or 0.0)
             if direction == "long":
-                mfe_val = max(mfe_val, high - trade_plan.entry_price)
-                mae_val = min(mae_val, low - trade_plan.entry_price)
+                mfe_val = max(mfe_val, high - entry_price)
+                mae_val = min(mae_val, low - entry_price)
                 hit_stop = low <= trade_plan.stop_price
                 hit_target = high >= trade_plan.target_price
             else:
-                mfe_val = max(mfe_val, trade_plan.entry_price - low)
-                mae_val = min(mae_val, trade_plan.entry_price - high)
+                mfe_val = max(mfe_val, entry_price - low)
+                mae_val = min(mae_val, entry_price - high)
                 hit_stop = high >= trade_plan.stop_price
                 hit_target = low <= trade_plan.target_price
-            mfe_pct = (mfe_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
-            mae_pct = (mae_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
-            mfe_r = (mfe_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
-            mae_r = (mae_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
-            if hit_stop and hit_target:
-                reason = "stop" if stop_first else "target"
-                price = trade_plan.stop_price if stop_first else trade_plan.target_price
-                return {
-                    "exit_date": trade_plan.entry_date,
-                    "exit_price": price,
-                    "exit_reason": reason,
-                    "mfe_pct": mfe_pct,
-                    "mae_pct": mae_pct,
-                    "mfe_r": mfe_r,
-                    "mae_r": mae_r,
-                    "exit_ts": last_ts.isoformat() if last_ts else None,
-                }
-            if hit_stop:
-                return {
-                    "exit_date": trade_plan.entry_date,
-                    "exit_price": trade_plan.stop_price,
-                    "exit_reason": "stop",
-                    "mfe_pct": mfe_pct,
-                    "mae_pct": mae_pct,
-                    "mfe_r": mfe_r,
-                    "mae_r": mae_r,
-                    "exit_ts": last_ts.isoformat() if last_ts else None,
-                }
-            if hit_target:
-                return {
-                    "exit_date": trade_plan.entry_date,
-                    "exit_price": trade_plan.target_price,
-                    "exit_reason": "target",
-                    "mfe_pct": mfe_pct,
-                    "mae_pct": mae_pct,
-                    "mfe_r": mfe_r,
-                    "mae_r": mae_r,
-                    "exit_ts": last_ts.isoformat() if last_ts else None,
-                }
+
+            if hit_stop and first_stop_ts is None:
+                first_stop_ts = ts
+                # Exclude the stop bar for a safe "target would have hit before stop" threshold.
+                mfe_val_before_stop = mfe_prev
+            if hit_target and first_target_ts is None:
+                first_target_ts = ts
+                # Include target bar lows for a safe "stop needed to survive to target" threshold.
+                mae_val_to_target = mae_val
+
+            # Determine actual exit on the first bar that hits stop/target.
+            if exit_reason is None and (hit_stop or hit_target):
+                if hit_stop and hit_target:
+                    exit_reason = "stop" if stop_first else "target"
+                    exit_price = trade_plan.stop_price if stop_first else trade_plan.target_price
+                elif hit_stop:
+                    exit_reason = "stop"
+                    exit_price = trade_plan.stop_price
+                else:
+                    exit_reason = "target"
+                    exit_price = trade_plan.target_price
+                exit_ts = ts.isoformat()
+                mfe_val_to_exit = mfe_val
+                mae_val_to_exit = mae_val
         if not last_bar:
             return None
         close_price = float(last_bar.get("close") or last_bar.get("c") or last_bar.get("Close") or 0.0)
-        mfe_pct = (mfe_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
-        mae_pct = (mae_val / trade_plan.entry_price) * 100.0 if trade_plan.entry_price else None
-        mfe_r = (mfe_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
-        mae_r = (mae_val / trade_plan.stop_distance) if trade_plan.stop_distance else None
-        exit_reason = "time_stop"
-        if intraday_only and flatten_dt is not None and cutoff == flatten_dt:
-            if time_stop_cutoff is None or flatten_dt <= time_stop_cutoff:
-                exit_reason = "eod_flat"
+        if exit_reason is None:
+            exit_reason = "time_stop"
+            if intraday_only and flatten_dt is not None and cutoff == flatten_dt:
+                if time_stop_cutoff is None or flatten_dt <= time_stop_cutoff:
+                    exit_reason = "eod_flat"
+            exit_price = close_price
+            exit_ts = last_ts.isoformat() if last_ts else None
+            mfe_val_to_exit = mfe_val
+            mae_val_to_exit = mae_val
+
+        mfe_pct = (float(mfe_val_to_exit or 0.0) / entry_price) * 100.0 if entry_price else None
+        mae_pct = (float(mae_val_to_exit or 0.0) / entry_price) * 100.0 if entry_price else None
+        mfe_r = (float(mfe_val_to_exit or 0.0) / stop_distance) if stop_distance else None
+        mae_r = (float(mae_val_to_exit or 0.0) / stop_distance) if stop_distance else None
+        mfe_r_full = (float(mfe_val) / stop_distance) if stop_distance else None
+        mae_r_full = (float(mae_val) / stop_distance) if stop_distance else None
+        mfe_r_before_stop = None
+        if str(exit_reason) == "stop" and mfe_val_before_stop is not None and stop_distance:
+            mfe_r_before_stop = float(mfe_val_before_stop) / stop_distance
+        mae_r_to_target = None
+        if mae_val_to_target is not None and stop_distance:
+            mae_r_to_target = float(mae_val_to_target) / stop_distance
         return {
             "exit_date": trade_plan.entry_date,
-            "exit_price": close_price,
+            "exit_price": exit_price,
             "exit_reason": exit_reason,
             "mfe_pct": mfe_pct,
             "mae_pct": mae_pct,
             "mfe_r": mfe_r,
             "mae_r": mae_r,
-            "exit_ts": last_ts.isoformat() if last_ts else None,
+            "exit_ts": exit_ts,
+            "stop_hit_ts": first_stop_ts.isoformat() if first_stop_ts else None,
+            "target_hit_ts": first_target_ts.isoformat() if first_target_ts else None,
+            "mfe_r_full": mfe_r_full,
+            "mae_r_full": mae_r_full,
+            "mfe_r_before_stop": mfe_r_before_stop,
+            "mae_r_to_target": mae_r_to_target,
         }
 
     if intraday_only:

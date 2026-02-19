@@ -1,8 +1,118 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from app.strategies.types import TradePlan
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _safe_float_opt(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[str, Any]]:
+    params = cfg.get("daily_trend_reversal") or {}
+    enabled = bool(params.get("quality_sizing_enabled", False))
+    meta: Dict[str, Any] = {"enabled": enabled, "applied": False}
+    if not enabled:
+        return 1.0, meta
+
+    stats = getattr(plan, "watchlist_stats", None)
+    if not isinstance(stats, dict):
+        meta["reason"] = "missing_watchlist_stats"
+        return 1.0, meta
+
+    try:
+        min_mult = float(params.get("quality_sizing_min_mult") or 0.4)
+        max_mult = float(params.get("quality_sizing_max_mult") or 1.2)
+        if max_mult < min_mult:
+            min_mult, max_mult = max_mult, min_mult
+
+        avg_floor = float(params.get("quality_sizing_avgR_floor") or 0.0)
+        avg_cap = float(params.get("quality_sizing_avgR_cap") or 0.6)
+        pf_floor = float(params.get("quality_sizing_pf_floor") or 1.0)
+        pf_cap = float(params.get("quality_sizing_pf_cap") or 3.0)
+        wr_floor = float(params.get("quality_sizing_win_rate_floor") or 0.45)
+        wr_cap = float(params.get("quality_sizing_win_rate_cap") or 0.75)
+        trades_ref = max(1, int(params.get("quality_sizing_trades_ref") or 20))
+        lcb_z = float(params.get("quality_sizing_lcb_z") or 0.0)
+
+        w_avg = float(params.get("quality_sizing_weight_avgR") or 0.5)
+        w_pf = float(params.get("quality_sizing_weight_pf") or 0.2)
+        w_wr = float(params.get("quality_sizing_weight_win_rate") or 0.2)
+        w_n = float(params.get("quality_sizing_weight_trades") or 0.1)
+        if w_avg < 0:
+            w_avg = 0.0
+        if w_pf < 0:
+            w_pf = 0.0
+        if w_wr < 0:
+            w_wr = 0.0
+        if w_n < 0:
+            w_n = 0.0
+        w_sum = w_avg + w_pf + w_wr + w_n
+        if w_sum <= 0:
+            w_avg, w_pf, w_wr, w_n = 0.5, 0.2, 0.2, 0.1
+            w_sum = 1.0
+
+        avg_r = _safe_float_opt(stats.get("avgR"))
+        avg_r_stderr = _safe_float_opt(stats.get("avgR_stderr"))
+        profit_factor = _safe_float_opt(stats.get("profit_factor"))
+        win_rate = _safe_float_opt(stats.get("win_rate"))
+        trades_count = _safe_float_opt(stats.get("trades_count"))
+
+        avg_eff = avg_r
+        if avg_r is not None and avg_r_stderr is not None and lcb_z > 0:
+            avg_eff = avg_r - (lcb_z * max(0.0, avg_r_stderr))
+
+        def _score(v: Optional[float], lo: float, hi: float, *, neutral: float = 0.5) -> float:
+            if v is None:
+                return neutral
+            if hi <= lo:
+                return 1.0 if v > lo else 0.0
+            return _clamp((v - lo) / (hi - lo), 0.0, 1.0)
+
+        score_avg = _score(avg_eff, avg_floor, avg_cap)
+        score_pf = _score(profit_factor, pf_floor, pf_cap)
+        score_wr = _score(win_rate, wr_floor, wr_cap)
+        score_n = _score(trades_count, 0.0, float(trades_ref))
+
+        score = (
+            (w_avg * score_avg) + (w_pf * score_pf) + (w_wr * score_wr) + (w_n * score_n)
+        ) / w_sum
+        risk_multiplier = _clamp(min_mult + (max_mult - min_mult) * score, min_mult, max_mult)
+
+        meta.update(
+            {
+                "applied": True,
+                "rank": stats.get("rank"),
+                "avgR": avg_r,
+                "avgR_stderr": avg_r_stderr,
+                "avgR_effective": avg_eff,
+                "profit_factor": profit_factor,
+                "win_rate": win_rate,
+                "trades_count": trades_count,
+                "score_avg": score_avg,
+                "score_pf": score_pf,
+                "score_win_rate": score_wr,
+                "score_trades": score_n,
+                "score": score,
+                "risk_multiplier": risk_multiplier,
+                "min_mult": min_mult,
+                "max_mult": max_mult,
+            }
+        )
+        return risk_multiplier, meta
+    except Exception:
+        meta["reason"] = "quality_sizing_error"
+        return 1.0, meta
 
 
 def compute_qty_with_guards(
@@ -66,7 +176,9 @@ def compute_qty_with_guards(
         state["reject_reason"] = "risk_per_trade_zero"
         return 0, state
 
+    quality_mult, quality_state = _quality_risk_multiplier(plan, cfg)
     risk_amt = max(0.0, equity * risk_per_trade)
+    state["risk_amount_base"] = risk_amt
     state["risk_amount"] = risk_amt
     if plan.stop_distance <= 0:
         state["reject_reason"] = "stop_distance_zero"
@@ -96,11 +208,22 @@ def compute_qty_with_guards(
         state["per_trade_cap"] = per_trade_cap
         net_avail = min(net_avail, per_trade_cap)
 
+    state["quality_sizing"] = quality_state
+    state["quality_qty_multiplier"] = quality_mult
     state["net_available_final"] = net_avail
     budget_qty = int(net_avail // max(1e-9, float(plan.entry_price))) if net_avail > 0 else 0
     state["budget_qty"] = budget_qty
 
-    qty = min(risk_qty, budget_qty)
+    base_qty = min(risk_qty, budget_qty)
+    state["base_qty"] = base_qty
+    qty = base_qty
+    reserve_capacity = bool(params.get("quality_sizing_reserve_capacity", True))
+    if quality_state.get("applied"):
+        qty = int(base_qty * max(0.0, quality_mult))
+        # Avoid silently dropping otherwise valid trades due to integer truncation.
+        if base_qty > 0 and quality_mult > 0 and qty <= 0:
+            qty = 1
+    state["capacity_qty"] = base_qty if (quality_state.get("applied") and reserve_capacity) else qty
     state["final_qty"] = qty
     if qty <= 0:
         state["reject_reason"] = "budget_zero"
