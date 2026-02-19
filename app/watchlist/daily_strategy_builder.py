@@ -8,7 +8,7 @@ import time
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intraday_bars
@@ -265,6 +265,34 @@ def _expand_param_grid(grid: Dict) -> List[Dict]:
                 next_combos.append(new_combo)
         combos = next_combos
     return combos
+
+
+def _normalize_symbol_param_overrides(raw: Any) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        symbol = str(key or "").upper().strip()
+        if not symbol or not isinstance(value, dict) or not value:
+            continue
+        out[symbol] = dict(value)
+    return out
+
+
+def _load_symbol_param_overrides(watch_cfg: Dict) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    path_raw = watch_cfg.get("symbol_param_overrides_path")
+    if path_raw:
+        try:
+            payload = json.loads(Path(str(path_raw)).read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("symbol_param_overrides"), dict):
+                out.update(_normalize_symbol_param_overrides(payload.get("symbol_param_overrides")))
+            else:
+                out.update(_normalize_symbol_param_overrides(payload))
+        except Exception:
+            logging.warning("[WATCHLIST] failed to load symbol_param_overrides_path=%s", str(path_raw))
+    out.update(_normalize_symbol_param_overrides(watch_cfg.get("symbol_param_overrides")))
+    return out
 
 
 def _compute_stats(trades: List[TradeLite]) -> Dict[str, float]:
@@ -621,6 +649,17 @@ def build_watchlist(
     except Exception:
         rank_lcb_z = 1.0
     param_grid = _expand_param_grid(watch_cfg.get("param_grid") or {})
+    # Optional explicit per-symbol parameter overrides (e.g., target/stop knobs for specific symbols).
+    # These are applied in the watchlist builder so ranking/filtering uses the same params replay will execute.
+    symbol_param_overrides = _load_symbol_param_overrides(watch_cfg)
+    symbol_param_override_mode = str(watch_cfg.get("symbol_param_override_mode") or "merge").lower().strip()
+    if symbol_param_override_mode not in {"merge", "replace"}:
+        symbol_param_override_mode = "merge"
+    grid_idx_by_overrides_key: Dict[str, int] = {}
+    for idx, overrides in enumerate(param_grid):
+        ok = _overrides_key(overrides)
+        if ok not in grid_idx_by_overrides_key:
+            grid_idx_by_overrides_key[ok] = idx
     progress_interval_sec = int(watch_cfg.get("progress_interval_sec") or 60)
     tgt = expected_watchlist_date_str(target_date)
     symbols_list = [str(s).upper() for s in (symbols or []) if s]
@@ -746,6 +785,7 @@ def build_watchlist(
     last_log_ts = start_ts
     total_symbols = len(symbols_list)
     grid_size = max(1, len(param_grid))
+    symbol_overrides_used = 0
     for symbol_idx, symbol in enumerate(symbols_list, start=1):
         bars = bars_map.get(symbol, [])
         if not bars:
@@ -907,6 +947,64 @@ def build_watchlist(
                 best_time = entry_time
                 best_params = overrides
                 best_stats = stats
+        param_override_source = "grid_best"
+        symbol_override = symbol_param_overrides.get(symbol)
+        if symbol_override:
+            if symbol_param_override_mode == "replace":
+                forced_params = dict(symbol_override)
+                param_override_source = "symbol_override_replace"
+            else:
+                forced_params = dict(best_params or {})
+                forced_params.update(symbol_override)
+                param_override_source = "symbol_override_merge"
+
+            forced_key = _overrides_key(forced_params)
+            forced_grid_idx = grid_idx_by_overrides_key.get(forced_key)
+            forced_candidates: List[Tuple[str, Dict, Dict[str, float]]] = []
+            if forced_grid_idx is not None:
+                for entry_time in entry_times:
+                    forced_stats = _stats_from_acc(state.acc_by_candidate.get((entry_time, forced_grid_idx), CandidateAcc()))
+                    forced_candidates.append((entry_time, forced_params, forced_stats))
+            else:
+                forced_acc_by_time: Dict[str, CandidateAcc] = {entry_time: CandidateAcc() for entry_time in entry_times}
+                for d in sorted(state.window_signal_dates):
+                    sig = signals_by_date.get(d)
+                    if sig is None:
+                        continue
+                    lites = _trade_lites_for_signal(
+                        symbol,
+                        sig,
+                        trade_ns=trade_ns,
+                        cfg=cfg,
+                        data_store=data_store,
+                        bars_daily=bars,
+                        entry_times=entry_times,
+                        param_grid=[forced_params],
+                        minutes_needed_base=minutes_needed_base,
+                        apply_confirm=apply_confirm,
+                        confirm_minutes=confirm_minutes,
+                    )
+                    for entry_time in entry_times:
+                        lite = lites.get((entry_time, 0))
+                        if lite is not None:
+                            _acc_add(forced_acc_by_time[entry_time], lite, d)
+                for entry_time in entry_times:
+                    forced_candidates.append((entry_time, forced_params, _stats_from_acc(forced_acc_by_time[entry_time])))
+
+            forced_eligible = forced_candidates
+            if min_trades > 0:
+                forced_with_min_trades = [c for c in forced_candidates if int(c[2].get("trades_count") or 0) >= min_trades]
+                if forced_with_min_trades:
+                    forced_eligible = forced_with_min_trades
+            if forced_eligible:
+                best_time = forced_eligible[0][0]
+                best_params = forced_params
+                best_stats = forced_eligible[0][2]
+                for entry_time, _, forced_stats in forced_eligible[1:]:
+                    if _score(forced_stats) > _score(best_stats):
+                        best_time = entry_time
+                        best_stats = forced_stats
+                symbol_overrides_used += 1
         stats = best_stats
         trades_samples.append(int(stats["trades_count"]))
         pnl_samples.append(float(stats["total_pnl_pct"]))
@@ -971,6 +1069,7 @@ def build_watchlist(
                     "direction": str(getattr(signal_today, "direction", "") or "").lower(),
                     "entry_time_et": best_time,
                     "param_overrides": best_params,
+                    "param_override_source": param_override_source,
                     **stats,
                     "reasons": reasons,
                 }
@@ -999,6 +1098,7 @@ def build_watchlist(
                 "direction": str(getattr(signal_today, "direction", "") or "").lower(),
                 "entry_time_et": best_time,
                 "param_overrides": best_params,
+                "param_override_source": param_override_source,
                 **stats,
             }
         )
@@ -1033,6 +1133,12 @@ def build_watchlist(
             return float(row.get("total_pnl_pct") or 0.0)
         watchlist.sort(key=_rank_key, reverse=True)
         watchlist = watchlist[:top_k]
+
+    symbol_overrides_in_watchlist = sum(
+        1
+        for row in watchlist
+        if str(row.get("param_override_source") or "").startswith("symbol_override")
+    )
 
     funnel["watchlist_size"] = len(watchlist)
     logging.info(
@@ -1124,6 +1230,8 @@ def build_watchlist(
         "reject_counts": dict(reject_counts),
         "selected_summary": summarize_watchlist_rows(watchlist),
         "entry_time_counts": entry_time_counts,
+        "symbol_param_overrides_used_pre_top_k": int(symbol_overrides_used),
+        "symbol_param_overrides_used_in_watchlist": int(symbol_overrides_in_watchlist),
         "filters": {
             "minTrades": min_trades,
             "reject_negative_pnl": reject_negative_pnl,
@@ -1141,6 +1249,8 @@ def build_watchlist(
             "top_k_rank_by": top_k_rank_by,
             "param_rank_by": param_rank_by,
             "directional_history_only": directional_history_only,
+            "symbol_param_override_mode": symbol_param_override_mode,
+            "symbol_param_overrides_count": len(symbol_param_overrides),
         },
     }
 
@@ -1182,10 +1292,14 @@ def build_watchlist(
                 "param_rank_by": param_rank_by,
                 "param_grid": watch_cfg.get("param_grid") or {},
                 "directional_history_only": directional_history_only,
+                "symbol_param_override_mode": symbol_param_override_mode,
+                "symbol_param_overrides_count": len(symbol_param_overrides),
             },
             "summary": {
                 **funnel,
                 **reject_counts,
+                "symbol_overrides_used_pre_top_k": int(symbol_overrides_used),
+                "symbol_overrides_used_in_watchlist": int(symbol_overrides_in_watchlist),
                 "pass_trades_only": pass_trades_only,
                 "pass_trades_and_pnl": pass_trades_and_pnl,
                 "pass_trades_and_avg_r": pass_trades_and_avg_r,
