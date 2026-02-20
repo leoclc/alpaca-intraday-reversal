@@ -16,7 +16,7 @@ from app.execution.daily_execution_model import simulate_exit
 from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date, generate_signals_cached
 from app.utils.time import ensure_date, parse_time_hhmm
 from app.watchlist.day_filter import summarize_watchlist_rows
-from app.watchlist.node_assets import fetch_asset_symbols, resolve_watchlist_asset_filters, resolve_watchlist_builder_base
+from app.watchlist.node_assets import resolve_asset_universe_symbols
 from app.watchlist.storage import expected_watchlist_date_str, write_watchlist
 
 
@@ -66,7 +66,7 @@ _TRADE_LITE_CACHE: Dict[Tuple[str, str, str, str, str, str], Optional[TradeLite]
 _TRADE_LITE_DISK_LOADED: set[Tuple[str, str, str, str]] = set()
 
 # Bump this whenever the trade-lite computation logic changes so we don't reuse stale caches.
-_TRADE_LITE_CACHE_VERSION = 3
+_TRADE_LITE_CACHE_VERSION = 5
 
 
 def _trade_lite_namespace(cfg: Dict) -> str:
@@ -665,11 +665,17 @@ def build_watchlist(
     symbols_list = [str(s).upper() for s in (symbols or []) if s]
     watchlist_source = str(cfg.get("watchlist_source") or "node").lower()
     if not symbols_list and watchlist_source == "node":
-        asset_filters = resolve_watchlist_asset_filters(cfg) or {}
-        base_url = resolve_watchlist_builder_base(cfg)
-        symbols_list = fetch_asset_symbols(base_url=base_url, **asset_filters)
+        symbols_list, universe_source = resolve_asset_universe_symbols(cfg, target_date=tgt, allow_fetch=True)
+        logging.info(
+            "[WATCHLIST] universe date=%s source=%s size=%s",
+            tgt,
+            universe_source,
+            len(symbols_list),
+        )
     elif not symbols_list:
         symbols_list = [str(s).upper() for s in (cfg.get("symbols") or cfg.get("watchlist_symbols") or []) if s]
+    # Deterministic symbol scan order keeps tie-break behavior stable across runs.
+    symbols_list = sorted({str(s).upper() for s in symbols_list if s})
 
     funnel = {
         "scanned_symbols": 0,
@@ -1131,7 +1137,8 @@ def build_watchlist(
             if top_k_rank_by in ("win_rate", "winrate"):
                 return float(row.get("win_rate") or 0.0)
             return float(row.get("total_pnl_pct") or 0.0)
-        watchlist.sort(key=_rank_key, reverse=True)
+        # Deterministic tie-break by symbol prevents run-to-run ordering drift when scores tie.
+        watchlist.sort(key=lambda row: (-float(_rank_key(row)), str(row.get("symbol") or "")))
         watchlist = watchlist[:top_k]
 
     symbol_overrides_in_watchlist = sum(

@@ -10,7 +10,7 @@ from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intra
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.execution.daily_execution_model import simulate_exit
 from app.market.filters import market_filter_decision
-from app.strategies.daily_trend_reversal import build_trade, generate_signals
+from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
 from app.strategies.types import TradeResult
 from app.utils.time import iter_trading_days, parse_time_hhmm
 from app.watchlist.day_filter import day_filter_decision
@@ -178,11 +178,10 @@ def run_replay(
         if use_intraday_entry:
             minutes_needed = max(minutes_needed, max_entry_minutes)
         for symbol in symbols:
-            signals = generate_signals([symbol], date_str, date_str, cfg, data_store)
-            if not signals:
+            signal = generate_signal_for_date(symbol, date_str, cfg, data_store)
+            if not signal:
                 skip_counts["no_signal"] += 1
                 continue
-            signal = signals[0]
             bars_intraday = None
             if minutes_needed > 0:
                 bars_intraday = get_intraday_bars(symbol, date_str, minutes_needed, cfg=cfg, allow_fetch=True)

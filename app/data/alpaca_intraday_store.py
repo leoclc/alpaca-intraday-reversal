@@ -12,6 +12,7 @@ import requests
 from app.utils.time import ET_TZ, ensure_date, ensure_et, parse_time_hhmm
 
 _MEM_CACHE: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = {}
+_MINUTE_BARS_CACHE_VERSION = 2
 
 
 def _cache_path(base_dir: Path, symbol: str, session_date: dt.date, minutes: int) -> Path:
@@ -206,25 +207,44 @@ def get_intraday_bars(
     if minutes <= 0 or not symbol:
         return []
     session_dt = ensure_date(session_date)
-    cache_dir = Path(cfg.get("minute_bars_cache_dir") or "alpaca-minute")
+    alp = cfg.get("alpaca") or {}
+    feed_tok = "".join(ch for ch in str(alp.get("data_feed") or "x").lower() if ch.isalnum() or ch in ("-", "_")) or "x"
+    adj_tok = "".join(ch for ch in str(alp.get("adjustment") or "x").lower() if ch.isalnum() or ch in ("-", "_")) or "x"
+    cache_ns = f"v{_MINUTE_BARS_CACHE_VERSION}_{feed_tok}_{adj_tok}"
+    cache_dir = Path(cfg.get("minute_bars_cache_dir") or "alpaca-minute") / cache_ns
     cache_file = _cache_path(cache_dir, symbol, session_dt, minutes)
-    cache_key = (str(symbol).upper(), session_dt.isoformat(), minutes)
+    cache_key = (str(symbol).upper(), f"{session_dt.isoformat()}|{cache_ns}", minutes)
     if cache_key in _MEM_CACHE:
         return _MEM_CACHE[cache_key]
     refresh = bool(cfg.get("minute_bars_refresh", False))
 
-    def _has_open_bar(rows: List[Dict[str, Any]]) -> bool:
+    def _has_expected_coverage(rows: List[Dict[str, Any]]) -> bool:
         params = cfg.get("daily_trend_reversal") or {}
         session_open_et = str(params.get("session_open_et") or "09:30")
         open_time = parse_time_hhmm(session_open_et)
+        try:
+            open_dt = ensure_et(dt.datetime.combine(session_dt, open_time))
+            required_last_dt = open_dt + dt.timedelta(minutes=max(1, int(minutes)) - 1)
+        except Exception:
+            required_last_dt = None
+        saw_open = False
+        last_ts: Optional[dt.datetime] = None
         for row in rows or []:
             ts = _parse_timestamp(row.get("timestamp") or row.get("t") or row.get("time") or row.get("date"))
             if not ts:
                 continue
             ts_et = ensure_et(ts)
             if ts_et.hour == open_time.hour and ts_et.minute == open_time.minute:
-                return True
-        return False
+                saw_open = True
+            if last_ts is None or ts_et > last_ts:
+                last_ts = ts_et
+        if not saw_open:
+            return False
+        if required_last_dt is None:
+            return True
+        if last_ts is None:
+            return False
+        return last_ts >= required_last_dt
 
     def _slice_to_minutes(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         params = cfg.get("daily_trend_reversal") or {}
@@ -275,11 +295,11 @@ def get_intraday_bars(
         try:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
             if isinstance(cached, list):
-                if not _has_open_bar(cached):
+                if not _has_expected_coverage(cached):
                     # Stale cache is not an error; we will refetch below. Keep this at DEBUG to
                     # avoid spamming INFO logs during large backtests.
                     logging.debug(
-                        "[INTRADAY] cache stale (missing session open bar); refetching sym=%s date=%s minutes=%s",
+                        "[INTRADAY] cache stale (coverage check failed); refetching sym=%s date=%s minutes=%s",
                         str(symbol).upper(),
                         session_dt.isoformat(),
                         minutes,
@@ -295,8 +315,12 @@ def get_intraday_bars(
         if alt is not None and alt.exists():
             try:
                 cached = json.loads(alt.read_text(encoding="utf-8"))
-                if isinstance(cached, list) and cached and _has_open_bar(cached):
+                sliced: List[Dict[str, Any]] = []
+                if isinstance(cached, list) and cached:
                     sliced = _slice_to_minutes(cached)
+                    if not _has_expected_coverage(sliced):
+                        sliced = []
+                if isinstance(cached, list) and sliced:
                     _MEM_CACHE[cache_key] = sliced
                     # Persist the sliced result so subsequent runs can hit the exact cache file directly.
                     try:

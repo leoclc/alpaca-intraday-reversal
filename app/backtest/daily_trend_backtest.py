@@ -12,9 +12,9 @@ from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.market.filters import market_filter_decision
 from app.portfolio.sizing import compute_qty_with_guards
 from app.replay.daily_strategy_replay import run_replay
-from app.utils.time import iter_trading_days
+from app.utils.time import ensure_et, iter_trading_days, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
-from app.watchlist.node_assets import fetch_asset_symbols, resolve_watchlist_asset_filters, resolve_watchlist_builder_base
+from app.watchlist.node_assets import read_asset_universe_snapshot, resolve_asset_universe_symbols
 
 
 def _summarize(trades) -> Dict[str, float]:
@@ -112,96 +112,222 @@ def _apply_portfolio_sizing(
     cfg: Dict,
 ) -> Tuple[List, List[Dict], float]:
     params = cfg.get("daily_trend_reversal") or {}
+    intraday_only = bool(params.get("intraday_only", False))
+    session_close_et = str(params.get("session_close_et") or "16:00")
     used_notional = 0.0
-    open_positions = 0
     accepted: List = []
     sized_records: List[Dict] = []
-    for trade in day_trades:
+
+    def _parse_ts_iso(val: object) -> Optional[dt.datetime]:
+        if val is None:
+            return None
+        ts = str(val).strip()
+        if not ts:
+            return None
+        if ts.endswith("Z"):
+            ts = ts.replace("Z", "+00:00")
+        try:
+            return ensure_et(dt.datetime.fromisoformat(ts))
+        except Exception:
+            return None
+
+    def _entry_dt(plan_obj) -> Optional[dt.datetime]:
+        try:
+            return ensure_et(
+                dt.datetime.combine(
+                    dt.date.fromisoformat(str(plan_obj.entry_date)),
+                    parse_time_hhmm(str(plan_obj.entry_time_et or "09:35")),
+                )
+            )
+        except Exception:
+            return None
+
+    def _fallback_exit_dt(trade_obj, entry_dt_obj: dt.datetime) -> dt.datetime:
+        try:
+            exit_day = dt.date.fromisoformat(str(getattr(trade_obj, "exit_date", "") or entry_dt_obj.date().isoformat()))
+            return ensure_et(dt.datetime.combine(exit_day, parse_time_hhmm(session_close_et)))
+        except Exception:
+            return entry_dt_obj
+
+    def _build_sized_record(trade_obj, plan_obj, qty: int, state: Dict, pnl_total: float, notional: float, capacity_notional: float) -> Dict:
+        wl_stats = (
+            getattr(plan_obj, "watchlist_stats", None)
+            if isinstance(getattr(plan_obj, "watchlist_stats", None), dict)
+            else {}
+        )
+        quality_state = state.get("quality_sizing") if isinstance(state, dict) else {}
+        return {
+            "symbol": plan_obj.symbol,
+            "param_overrides": getattr(plan_obj, "param_overrides", None),
+            "direction": plan_obj.direction,
+            "entry_date": plan_obj.entry_date,
+            "entry_time_et": plan_obj.entry_time_et,
+            "entry_price": plan_obj.entry_price,
+            "entry_price_mode": getattr(plan_obj, "entry_price_mode", None),
+            "stop_price": plan_obj.stop_price,
+            "target_price": plan_obj.target_price,
+            "stop_distance": plan_obj.stop_distance,
+            "target_mode": getattr(plan_obj, "target_mode", None),
+            "target_window_avg_pct": getattr(plan_obj, "target_window_avg_pct", None),
+            "target_window_mult": getattr(plan_obj, "target_window_mult", None),
+            "target_window_minutes": getattr(plan_obj, "target_window_minutes", None),
+            "target_window_samples": getattr(plan_obj, "target_window_samples", None),
+            "gap_bps": getattr(plan_obj, "gap_bps", None),
+            "early_pullback_bps": getattr(plan_obj, "early_pullback_bps", None),
+            "early_reversal_bps": getattr(plan_obj, "early_reversal_bps", None),
+            "confirm_move_bps": getattr(plan_obj, "confirm_move_bps", None),
+            "confirm_minutes": getattr(plan_obj, "confirm_minutes", None),
+            "confirm_hit_bps": getattr(plan_obj, "confirm_hit_bps", None),
+            "signal_return_pct": getattr(plan_obj, "signal_return_pct", None),
+            "signal_return_atr": getattr(plan_obj, "signal_return_atr", None),
+            "atr": getattr(plan_obj, "atr", None),
+            "watchlist_rank": wl_stats.get("rank"),
+            "watchlist_avgR": wl_stats.get("avgR"),
+            "watchlist_avgR_stderr": wl_stats.get("avgR_stderr"),
+            "watchlist_win_rate": wl_stats.get("win_rate"),
+            "watchlist_profit_factor": wl_stats.get("profit_factor"),
+            "watchlist_trades_count": wl_stats.get("trades_count"),
+            "watchlist_total_pnl_pct": wl_stats.get("total_pnl_pct"),
+            "exit_date": trade_obj.exit_date,
+            "exit_price": trade_obj.exit_price,
+            "exit_reason": trade_obj.exit_reason,
+            "exit_ts": getattr(trade_obj, "exit_ts", None),
+            "stop_hit_ts": getattr(trade_obj, "stop_hit_ts", None),
+            "target_hit_ts": getattr(trade_obj, "target_hit_ts", None),
+            "qty": qty,
+            "pnl_total": pnl_total,
+            "pnl_pct": trade_obj.pnl_pct,
+            "r_multiple": trade_obj.r_multiple,
+            "quality_risk_mult": (quality_state or {}).get("risk_multiplier"),
+            "quality_score": (quality_state or {}).get("score"),
+            "mfe_pct": getattr(trade_obj, "mfe_pct", None),
+            "mae_pct": getattr(trade_obj, "mae_pct", None),
+            "mfe_r": getattr(trade_obj, "mfe_r", None),
+            "mae_r": getattr(trade_obj, "mae_r", None),
+            "mfe_r_full": getattr(trade_obj, "mfe_r_full", None),
+            "mae_r_full": getattr(trade_obj, "mae_r_full", None),
+            "mfe_r_before_stop": getattr(trade_obj, "mfe_r_before_stop", None),
+            "mae_r_to_target": getattr(trade_obj, "mae_r_to_target", None),
+            "equity_before": None,
+            "equity_after": None,
+            "notional": notional,
+            "capacity_notional": capacity_notional,
+            "sizing_state": state,
+        }
+
+    if not intraday_only:
+        # Legacy path for multi-day holds: realized PnL is applied in sequence.
+        open_positions = 0
+        for trade in day_trades:
+            plan = getattr(trade, "plan", None)
+            if plan is None:
+                continue
+            qty, state = compute_qty_with_guards(
+                plan,
+                equity,
+                used_notional,
+                cfg,
+                open_positions=open_positions,
+            )
+            if qty <= 0:
+                continue
+            direction_mult = 1.0 if plan.direction == "long" else -1.0
+            pnl_per_share = (float(trade.exit_price) - plan.entry_price) * direction_mult
+            pnl_total = pnl_per_share * qty
+            equity_before = equity
+            equity = equity + pnl_total
+            notional = plan.entry_price * qty
+            capacity_qty = int((state or {}).get("capacity_qty") or qty)
+            capacity_notional = plan.entry_price * capacity_qty
+            used_notional += capacity_notional
+            open_positions += 1
+            accepted.append(trade)
+            rec = _build_sized_record(trade, plan, qty, state, pnl_total, notional, capacity_notional)
+            rec["equity_before"] = equity_before
+            rec["equity_after"] = equity
+            sized_records.append(rec)
+        return accepted, sized_records, equity
+
+    work: List[Dict] = []
+    for seq, trade in enumerate(day_trades):
         plan = getattr(trade, "plan", None)
         if plan is None:
             continue
+        entry_dt_obj = _entry_dt(plan)
+        if entry_dt_obj is None:
+            continue
+        exit_dt_obj = _parse_ts_iso(getattr(trade, "exit_ts", None))
+        if exit_dt_obj is None:
+            exit_dt_obj = _fallback_exit_dt(trade, entry_dt_obj)
+        work.append(
+            {
+                "seq": seq,
+                "trade": trade,
+                "plan": plan,
+                "entry_dt": entry_dt_obj,
+                "exit_dt": exit_dt_obj,
+            }
+        )
+    work.sort(key=lambda r: (r["entry_dt"], r["seq"]))
+
+    open_positions_state: List[Dict] = []
+
+    def _realize_until(cutoff_dt: dt.datetime, include_equal: bool = False) -> None:
+        nonlocal equity, used_notional, open_positions_state
+        if not open_positions_state:
+            return
+        still_open: List[Dict] = []
+        for pos in open_positions_state:
+            should_close = pos["exit_dt"] <= cutoff_dt if include_equal else pos["exit_dt"] < cutoff_dt
+            if should_close:
+                rec = pos["record"]
+                eq_before = equity
+                equity += float(pos["pnl_total"])
+                rec["equity_before"] = eq_before
+                rec["equity_after"] = equity
+                used_notional = max(0.0, used_notional - float(pos["capacity_notional"]))
+            else:
+                still_open.append(pos)
+        open_positions_state = still_open
+
+    for row in work:
+        trade = row["trade"]
+        plan = row["plan"]
+        entry_dt_obj = row["entry_dt"]
+        _realize_until(entry_dt_obj)
         qty, state = compute_qty_with_guards(
             plan,
             equity,
             used_notional,
             cfg,
-            open_positions=open_positions,
+            open_positions=len(open_positions_state),
         )
         if qty <= 0:
             continue
         direction_mult = 1.0 if plan.direction == "long" else -1.0
         pnl_per_share = (float(trade.exit_price) - plan.entry_price) * direction_mult
         pnl_total = pnl_per_share * qty
-        equity_before = equity
-        equity = equity + pnl_total
         notional = plan.entry_price * qty
         capacity_qty = int((state or {}).get("capacity_qty") or qty)
         capacity_notional = plan.entry_price * capacity_qty
         used_notional += capacity_notional
-        open_positions += 1
-        wl_stats = getattr(plan, "watchlist_stats", None) if isinstance(getattr(plan, "watchlist_stats", None), dict) else {}
-        quality_state = state.get("quality_sizing") if isinstance(state, dict) else {}
+
         accepted.append(trade)
-        sized_records.append(
+        rec = _build_sized_record(trade, plan, qty, state, pnl_total, notional, capacity_notional)
+        sized_records.append(rec)
+        open_positions_state.append(
             {
-                "symbol": plan.symbol,
-                "param_overrides": getattr(plan, "param_overrides", None),
-                "direction": plan.direction,
-                "entry_date": plan.entry_date,
-                "entry_time_et": plan.entry_time_et,
-                "entry_price": plan.entry_price,
-                "entry_price_mode": getattr(plan, "entry_price_mode", None),
-                "stop_price": plan.stop_price,
-                "target_price": plan.target_price,
-                "stop_distance": plan.stop_distance,
-                "target_mode": getattr(plan, "target_mode", None),
-                "target_window_avg_pct": getattr(plan, "target_window_avg_pct", None),
-                "target_window_mult": getattr(plan, "target_window_mult", None),
-                "target_window_minutes": getattr(plan, "target_window_minutes", None),
-                "target_window_samples": getattr(plan, "target_window_samples", None),
-                "gap_bps": getattr(plan, "gap_bps", None),
-                "early_pullback_bps": getattr(plan, "early_pullback_bps", None),
-                "early_reversal_bps": getattr(plan, "early_reversal_bps", None),
-                "confirm_move_bps": getattr(plan, "confirm_move_bps", None),
-                "confirm_minutes": getattr(plan, "confirm_minutes", None),
-                "confirm_hit_bps": getattr(plan, "confirm_hit_bps", None),
-                "signal_return_pct": getattr(plan, "signal_return_pct", None),
-                "signal_return_atr": getattr(plan, "signal_return_atr", None),
-                "atr": getattr(plan, "atr", None),
-                "watchlist_rank": wl_stats.get("rank"),
-                "watchlist_avgR": wl_stats.get("avgR"),
-                "watchlist_avgR_stderr": wl_stats.get("avgR_stderr"),
-                "watchlist_win_rate": wl_stats.get("win_rate"),
-                "watchlist_profit_factor": wl_stats.get("profit_factor"),
-                "watchlist_trades_count": wl_stats.get("trades_count"),
-                "watchlist_total_pnl_pct": wl_stats.get("total_pnl_pct"),
-                "exit_date": trade.exit_date,
-                "exit_price": trade.exit_price,
-                "exit_reason": trade.exit_reason,
-                "exit_ts": getattr(trade, "exit_ts", None),
-                "stop_hit_ts": getattr(trade, "stop_hit_ts", None),
-                "target_hit_ts": getattr(trade, "target_hit_ts", None),
-                "qty": qty,
-                "pnl_total": pnl_total,
-                "pnl_pct": trade.pnl_pct,
-                "r_multiple": trade.r_multiple,
-                "quality_risk_mult": (quality_state or {}).get("risk_multiplier"),
-                "quality_score": (quality_state or {}).get("score"),
-                "mfe_pct": getattr(trade, "mfe_pct", None),
-                "mae_pct": getattr(trade, "mae_pct", None),
-                "mfe_r": getattr(trade, "mfe_r", None),
-                "mae_r": getattr(trade, "mae_r", None),
-                "mfe_r_full": getattr(trade, "mfe_r_full", None),
-                "mae_r_full": getattr(trade, "mae_r_full", None),
-                "mfe_r_before_stop": getattr(trade, "mfe_r_before_stop", None),
-                "mae_r_to_target": getattr(trade, "mae_r_to_target", None),
-                "equity_before": equity_before,
-                "equity_after": equity,
-                "notional": notional,
+                "exit_dt": row["exit_dt"],
                 "capacity_notional": capacity_notional,
-                "sizing_state": state,
+                "pnl_total": pnl_total,
+                "record": rec,
             }
         )
+
+    if open_positions_state:
+        cutoff_points = sorted({pos["exit_dt"] for pos in open_positions_state})
+        for cutoff in cutoff_points:
+            _realize_until(cutoff, include_equal=True)
     return accepted, sized_records, equity
 
 
@@ -219,11 +345,13 @@ def run_backtest(
     if not start or not end:
         raise ValueError("start_date/end_date required (or set replay.start_date/end_date in config.json)")
 
-    base_url = resolve_watchlist_builder_base(cfg)
-    asset_filters = resolve_watchlist_asset_filters(cfg) or {}
-    logging.info("[BACKTEST] fetching asset universe via node base=%s filters=%s", base_url, asset_filters)
-    symbols = fetch_asset_symbols(base_url=base_url, **asset_filters)
-    logging.info("[BACKTEST] asset universe size=%s", len(symbols))
+    symbols, universe_source = resolve_asset_universe_symbols(cfg, target_date=start, allow_fetch=True)
+    logging.info(
+        "[BACKTEST] asset universe date=%s source=%s size=%s",
+        start,
+        universe_source,
+        len(symbols),
+    )
 
     data_store = AlpacaOHLCStore(cfg=cfg)
     # Prefetch historical bars once so daily scans don't hit Alpaca repeatedly.
@@ -306,8 +434,17 @@ def run_backtest(
         if month_key is None:
             month_key = current_month
             month_start_equity = equity
-        logging.info("[BACKTEST] build watchlist date=%s", date_str)
-        _ = build_watchlist(cfg, target_date=date_str, symbols=symbols, data_store=data_store, run_id=run_id)
+        symbols_for_day = symbols
+        day_snapshot_symbols, _day_meta = read_asset_universe_snapshot(cfg, date_str)
+        if day_snapshot_symbols:
+            symbols_for_day = day_snapshot_symbols
+            logging.info(
+                "[BACKTEST] using universe snapshot date=%s size=%s",
+                date_str,
+                len(symbols_for_day),
+            )
+        logging.info("[BACKTEST] build watchlist date=%s symbols=%s", date_str, len(symbols_for_day))
+        _ = build_watchlist(cfg, target_date=date_str, symbols=symbols_for_day, data_store=data_store, run_id=run_id)
         skip, info = market_filter_decision(date_str, cfg, data_store)
         if skip:
             skip_count += 1

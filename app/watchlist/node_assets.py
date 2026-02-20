@@ -1,9 +1,81 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+from app.utils.time import et_today_date_str
+
+
+def _normalize_symbols(raw: Any) -> List[str]:
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    for val in raw:
+        try:
+            sym = str(val or "").upper().strip()
+        except Exception:
+            sym = ""
+        if sym:
+            out.append(sym)
+    return sorted(dict.fromkeys(out))
+
+
+def _asset_universe_dir(cfg: dict) -> Path:
+    base = cfg.get("asset_universe_dir")
+    if not base:
+        logs_dir = str(cfg.get("logs_dir") or "logs")
+        base = str(Path(logs_dir) / "asset_universe")
+    path = Path(str(base))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def asset_universe_snapshot_path(cfg: dict, target_date: Optional[str] = None) -> Path:
+    date_str = str(target_date or et_today_date_str())
+    return _asset_universe_dir(cfg) / f"{date_str}.json"
+
+
+def read_asset_universe_snapshot(cfg: dict, target_date: Optional[str] = None) -> Tuple[List[str], Dict[str, Any]]:
+    path = asset_universe_snapshot_path(cfg, target_date)
+    if not path.exists() or path.stat().st_size <= 0:
+        return [], {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return [], {}
+    if not isinstance(payload, dict):
+        return [], {}
+    symbols = _normalize_symbols(payload.get("symbols"))
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    return symbols, meta
+
+
+def write_asset_universe_snapshot(
+    cfg: dict,
+    target_date: Optional[str],
+    symbols: List[str],
+    *,
+    source: str,
+    base_url: Optional[str] = None,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Path:
+    date_str = str(target_date or et_today_date_str())
+    path = asset_universe_snapshot_path(cfg, date_str)
+    payload = {
+        "date": date_str,
+        "symbols": _normalize_symbols(symbols),
+        "meta": {
+            "source": str(source or ""),
+            "base_url": str(base_url or ""),
+            "filters": dict(filters or {}),
+        },
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
 
 
 def resolve_watchlist_asset_filters(cfg: dict) -> Optional[Dict[str, Any]]:
@@ -132,3 +204,41 @@ def fetch_asset_symbols(
     if not symbols:
         raise RuntimeError("Asset scan returned no symbols")
     return symbols
+
+
+def resolve_asset_universe_symbols(
+    cfg: dict,
+    *,
+    target_date: Optional[str] = None,
+    allow_fetch: bool = True,
+    force_refresh: bool = False,
+) -> Tuple[List[str], str]:
+    date_str = str(target_date or et_today_date_str())
+    watchlist_source = str(cfg.get("watchlist_source") or "node").lower()
+
+    if not force_refresh:
+        cached, _meta = read_asset_universe_snapshot(cfg, date_str)
+        if cached:
+            return cached, "snapshot"
+
+    if watchlist_source != "node":
+        symbols = _normalize_symbols(cfg.get("symbols") or cfg.get("watchlist_symbols") or [])
+        if symbols:
+            write_asset_universe_snapshot(cfg, date_str, symbols, source="config")
+        return symbols, "config"
+
+    if not allow_fetch:
+        return [], "none"
+
+    asset_filters = resolve_watchlist_asset_filters(cfg) or {}
+    base_url = resolve_watchlist_builder_base(cfg)
+    symbols = fetch_asset_symbols(base_url=base_url, **asset_filters)
+    write_asset_universe_snapshot(
+        cfg,
+        date_str,
+        symbols,
+        source="node",
+        base_url=base_url,
+        filters=asset_filters,
+    )
+    return symbols, "node"
