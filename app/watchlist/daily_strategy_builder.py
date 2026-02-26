@@ -13,7 +13,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intraday_bars
 from app.execution.daily_execution_model import simulate_exit
-from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date, generate_signals_cached
+from app.strategies.daily_trend_reversal import (
+    build_trade,
+    generate_signal_for_date,
+    generate_signals_cached,
+    resolve_entry_times,
+)
 from app.utils.time import ensure_date, parse_time_hhmm
 from app.watchlist.day_filter import summarize_watchlist_rows
 from app.watchlist.node_assets import resolve_asset_universe_symbols
@@ -1653,6 +1658,13 @@ def build_watchlist(
     except Exception:
         min_cutoff_avg_mfe_r = None
     try:
+        min_cutoff_target_fit_ratio_raw = watch_cfg.get("min_cutoff_target_fit_ratio")
+        min_cutoff_target_fit_ratio = (
+            float(min_cutoff_target_fit_ratio_raw) if min_cutoff_target_fit_ratio_raw is not None else None
+        )
+    except Exception:
+        min_cutoff_target_fit_ratio = None
+    try:
         max_loser_no_progress_share_raw = watch_cfg.get("max_loser_no_progress_share")
         max_loser_no_progress_share = (
             float(max_loser_no_progress_share_raw) if max_loser_no_progress_share_raw is not None else None
@@ -1851,6 +1863,15 @@ def build_watchlist(
         )
     except Exception:
         dynamic_wf_min_cutoff_avg_mfe_r = None
+    try:
+        dynamic_wf_min_cutoff_target_fit_ratio_raw = dynamic_wf_cfg.get("min_cutoff_target_fit_ratio")
+        dynamic_wf_min_cutoff_target_fit_ratio = (
+            float(dynamic_wf_min_cutoff_target_fit_ratio_raw)
+            if dynamic_wf_min_cutoff_target_fit_ratio_raw is not None
+            else None
+        )
+    except Exception:
+        dynamic_wf_min_cutoff_target_fit_ratio = None
     dynamic_wf_log_details = bool(dynamic_wf_cfg.get("log_details", False))
     grid_idx_by_overrides_key: Dict[str, int] = {}
     for idx, overrides in enumerate(param_grid):
@@ -1896,6 +1917,7 @@ def build_watchlist(
         "max_stop_rate": 0,
         "max_cutoff_rate": 0,
         "min_cutoff_avg_mfe_r": 0,
+        "min_cutoff_target_fit_ratio": 0,
         "max_loser_no_progress_share": 0,
         "max_stop_no_progress_share": 0,
         "wf_min_trades": 0,
@@ -1908,6 +1930,7 @@ def build_watchlist(
         "wf_max_loser_no_progress_share": 0,
         "wf_max_stop_no_progress_share": 0,
         "wf_min_cutoff_avg_mfe_r": 0,
+        "wf_min_cutoff_target_fit_ratio": 0,
     }
     report_rows: List[Dict] = []
     pass_trades_only = 0
@@ -1922,22 +1945,7 @@ def build_watchlist(
 
     params = cfg.get("daily_trend_reversal") or {}
     entry_time_et = str(params.get("entry_time_et") or "09:35")
-    entry_times_raw = params.get("entry_times_et")
-    if isinstance(entry_times_raw, list) and entry_times_raw:
-        entry_times_all = [str(t) for t in entry_times_raw if t]
-    else:
-        entry_times_all = [entry_time_et]
-    # De-duplicate while preserving author-specified order.
-    if entry_times_all:
-        seen_times: set[str] = set()
-        ordered: List[str] = []
-        for t in entry_times_all:
-            ts = str(t or "")
-            if not ts or ts in seen_times:
-                continue
-            seen_times.add(ts)
-            ordered.append(ts)
-        entry_times_all = ordered or [entry_time_et]
+    entry_times_all = resolve_entry_times(params, sort_mode="preserve")
     entry_time_mode = str(watch_cfg.get("entry_time_mode") or "fixed").lower().strip()
     scan_first_valid_mode = entry_time_mode in {"scan_first_valid", "dynamic_first_valid", "scan"}
     scan_first_valid_candidate_mode = str(
@@ -2479,6 +2487,12 @@ def build_watchlist(
             ):
                 reject_counts["wf_min_cutoff_avg_mfe_r"] += 1
                 wf_recent_reasons.append("wf_min_cutoff_avg_mfe_r")
+            if apply_wf_thresholds and (
+                dynamic_wf_min_cutoff_target_fit_ratio is not None
+                and float(recent_stats.get("cutoff_target_fit_ratio") or 0.0) < dynamic_wf_min_cutoff_target_fit_ratio
+            ):
+                reject_counts["wf_min_cutoff_target_fit_ratio"] += 1
+                wf_recent_reasons.append("wf_min_cutoff_target_fit_ratio")
             if dynamic_wf_log_details and wf_recent_reasons:
                 logging.info(
                     "[WATCHLIST_WF_SUPPRESS] date=%s symbol=%s reasons=%s recent_trades=%s recent_avgR=%.4f recent_win_rate=%.4f recent_total_pnl_pct=%.4f",
@@ -2553,6 +2567,12 @@ def build_watchlist(
             reject_counts["min_cutoff_avg_mfe_r"] += 1
             reasons.append("min_cutoff_avg_mfe_r")
         if (
+            min_cutoff_target_fit_ratio is not None
+            and float(stats.get("cutoff_target_fit_ratio") or 0.0) < min_cutoff_target_fit_ratio
+        ):
+            reject_counts["min_cutoff_target_fit_ratio"] += 1
+            reasons.append("min_cutoff_target_fit_ratio")
+        if (
             max_loser_no_progress_share is not None
             and float(stats.get("loser_no_progress_share") or 0.0) > max_loser_no_progress_share
         ):
@@ -2578,6 +2598,7 @@ def build_watchlist(
                 "wf_recent_stop_no_progress_share": float(recent_stats.get("stop_no_progress_share") or 0.0),
                 "wf_recent_cutoff_rate": float(recent_stats.get("cutoff_rate") or 0.0),
                 "wf_recent_cutoff_avg_mfe_r": float(recent_stats.get("cutoff_avg_mfe_r") or 0.0),
+                "wf_recent_cutoff_target_fit_ratio": float(recent_stats.get("cutoff_target_fit_ratio") or 0.0),
                 "wf_recent_cutoff_no_progress_share": float(recent_stats.get("cutoff_no_progress_share") or 0.0),
                 "wf_recent_loser_no_progress_share": float(recent_stats.get("loser_no_progress_share") or 0.0),
                 "wf_recent_suppressed": bool(len(wf_recent_reasons) > 0),
@@ -2713,7 +2734,7 @@ def build_watchlist(
     )
     if dynamic_wf_enabled and dynamic_wf_considered_symbols > 0:
         logging.info(
-            "[WATCHLIST_WF_FILTERS] date=%s considered=%s suppressed=%s reject_min_trades=%s reject_min_total_pnl_pct=%s reject_min_avg_r=%s reject_min_win_rate=%s reject_max_stop_rate=%s reject_max_cutoff_rate=%s reject_max_cutoff_no_progress_share=%s reject_max_loser_no_progress_share=%s reject_max_stop_no_progress_share=%s reject_min_cutoff_avg_mfe_r=%s",
+            "[WATCHLIST_WF_FILTERS] date=%s considered=%s suppressed=%s reject_min_trades=%s reject_min_total_pnl_pct=%s reject_min_avg_r=%s reject_min_win_rate=%s reject_max_stop_rate=%s reject_max_cutoff_rate=%s reject_max_cutoff_no_progress_share=%s reject_max_loser_no_progress_share=%s reject_max_stop_no_progress_share=%s reject_min_cutoff_avg_mfe_r=%s reject_min_cutoff_target_fit_ratio=%s",
             tgt,
             dynamic_wf_considered_symbols,
             dynamic_wf_suppressed_symbols,
@@ -2727,10 +2748,11 @@ def build_watchlist(
             reject_counts["wf_max_loser_no_progress_share"],
             reject_counts["wf_max_stop_no_progress_share"],
             reject_counts["wf_min_cutoff_avg_mfe_r"],
+            reject_counts["wf_min_cutoff_target_fit_ratio"],
         )
     if funnel["symbols_passing_filters"] == 0 and funnel["scanned_symbols"] > 0:
         logging.info(
-            "[WATCHLIST_FILTERS] date=%s reject_min_trades=%s reject_neg_pnl=%s reject_min_avg_r=%s reject_min_pf=%s reject_max_stop_rate=%s reject_max_cutoff_rate=%s reject_min_cutoff_avg_mfe_r=%s reject_max_loser_no_progress_share=%s reject_max_stop_no_progress_share=%s",
+            "[WATCHLIST_FILTERS] date=%s reject_min_trades=%s reject_neg_pnl=%s reject_min_avg_r=%s reject_min_pf=%s reject_max_stop_rate=%s reject_max_cutoff_rate=%s reject_min_cutoff_avg_mfe_r=%s reject_min_cutoff_target_fit_ratio=%s reject_max_loser_no_progress_share=%s reject_max_stop_no_progress_share=%s",
             tgt,
             reject_counts["min_trades"],
             reject_counts["neg_pnl"],
@@ -2739,6 +2761,7 @@ def build_watchlist(
             reject_counts["max_stop_rate"],
             reject_counts["max_cutoff_rate"],
             reject_counts["min_cutoff_avg_mfe_r"],
+            reject_counts["min_cutoff_target_fit_ratio"],
             reject_counts["max_loser_no_progress_share"],
             reject_counts["max_stop_no_progress_share"],
         )
@@ -2781,6 +2804,12 @@ def build_watchlist(
                 "[WATCHLIST_FILTERS] date=%s reject_min_cutoff_avg_mfe_r=%s",
                 tgt,
                 reject_counts["min_cutoff_avg_mfe_r"],
+            )
+        if reject_counts["min_cutoff_target_fit_ratio"] > 0:
+            logging.info(
+                "[WATCHLIST_FILTERS] date=%s reject_min_cutoff_target_fit_ratio=%s",
+                tgt,
+                reject_counts["min_cutoff_target_fit_ratio"],
             )
         if reject_counts["max_loser_no_progress_share"] > 0:
             logging.info(
@@ -2878,6 +2907,7 @@ def build_watchlist(
             "maxStopRate": max_stop_rate,
             "maxCutoffRate": max_cutoff_rate,
             "min_cutoff_avg_mfe_r": min_cutoff_avg_mfe_r,
+            "min_cutoff_target_fit_ratio": min_cutoff_target_fit_ratio,
             "max_loser_no_progress_share": max_loser_no_progress_share,
             "max_stop_no_progress_share": max_stop_no_progress_share,
             "top_k": top_k,
@@ -2938,6 +2968,7 @@ def build_watchlist(
                 "min_worst_month_pnl_pct": min_worst_month_pnl_pct,
                 "maxCutoffRate": max_cutoff_rate,
                 "min_cutoff_avg_mfe_r": min_cutoff_avg_mfe_r,
+                "min_cutoff_target_fit_ratio": min_cutoff_target_fit_ratio,
                 "max_loser_no_progress_share": max_loser_no_progress_share,
                 "max_stop_no_progress_share": max_stop_no_progress_share,
                 "top_k": top_k,
@@ -2983,5 +3014,25 @@ def build_watchlist(
             "symbols": report_rows,
         }
         report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+        overrides_path = report_dir / f"overrides_{tgt}.json"
+        overrides_payload = {
+            "date": tgt,
+            "watchlist_size": len(watchlist),
+            "rows": [
+                {
+                    "symbol": str(row.get("symbol") or ""),
+                    "direction": str(row.get("direction") or ""),
+                    "entry_time_et": str(row.get("entry_time_et") or ""),
+                    "param_overrides": (row.get("param_overrides") or {}),
+                    "param_override_source": str(row.get("param_override_source") or ""),
+                    "auto_tuning_applied": bool(row.get("auto_tuning_applied")),
+                    "auto_tuning_reason": str(row.get("auto_tuning_reason") or ""),
+                    "auto_tuning_score_delta": float(row.get("auto_tuning_score_delta") or 0.0),
+                    "auto_tuning_candidate_count": int(row.get("auto_tuning_candidate_count") or 0),
+                }
+                for row in watchlist
+            ],
+        }
+        overrides_path.write_text(json.dumps(overrides_payload, indent=2), encoding="utf-8")
     # Muted insufficient history spam; keep list in case we want to surface later.
     return watchlist

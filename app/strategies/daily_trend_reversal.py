@@ -135,6 +135,74 @@ def _minutes_needed_for_window(entry_time_et: str, window_minutes: int, session_
     return max(1, entry_minutes + max(1, window_minutes))
 
 
+def resolve_entry_times(params: Dict[str, Any], *, sort_mode: str = "asc") -> List[str]:
+    """Resolve configured entry times with optional automatic minute-window expansion.
+
+    Rules:
+    - If `entry_times_et` is a non-empty list, use it as primary source.
+    - Else, if `entry_times_use_range` is true, expand `[entry_start_et, entry_end_et]`
+      using `entry_times_step_minutes` (inclusive endpoints).
+    - Else, fall back to single `entry_time_et`.
+    """
+    entry_time_et = str(params.get("entry_time_et") or "09:35")
+    entry_times_raw = params.get("entry_times_et")
+
+    entry_times: List[str] = []
+    if isinstance(entry_times_raw, list) and entry_times_raw:
+        entry_times = [str(t) for t in entry_times_raw if t]
+    else:
+        use_range = bool(params.get("entry_times_use_range", False))
+        if use_range:
+            start_et = str(params.get("entry_start_et") or entry_time_et)
+            end_et = str(params.get("entry_end_et") or entry_time_et)
+            try:
+                step_min = int(params.get("entry_times_step_minutes") or 1)
+            except Exception:
+                step_min = 1
+            step_min = max(1, step_min)
+            try:
+                max_count = int(params.get("entry_times_max_count") or 180)
+            except Exception:
+                max_count = 180
+            max_count = max(1, max_count)
+            try:
+                start_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(start_et))
+                end_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(end_et))
+                if end_dt >= start_dt:
+                    cur = start_dt
+                    while cur <= end_dt and len(entry_times) < max_count:
+                        entry_times.append(cur.strftime("%H:%M"))
+                        cur += dt.timedelta(minutes=step_min)
+            except Exception:
+                entry_times = []
+        if not entry_times:
+            entry_times = [entry_time_et]
+
+    # De-duplicate while preserving author-specified order.
+    seen_times: set[str] = set()
+    deduped: List[str] = []
+    for t in entry_times:
+        ts = str(t or "")
+        if not ts or ts in seen_times:
+            continue
+        seen_times.add(ts)
+        deduped.append(ts)
+    entry_times = deduped or [entry_time_et]
+
+    mode = str(sort_mode or "asc").lower().strip()
+    if mode in {"asc", "sorted", "time_asc"}:
+        try:
+            entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t))
+        except Exception:
+            pass
+    elif mode in {"desc", "time_desc", "reverse"}:
+        try:
+            entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t), reverse=True)
+        except Exception:
+            entry_times = list(reversed(entry_times))
+    return entry_times
+
+
 def _signals_cache_key(symbol: str, cfg: Dict) -> Tuple[Any, ...]:
     params = cfg.get("daily_trend_reversal") or {}
     trend_ma_days = int(params.get("trend_ma_days") or 200)
@@ -655,17 +723,10 @@ def build_trade(
     entry_start_et = str(entry_start_raw or entry_time_et)
     entry_end_et = str(entry_end_raw or entry_time_et)
     has_entry_window_limits = entry_start_raw is not None or entry_end_raw is not None
-    entry_times_raw = params.get("entry_times_et")
     if entry_time_override:
         entry_times = [str(entry_time_override)]
-    elif isinstance(entry_times_raw, list) and entry_times_raw:
-        entry_times = [str(t) for t in entry_times_raw if t]
     else:
-        entry_times = [entry_time_et]
-    try:
-        entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t))
-    except Exception:
-        pass
+        entry_times = resolve_entry_times(params, sort_mode="asc")
     atr_period = int(params.get("atr_period") or 14)
     stop_mode = str(params.get("stop_mode") or "atr").lower()
     stop_atr_mult = float(params.get("stop_atr_mult") or 1.0)

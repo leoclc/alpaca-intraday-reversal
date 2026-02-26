@@ -10,7 +10,7 @@ from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intra
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.execution.daily_execution_model import simulate_exit
 from app.market.filters import market_filter_decision
-from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
+from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date, resolve_entry_times
 from app.strategies.types import TradeResult
 from app.utils.time import iter_trading_days, parse_time_hhmm
 from app.watchlist.day_filter import day_filter_decision
@@ -184,35 +184,11 @@ def run_replay(
             logging.info("[REPLAY] date=%s watchlist empty or missing", date_str)
             continue
         params = cfg.get("daily_trend_reversal") or {}
-        entry_times_raw = params.get("entry_times_et")
-        if isinstance(entry_times_raw, list) and entry_times_raw:
-            entry_times = [str(t) for t in entry_times_raw if t]
-        else:
-            entry_times = [str(params.get("entry_time_et") or "09:35")]
         watch_cfg = cfg.get("watchlist") or {}
         entry_time_mode = str(watch_cfg.get("entry_time_mode") or "fixed").lower().strip()
         scan_first_valid_mode = entry_time_mode in {"scan_first_valid", "dynamic_first_valid", "scan"}
         entry_time_sort_mode = str(watch_cfg.get("entry_time_sort_mode") or "asc").lower().strip()
-        if entry_times:
-            seen_times = set()
-            deduped: List[str] = []
-            for t in entry_times:
-                ts = str(t or "")
-                if not ts or ts in seen_times:
-                    continue
-                seen_times.add(ts)
-                deduped.append(ts)
-            entry_times = deduped or [str(params.get("entry_time_et") or "09:35")]
-        if entry_time_sort_mode in {"asc", "sorted", "time_asc"}:
-            try:
-                entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t))
-            except Exception:
-                pass
-        elif entry_time_sort_mode in {"desc", "time_desc", "reverse"}:
-            try:
-                entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t), reverse=True)
-            except Exception:
-                entry_times = list(reversed(entry_times))
+        entry_times = resolve_entry_times(params, sort_mode=entry_time_sort_mode)
         for symbol in symbols:
             signal = generate_signal_for_date(symbol, date_str, cfg, data_store)
             if not signal:

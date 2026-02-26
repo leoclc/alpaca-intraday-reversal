@@ -8,6 +8,7 @@ from app.config.loader import load_config
 from app.brokers.alpaca import AlpacaBroker
 from app.live.minute_report import log_account_summary, log_minute_report
 from app.live.runner import enforce_time_stop, run_flatten, run_live
+from app.strategies.daily_trend_reversal import resolve_entry_times
 from app.utils.time import ensure_et, et_now, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
 from app.watchlist.storage import read_watchlist, expected_watchlist_date_str
@@ -25,28 +26,8 @@ def _sleep_until(target: dt.datetime) -> None:
 def _ordered_entry_time_strs(cfg: dict) -> list[str]:
     params = cfg.get("daily_trend_reversal") or {}
     watch_cfg = cfg.get("watchlist") or {}
-    entry_time_str = str(params.get("entry_time_et") or params.get("entry_start_et") or "09:35")
-    entry_times_raw = params.get("entry_times_et")
-    if isinstance(entry_times_raw, list) and entry_times_raw:
-        entry_time_strs = [str(t) for t in entry_times_raw if t]
-    else:
-        entry_time_strs = [entry_time_str]
-    # De-duplicate while preserving config order.
-    seen = set()
-    deduped: list[str] = []
-    for t in entry_time_strs:
-        ts = str(t or "")
-        if not ts or ts in seen:
-            continue
-        seen.add(ts)
-        deduped.append(ts)
-    entry_time_strs = deduped or [entry_time_str]
     sort_mode = str(watch_cfg.get("entry_time_sort_mode") or "asc").lower().strip()
-    if sort_mode in {"asc", "sorted", "time_asc"}:
-        entry_time_strs = sorted(entry_time_strs, key=lambda t: parse_time_hhmm(t))
-    elif sort_mode in {"desc", "time_desc", "reverse"}:
-        entry_time_strs = sorted(entry_time_strs, key=lambda t: parse_time_hhmm(t), reverse=True)
-    return entry_time_strs
+    return resolve_entry_times(params, sort_mode=sort_mode)
 
 
 def _schedule_for_day(cfg: dict, day: dt.date) -> tuple[dt.datetime, list[dt.datetime], dt.datetime]:
