@@ -5,9 +5,10 @@ import json
 import logging
 import csv
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 from app.config.loader import load_config
+from app.data.alpaca_quote_store import resolve_quote_for_timestamp
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.market.filters import market_filter_decision
 from app.portfolio.sizing import compute_qty_with_guards
@@ -15,6 +16,40 @@ from app.replay.daily_strategy_replay import run_replay
 from app.utils.time import ensure_et, iter_trading_days, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
 from app.watchlist.node_assets import read_asset_universe_snapshot, resolve_asset_universe_symbols
+
+_FILL_MODEL_LOGGED = False
+_FILL_MODEL_DEBUG_LOGS = 0
+_QUOTE_MODEL_LOGGED = False
+_QUOTE_MODEL_DEBUG_LOGS = 0
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _adverse_fill_price(price: float, *, side: str, bps: float) -> float:
+    px = _safe_float(price, default=0.0)
+    if px <= 0:
+        return px
+    bps_eff = max(0.0, _safe_float(bps, default=0.0))
+    if bps_eff <= 0:
+        return px
+    mult = 1.0 + (bps_eff / 10000.0) if str(side).lower() == "buy" else 1.0 - (bps_eff / 10000.0)
+    return max(0.0001, px * mult)
 
 
 def _summarize(trades) -> Dict[str, float]:
@@ -114,9 +149,70 @@ def _apply_portfolio_sizing(
     params = cfg.get("daily_trend_reversal") or {}
     intraday_only = bool(params.get("intraday_only", False))
     session_close_et = str(params.get("session_close_et") or "16:00")
+    fill_model_enabled = bool(params.get("backtest_fill_model_enabled", False))
+    fill_half_spread_bps = max(0.0, _safe_float(params.get("backtest_half_spread_bps"), default=0.0))
+    fill_entry_slippage_bps = max(0.0, _safe_float(params.get("backtest_entry_slippage_bps"), default=0.0))
+    fill_stop_slippage_bps = max(0.0, _safe_float(params.get("backtest_stop_slippage_bps"), default=0.0))
+    fill_target_slippage_bps = max(0.0, _safe_float(params.get("backtest_target_slippage_bps"), default=0.0))
+    fill_time_slippage_bps = max(0.0, _safe_float(params.get("backtest_time_slippage_bps"), default=0.0))
+    fill_debug = bool(params.get("backtest_fill_debug", False))
+    fill_debug_max_logs = max(0, _safe_int(params.get("backtest_fill_debug_max_logs"), default=40))
+    quote_fill_enabled = bool(params.get("backtest_quote_fill_enabled", False))
+    quote_lookback_seconds = max(1, _safe_int(params.get("backtest_quote_lookback_seconds"), default=120))
+    quote_forward_seconds = max(0, _safe_int(params.get("backtest_quote_forward_seconds"), default=10))
+    quote_max_age_seconds = max(1, _safe_int(params.get("backtest_quote_max_age_seconds"), default=300))
+    quote_fallback_to_bps = bool(params.get("backtest_quote_fallback_to_bps", True))
+    quote_target_limit_protect = bool(params.get("backtest_quote_target_limit_protect", True))
+    quote_require_both_sides = bool(params.get("backtest_quote_require_both_sides", True))
+    quote_max_spread_bps = max(0.0, _safe_float(params.get("backtest_quote_max_spread_bps"), default=80.0))
+    quote_max_deviation_bps = max(0.0, _safe_float(params.get("backtest_quote_max_deviation_bps"), default=120.0))
+    quote_max_spread_bps_stop = max(
+        quote_max_spread_bps,
+        _safe_float(params.get("backtest_quote_max_spread_bps_stop"), default=quote_max_spread_bps),
+    )
+    quote_max_deviation_bps_stop = max(
+        quote_max_deviation_bps,
+        _safe_float(params.get("backtest_quote_max_deviation_bps_stop"), default=quote_max_deviation_bps),
+    )
+    quote_debug = bool(params.get("backtest_quote_debug", False))
+    quote_debug_max_logs = max(0, _safe_int(params.get("backtest_quote_debug_max_logs"), default=40))
     used_notional = 0.0
     accepted: List = []
     sized_records: List[Dict] = []
+
+    if fill_model_enabled:
+        global _FILL_MODEL_LOGGED
+        if not _FILL_MODEL_LOGGED:
+            logging.info(
+                "[BACKTEST_FILL] enabled=1 half_spread_bps=%.3f entry_slip_bps=%.3f stop_slip_bps=%.3f target_slip_bps=%.3f time_slip_bps=%.3f debug=%s max_debug_logs=%s",
+                fill_half_spread_bps,
+                fill_entry_slippage_bps,
+                fill_stop_slippage_bps,
+                fill_target_slippage_bps,
+                fill_time_slippage_bps,
+                fill_debug,
+                fill_debug_max_logs,
+            )
+            _FILL_MODEL_LOGGED = True
+    if quote_fill_enabled:
+        global _QUOTE_MODEL_LOGGED
+        if not _QUOTE_MODEL_LOGGED:
+            logging.info(
+                "[BACKTEST_QUOTE_FILL] enabled=1 lookback_s=%s forward_s=%s max_age_s=%s require_both_sides=%s max_spread_bps=%.2f max_deviation_bps=%.2f max_spread_bps_stop=%.2f max_deviation_bps_stop=%.2f fallback_to_bps=%s target_limit_protect=%s debug=%s max_debug_logs=%s",
+                quote_lookback_seconds,
+                quote_forward_seconds,
+                quote_max_age_seconds,
+                quote_require_both_sides,
+                quote_max_spread_bps,
+                quote_max_deviation_bps,
+                quote_max_spread_bps_stop,
+                quote_max_deviation_bps_stop,
+                quote_fallback_to_bps,
+                quote_target_limit_protect,
+                quote_debug,
+                quote_debug_max_logs,
+            )
+            _QUOTE_MODEL_LOGGED = True
 
     def _parse_ts_iso(val: object) -> Optional[dt.datetime]:
         if val is None:
@@ -149,14 +245,441 @@ def _apply_portfolio_sizing(
         except Exception:
             return entry_dt_obj
 
-    def _build_sized_record(trade_obj, plan_obj, qty: int, state: Dict, pnl_total: float, notional: float, capacity_notional: float) -> Dict:
+    def _entry_side(direction: str) -> str:
+        return "buy" if str(direction).lower() == "long" else "sell"
+
+    def _exit_side(direction: str) -> str:
+        return "sell" if str(direction).lower() == "long" else "buy"
+
+    def _exit_slippage_bps(exit_reason: str) -> Tuple[float, str]:
+        reason = str(exit_reason or "").lower()
+        if reason == "stop":
+            return fill_stop_slippage_bps, "stop"
+        if reason == "target":
+            return fill_target_slippage_bps, "target"
+        return fill_time_slippage_bps, "time"
+
+    def _side_price_bps(raw_price: float, fill_price: float, side: str) -> float:
+        raw_px = _safe_float(raw_price, default=0.0)
+        fill_px = _safe_float(fill_price, default=0.0)
+        if raw_px <= 0 or fill_px <= 0:
+            return 0.0
+        if str(side).lower() == "buy":
+            return ((fill_px / raw_px) - 1.0) * 10000.0
+        return ((raw_px - fill_px) / raw_px) * 10000.0
+
+    def _resolve_quote_leg(
+        symbol: str,
+        target_ts: Optional[dt.datetime],
+        side: str,
+        raw_reference_price: float,
+        *,
+        max_spread_bps: float,
+        max_deviation_bps: float,
+    ) -> Dict[str, Any]:
+        if not quote_fill_enabled:
+            return {"ok": False, "reason": "quote_disabled"}
+        if target_ts is None:
+            return {"ok": False, "reason": "missing_ts"}
+        quote = resolve_quote_for_timestamp(
+            symbol,
+            target_ts,
+            cfg,
+            lookback_seconds=quote_lookback_seconds,
+            forward_seconds=quote_forward_seconds,
+            allow_fetch=True,
+        )
+        if not quote:
+            return {"ok": False, "reason": "no_quote"}
+        quote_ts = _parse_ts_iso(quote.get("timestamp"))
+        if quote_ts is None:
+            return {"ok": False, "reason": "bad_quote_ts"}
+        age_seconds = abs((quote_ts - ensure_et(target_ts)).total_seconds())
+        if age_seconds > float(quote_max_age_seconds):
+            return {
+                "ok": False,
+                "reason": "quote_too_old",
+                "quote_ts": quote.get("timestamp"),
+                "age_seconds": age_seconds,
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "selection": quote.get("selected"),
+            }
+        bid = quote.get("bid")
+        ask = quote.get("ask")
+        bid = None if bid is None else _safe_float(bid, default=0.0)
+        ask = None if ask is None else _safe_float(ask, default=0.0)
+        if quote_require_both_sides and ((bid is None or bid <= 0) or (ask is None or ask <= 0)):
+            return {
+                "ok": False,
+                "reason": "missing_bid_or_ask",
+                "quote_ts": quote.get("timestamp"),
+                "bid": bid,
+                "ask": ask,
+                "selection": quote.get("selected"),
+            }
+        spread_bps = None
+        if bid is not None and bid > 0 and ask is not None and ask > 0:
+            if ask < bid:
+                return {
+                    "ok": False,
+                    "reason": "crossed_quote",
+                    "quote_ts": quote.get("timestamp"),
+                    "bid": bid,
+                    "ask": ask,
+                    "selection": quote.get("selected"),
+                }
+            mid = (bid + ask) / 2.0
+            spread_bps = ((ask - bid) / mid) * 10000.0 if mid > 0 else None
+            if spread_bps is not None and spread_bps > float(max_spread_bps):
+                return {
+                    "ok": False,
+                    "reason": "spread_too_wide",
+                    "quote_ts": quote.get("timestamp"),
+                    "bid": bid,
+                    "ask": ask,
+                    "spread_bps": spread_bps,
+                    "selection": quote.get("selected"),
+                }
+        px = None
+        px_src = None
+        side_l = str(side).lower()
+        if side_l == "buy":
+            if ask is not None and ask > 0:
+                px = ask
+                px_src = "ask"
+            elif bid is not None and bid > 0:
+                px = bid
+                px_src = "bid_fallback"
+        else:
+            if bid is not None and bid > 0:
+                px = bid
+                px_src = "bid"
+            elif ask is not None and ask > 0:
+                px = ask
+                px_src = "ask_fallback"
+        if px is None or px <= 0:
+            return {
+                "ok": False,
+                "reason": "no_side_price",
+                "quote_ts": quote.get("timestamp"),
+                "bid": bid,
+                "ask": ask,
+                "spread_bps": spread_bps,
+                "selection": quote.get("selected"),
+            }
+        raw_ref = _safe_float(raw_reference_price, default=0.0)
+        deviation_bps = (abs(px - raw_ref) / raw_ref * 10000.0) if raw_ref > 0 else None
+        if deviation_bps is not None and deviation_bps > float(max_deviation_bps):
+            return {
+                "ok": False,
+                "reason": "deviation_too_large",
+                "quote_ts": quote.get("timestamp"),
+                "bid": bid,
+                "ask": ask,
+                "spread_bps": spread_bps,
+                "deviation_bps": deviation_bps,
+                "selection": quote.get("selected"),
+            }
+        return {
+            "ok": True,
+            "price": px,
+            "price_source": px_src,
+            "quote_ts": quote.get("timestamp"),
+            "selection": quote.get("selected"),
+            "age_seconds": age_seconds,
+            "spread_bps": spread_bps,
+            "deviation_bps": deviation_bps,
+            "bid": bid,
+            "ask": ask,
+        }
+
+    def _target_limit_bound(direction: str, exit_reason: str, exit_price: float, target_price: float) -> Tuple[float, bool]:
+        if (not quote_target_limit_protect) or str(exit_reason or "").lower() != "target":
+            return exit_price, False
+        d = str(direction or "").lower()
+        px = _safe_float(exit_price, default=0.0)
+        tgt = _safe_float(target_price, default=0.0)
+        if px <= 0 or tgt <= 0:
+            return exit_price, False
+        if d == "long":
+            bounded = max(px, tgt)
+        else:
+            bounded = min(px, tgt)
+        return bounded, (abs(bounded - px) > 1e-12)
+
+    def _compute_fill_meta(trade_obj, plan_obj, qty: int) -> Dict[str, Any]:
+        raw_entry = _safe_float(getattr(plan_obj, "entry_price", None), default=0.0)
+        raw_exit = _safe_float(getattr(trade_obj, "exit_price", None), default=0.0)
+        direction = str(getattr(plan_obj, "direction", "long")).lower()
+        direction_mult = 1.0 if direction == "long" else -1.0
+        stop_distance = max(0.0, _safe_float(getattr(plan_obj, "stop_distance", None), default=0.0))
+
+        entry_side = _entry_side(direction)
+        exit_side = _exit_side(direction)
+        exit_slip_bps, exit_bucket = _exit_slippage_bps(str(getattr(trade_obj, "exit_reason", "") or ""))
+        entry_bps_model = fill_half_spread_bps + fill_entry_slippage_bps
+        exit_bps_model = fill_half_spread_bps + exit_slip_bps
+        use_bps_base = bool(fill_model_enabled or (quote_fill_enabled and quote_fallback_to_bps))
+        entry_bps = entry_bps_model if use_bps_base else 0.0
+        exit_bps = exit_bps_model if use_bps_base else 0.0
+        entry_fill = _adverse_fill_price(raw_entry, side=entry_side, bps=entry_bps) if use_bps_base else raw_entry
+        exit_fill = _adverse_fill_price(raw_exit, side=exit_side, bps=exit_bps) if use_bps_base else raw_exit
+        entry_fill_mode = "bps" if use_bps_base else "raw"
+        exit_fill_mode = "bps" if use_bps_base else "raw"
+        entry_quote_meta: Dict[str, Any] = {"ok": False, "reason": "quote_disabled"}
+        exit_quote_meta: Dict[str, Any] = {"ok": False, "reason": "quote_disabled"}
+        entry_ts = _entry_dt(plan_obj)
+        exit_ts = _parse_ts_iso(getattr(trade_obj, "exit_ts", None))
+        if exit_ts is None and entry_ts is not None:
+            exit_ts = _fallback_exit_dt(trade_obj, entry_ts)
+
+        if quote_fill_enabled:
+            entry_quote_meta = _resolve_quote_leg(
+                str(getattr(plan_obj, "symbol", "") or ""),
+                entry_ts,
+                entry_side,
+                raw_entry,
+                max_spread_bps=quote_max_spread_bps,
+                max_deviation_bps=quote_max_deviation_bps,
+            )
+            exit_reason_l = str(getattr(trade_obj, "exit_reason", "") or "").lower()
+            exit_spread_cap = quote_max_spread_bps_stop if exit_reason_l == "stop" else quote_max_spread_bps
+            exit_dev_cap = quote_max_deviation_bps_stop if exit_reason_l == "stop" else quote_max_deviation_bps
+            exit_quote_meta = _resolve_quote_leg(
+                str(getattr(plan_obj, "symbol", "") or ""),
+                exit_ts,
+                exit_side,
+                raw_exit,
+                max_spread_bps=exit_spread_cap,
+                max_deviation_bps=exit_dev_cap,
+            )
+            if bool(entry_quote_meta.get("ok")):
+                entry_fill = _safe_float(entry_quote_meta.get("price"), default=entry_fill)
+                entry_fill_mode = "quote"
+            elif not quote_fallback_to_bps:
+                entry_fill = raw_entry
+                entry_fill_mode = "raw_quote_missing"
+            if bool(exit_quote_meta.get("ok")):
+                exit_fill = _safe_float(exit_quote_meta.get("price"), default=exit_fill)
+                exit_fill_mode = "quote"
+            elif not quote_fallback_to_bps:
+                exit_fill = raw_exit
+                exit_fill_mode = "raw_quote_missing"
+            exit_fill, target_limit_bound_applied = _target_limit_bound(
+                direction,
+                str(getattr(trade_obj, "exit_reason", "") or ""),
+                exit_fill,
+                _safe_float(getattr(plan_obj, "target_price", None), default=0.0),
+            )
+        else:
+            target_limit_bound_applied = False
+            exit_spread_cap = quote_max_spread_bps
+            exit_dev_cap = quote_max_deviation_bps
+        raw_pnl_per_share = (raw_exit - raw_entry) * direction_mult
+        fill_pnl_per_share = (exit_fill - entry_fill) * direction_mult
+        raw_pnl_pct = (raw_pnl_per_share / raw_entry * 100.0) if raw_entry > 0 else 0.0
+        fill_pnl_pct = (fill_pnl_per_share / entry_fill * 100.0) if entry_fill > 0 else 0.0
+        raw_r = (raw_pnl_per_share / stop_distance) if stop_distance > 0 else 0.0
+        fill_r = (fill_pnl_per_share / stop_distance) if stop_distance > 0 else 0.0
+        fill_cost_per_share = raw_pnl_per_share - fill_pnl_per_share
+        fill_cost_total = fill_cost_per_share * max(0, int(qty))
+        stop_price = _safe_float(getattr(plan_obj, "stop_price", None), default=0.0)
+        stop_distance_fill = abs(entry_fill - stop_price) if stop_price > 0 else None
+        fill_entry_bps_eff = _side_price_bps(raw_entry, entry_fill, entry_side)
+        fill_exit_bps_eff = _side_price_bps(raw_exit, exit_fill, exit_side)
+
+        return {
+            "fill_model_enabled": fill_model_enabled,
+            "quote_fill_enabled": quote_fill_enabled,
+            "quote_fallback_to_bps": quote_fallback_to_bps,
+            "entry_fill_mode": entry_fill_mode,
+            "exit_fill_mode": exit_fill_mode,
+            "entry_quote_ok": bool(entry_quote_meta.get("ok")),
+            "exit_quote_ok": bool(exit_quote_meta.get("ok")),
+            "entry_quote_spread_cap_bps": quote_max_spread_bps if quote_fill_enabled else None,
+            "entry_quote_deviation_cap_bps": quote_max_deviation_bps if quote_fill_enabled else None,
+            "exit_quote_spread_cap_bps": exit_spread_cap if quote_fill_enabled else None,
+            "exit_quote_deviation_cap_bps": exit_dev_cap if quote_fill_enabled else None,
+            "entry_quote_reason": entry_quote_meta.get("reason"),
+            "exit_quote_reason": exit_quote_meta.get("reason"),
+            "entry_quote_ts": entry_quote_meta.get("quote_ts"),
+            "exit_quote_ts": exit_quote_meta.get("quote_ts"),
+            "entry_quote_selection": entry_quote_meta.get("selection"),
+            "exit_quote_selection": exit_quote_meta.get("selection"),
+            "entry_quote_age_seconds": entry_quote_meta.get("age_seconds"),
+            "exit_quote_age_seconds": exit_quote_meta.get("age_seconds"),
+            "entry_quote_spread_bps": entry_quote_meta.get("spread_bps"),
+            "exit_quote_spread_bps": exit_quote_meta.get("spread_bps"),
+            "entry_quote_deviation_bps": entry_quote_meta.get("deviation_bps"),
+            "exit_quote_deviation_bps": exit_quote_meta.get("deviation_bps"),
+            "entry_quote_bid": entry_quote_meta.get("bid"),
+            "entry_quote_ask": entry_quote_meta.get("ask"),
+            "exit_quote_bid": exit_quote_meta.get("bid"),
+            "exit_quote_ask": exit_quote_meta.get("ask"),
+            "entry_quote_price_source": entry_quote_meta.get("price_source"),
+            "exit_quote_price_source": exit_quote_meta.get("price_source"),
+            "target_limit_bound_applied": target_limit_bound_applied,
+            "entry_side": entry_side,
+            "exit_side": exit_side,
+            "fill_exit_reason_bucket": exit_bucket,
+            "raw_entry_price": raw_entry,
+            "raw_exit_price": raw_exit,
+            "entry_fill_price": entry_fill,
+            "exit_fill_price": exit_fill,
+            "fill_half_spread_bps": fill_half_spread_bps if use_bps_base else 0.0,
+            "fill_entry_slippage_bps": fill_entry_slippage_bps if use_bps_base else 0.0,
+            "fill_exit_slippage_bps": exit_slip_bps if use_bps_base else 0.0,
+            "fill_entry_bps": fill_entry_bps_eff,
+            "fill_exit_bps": fill_exit_bps_eff,
+            "fill_entry_bps_model": entry_bps_model if use_bps_base else 0.0,
+            "fill_exit_bps_model": exit_bps_model if use_bps_base else 0.0,
+            "raw_pnl_per_share": raw_pnl_per_share,
+            "pnl_per_share": fill_pnl_per_share,
+            "raw_pnl_pct": raw_pnl_pct,
+            "pnl_pct": fill_pnl_pct,
+            "raw_r_multiple": raw_r,
+            "r_multiple": fill_r,
+            "fill_cost_per_share": fill_cost_per_share,
+            "fill_cost_total": fill_cost_total,
+            "stop_distance_fill": stop_distance_fill,
+        }
+
+    def _apply_fill_to_trade(trade_obj, meta: Dict[str, Any]) -> None:
+        trade_obj.raw_exit_price = meta.get("raw_exit_price")
+        trade_obj.raw_pnl_pct = meta.get("raw_pnl_pct")
+        trade_obj.raw_r_multiple = meta.get("raw_r_multiple")
+        trade_obj.entry_fill_price = meta.get("entry_fill_price")
+        trade_obj.exit_fill_price = meta.get("exit_fill_price")
+        trade_obj.entry_fill_mode = meta.get("entry_fill_mode")
+        trade_obj.exit_fill_mode = meta.get("exit_fill_mode")
+        trade_obj.quote_fill_enabled = bool(meta.get("quote_fill_enabled"))
+        trade_obj.entry_quote_ok = bool(meta.get("entry_quote_ok"))
+        trade_obj.exit_quote_ok = bool(meta.get("exit_quote_ok"))
+        trade_obj.entry_quote_spread_cap_bps = meta.get("entry_quote_spread_cap_bps")
+        trade_obj.entry_quote_deviation_cap_bps = meta.get("entry_quote_deviation_cap_bps")
+        trade_obj.exit_quote_spread_cap_bps = meta.get("exit_quote_spread_cap_bps")
+        trade_obj.exit_quote_deviation_cap_bps = meta.get("exit_quote_deviation_cap_bps")
+        trade_obj.entry_quote_reason = meta.get("entry_quote_reason")
+        trade_obj.exit_quote_reason = meta.get("exit_quote_reason")
+        trade_obj.entry_quote_ts = meta.get("entry_quote_ts")
+        trade_obj.exit_quote_ts = meta.get("exit_quote_ts")
+        trade_obj.entry_quote_selection = meta.get("entry_quote_selection")
+        trade_obj.exit_quote_selection = meta.get("exit_quote_selection")
+        trade_obj.entry_quote_age_seconds = meta.get("entry_quote_age_seconds")
+        trade_obj.exit_quote_age_seconds = meta.get("exit_quote_age_seconds")
+        trade_obj.entry_quote_spread_bps = meta.get("entry_quote_spread_bps")
+        trade_obj.exit_quote_spread_bps = meta.get("exit_quote_spread_bps")
+        trade_obj.entry_quote_deviation_bps = meta.get("entry_quote_deviation_bps")
+        trade_obj.exit_quote_deviation_bps = meta.get("exit_quote_deviation_bps")
+        trade_obj.entry_quote_bid = meta.get("entry_quote_bid")
+        trade_obj.entry_quote_ask = meta.get("entry_quote_ask")
+        trade_obj.exit_quote_bid = meta.get("exit_quote_bid")
+        trade_obj.exit_quote_ask = meta.get("exit_quote_ask")
+        trade_obj.entry_quote_price_source = meta.get("entry_quote_price_source")
+        trade_obj.exit_quote_price_source = meta.get("exit_quote_price_source")
+        trade_obj.target_limit_bound_applied = bool(meta.get("target_limit_bound_applied"))
+        trade_obj.fill_entry_bps = meta.get("fill_entry_bps")
+        trade_obj.fill_exit_bps = meta.get("fill_exit_bps")
+        trade_obj.fill_entry_bps_model = meta.get("fill_entry_bps_model")
+        trade_obj.fill_exit_bps_model = meta.get("fill_exit_bps_model")
+        trade_obj.fill_half_spread_bps = meta.get("fill_half_spread_bps")
+        trade_obj.fill_entry_slippage_bps = meta.get("fill_entry_slippage_bps")
+        trade_obj.fill_exit_slippage_bps = meta.get("fill_exit_slippage_bps")
+        trade_obj.fill_cost_per_share = meta.get("fill_cost_per_share")
+        trade_obj.fill_cost_total = meta.get("fill_cost_total")
+        trade_obj.stop_distance_fill = meta.get("stop_distance_fill")
+        trade_obj.fill_model_enabled = bool(meta.get("fill_model_enabled"))
+        trade_obj.fill_exit_reason_bucket = meta.get("fill_exit_reason_bucket")
+        trade_obj.exit_price = _safe_float(meta.get("exit_fill_price"), default=_safe_float(trade_obj.exit_price, default=0.0))
+        trade_obj.pnl_pct = _safe_float(meta.get("pnl_pct"), default=_safe_float(trade_obj.pnl_pct, default=0.0))
+        trade_obj.r_multiple = _safe_float(meta.get("r_multiple"), default=_safe_float(trade_obj.r_multiple, default=0.0))
+
+    def _log_fill_debug(plan_obj, trade_obj, qty: int, meta: Dict[str, Any]) -> None:
+        if not (fill_model_enabled and fill_debug):
+            return
+        global _FILL_MODEL_DEBUG_LOGS
+        if _FILL_MODEL_DEBUG_LOGS >= fill_debug_max_logs:
+            return
+        _FILL_MODEL_DEBUG_LOGS += 1
+        logging.info(
+            "[BACKTEST_FILL_DEBUG] symbol=%s date=%s side=%s reason=%s qty=%s entry_mode=%s exit_mode=%s raw_entry=%.5f fill_entry=%.5f raw_exit=%.5f fill_exit=%.5f raw_r=%.4f fill_r=%.4f cost_ps=%.5f cost_total=%.2f entry_bps=%.2f exit_bps=%.2f model_entry_bps=%.2f model_exit_bps=%.2f",
+            str(getattr(plan_obj, "symbol", "") or ""),
+            str(getattr(plan_obj, "entry_date", "") or ""),
+            str(getattr(plan_obj, "direction", "") or ""),
+            str(getattr(trade_obj, "exit_reason", "") or ""),
+            int(max(0, int(qty))),
+            str(meta.get("entry_fill_mode") or ""),
+            str(meta.get("exit_fill_mode") or ""),
+            _safe_float(meta.get("raw_entry_price"), default=0.0),
+            _safe_float(meta.get("entry_fill_price"), default=0.0),
+            _safe_float(meta.get("raw_exit_price"), default=0.0),
+            _safe_float(meta.get("exit_fill_price"), default=0.0),
+            _safe_float(meta.get("raw_r_multiple"), default=0.0),
+            _safe_float(meta.get("r_multiple"), default=0.0),
+            _safe_float(meta.get("fill_cost_per_share"), default=0.0),
+            _safe_float(meta.get("fill_cost_total"), default=0.0),
+            _safe_float(meta.get("fill_entry_bps"), default=0.0),
+            _safe_float(meta.get("fill_exit_bps"), default=0.0),
+            _safe_float(meta.get("fill_entry_bps_model"), default=0.0),
+            _safe_float(meta.get("fill_exit_bps_model"), default=0.0),
+        )
+
+    def _log_quote_debug(plan_obj, trade_obj, qty: int, meta: Dict[str, Any]) -> None:
+        if not (quote_fill_enabled and quote_debug):
+            return
+        global _QUOTE_MODEL_DEBUG_LOGS
+        if _QUOTE_MODEL_DEBUG_LOGS >= quote_debug_max_logs:
+            return
+        _QUOTE_MODEL_DEBUG_LOGS += 1
+        logging.info(
+            "[BACKTEST_QUOTE_DEBUG] symbol=%s date=%s reason=%s qty=%s entry_ok=%s entry_mode=%s entry_qts=%s entry_sel=%s entry_bid=%.5f entry_ask=%.5f entry_src=%s entry_age=%.2fs entry_spread_bps=%.2f entry_dev_bps=%.2f exit_ok=%s exit_mode=%s exit_qts=%s exit_sel=%s exit_bid=%.5f exit_ask=%.5f exit_src=%s exit_age=%.2fs exit_spread_bps=%.2f exit_dev_bps=%.2f target_limit_bound=%s fallback_to_bps=%s",
+            str(getattr(plan_obj, "symbol", "") or ""),
+            str(getattr(plan_obj, "entry_date", "") or ""),
+            str(getattr(trade_obj, "exit_reason", "") or ""),
+            int(max(0, int(qty))),
+            bool(meta.get("entry_quote_ok")),
+            str(meta.get("entry_fill_mode") or ""),
+            str(meta.get("entry_quote_ts") or ""),
+            str(meta.get("entry_quote_selection") or ""),
+            _safe_float(meta.get("entry_quote_bid"), default=0.0),
+            _safe_float(meta.get("entry_quote_ask"), default=0.0),
+            str(meta.get("entry_quote_price_source") or meta.get("entry_quote_reason") or ""),
+            _safe_float(meta.get("entry_quote_age_seconds"), default=0.0),
+            _safe_float(meta.get("entry_quote_spread_bps"), default=0.0),
+            _safe_float(meta.get("entry_quote_deviation_bps"), default=0.0),
+            bool(meta.get("exit_quote_ok")),
+            str(meta.get("exit_fill_mode") or ""),
+            str(meta.get("exit_quote_ts") or ""),
+            str(meta.get("exit_quote_selection") or ""),
+            _safe_float(meta.get("exit_quote_bid"), default=0.0),
+            _safe_float(meta.get("exit_quote_ask"), default=0.0),
+            str(meta.get("exit_quote_price_source") or meta.get("exit_quote_reason") or ""),
+            _safe_float(meta.get("exit_quote_age_seconds"), default=0.0),
+            _safe_float(meta.get("exit_quote_spread_bps"), default=0.0),
+            _safe_float(meta.get("exit_quote_deviation_bps"), default=0.0),
+            bool(meta.get("target_limit_bound_applied")),
+            quote_fallback_to_bps,
+        )
+
+    def _build_sized_record(
+        trade_obj,
+        plan_obj,
+        qty: int,
+        state: Dict,
+        pnl_total: float,
+        notional: float,
+        capacity_notional: float,
+        fill_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict:
+        fill_meta = fill_meta or {}
         wl_stats = (
             getattr(plan_obj, "watchlist_stats", None)
             if isinstance(getattr(plan_obj, "watchlist_stats", None), dict)
             else {}
         )
         quality_state = state.get("quality_sizing") if isinstance(state, dict) else {}
-        return {
+        record = {
             "symbol": plan_obj.symbol,
             "param_overrides": getattr(plan_obj, "param_overrides", None),
             "direction": plan_obj.direction,
@@ -167,6 +690,52 @@ def _apply_portfolio_sizing(
             "stop_price": plan_obj.stop_price,
             "target_price": plan_obj.target_price,
             "stop_distance": plan_obj.stop_distance,
+            "raw_entry_price": fill_meta.get("raw_entry_price", plan_obj.entry_price),
+            "raw_exit_price": fill_meta.get("raw_exit_price", getattr(trade_obj, "exit_price", None)),
+            "entry_fill_price": fill_meta.get("entry_fill_price", plan_obj.entry_price),
+            "exit_fill_price": fill_meta.get("exit_fill_price", getattr(trade_obj, "exit_price", None)),
+            "stop_distance_fill": fill_meta.get("stop_distance_fill"),
+            "fill_model_enabled": bool(fill_meta.get("fill_model_enabled", False)),
+            "quote_fill_enabled": bool(fill_meta.get("quote_fill_enabled", False)),
+            "entry_fill_mode": fill_meta.get("entry_fill_mode"),
+            "exit_fill_mode": fill_meta.get("exit_fill_mode"),
+            "fill_half_spread_bps": fill_meta.get("fill_half_spread_bps", 0.0),
+            "fill_entry_slippage_bps": fill_meta.get("fill_entry_slippage_bps", 0.0),
+            "fill_exit_slippage_bps": fill_meta.get("fill_exit_slippage_bps", 0.0),
+            "fill_entry_bps": fill_meta.get("fill_entry_bps", 0.0),
+            "fill_exit_bps": fill_meta.get("fill_exit_bps", 0.0),
+            "fill_entry_bps_model": fill_meta.get("fill_entry_bps_model", 0.0),
+            "fill_exit_bps_model": fill_meta.get("fill_exit_bps_model", 0.0),
+            "fill_exit_reason_bucket": fill_meta.get("fill_exit_reason_bucket"),
+            "fill_cost_per_share": fill_meta.get("fill_cost_per_share", 0.0),
+            "fill_cost_total": fill_meta.get("fill_cost_total", 0.0),
+            "entry_quote_ok": bool(fill_meta.get("entry_quote_ok", False)),
+            "exit_quote_ok": bool(fill_meta.get("exit_quote_ok", False)),
+            "entry_quote_spread_cap_bps": fill_meta.get("entry_quote_spread_cap_bps"),
+            "entry_quote_deviation_cap_bps": fill_meta.get("entry_quote_deviation_cap_bps"),
+            "exit_quote_spread_cap_bps": fill_meta.get("exit_quote_spread_cap_bps"),
+            "exit_quote_deviation_cap_bps": fill_meta.get("exit_quote_deviation_cap_bps"),
+            "entry_quote_reason": fill_meta.get("entry_quote_reason"),
+            "exit_quote_reason": fill_meta.get("exit_quote_reason"),
+            "entry_quote_ts": fill_meta.get("entry_quote_ts"),
+            "exit_quote_ts": fill_meta.get("exit_quote_ts"),
+            "entry_quote_selection": fill_meta.get("entry_quote_selection"),
+            "exit_quote_selection": fill_meta.get("exit_quote_selection"),
+            "entry_quote_age_seconds": fill_meta.get("entry_quote_age_seconds"),
+            "exit_quote_age_seconds": fill_meta.get("exit_quote_age_seconds"),
+            "entry_quote_spread_bps": fill_meta.get("entry_quote_spread_bps"),
+            "exit_quote_spread_bps": fill_meta.get("exit_quote_spread_bps"),
+            "entry_quote_deviation_bps": fill_meta.get("entry_quote_deviation_bps"),
+            "exit_quote_deviation_bps": fill_meta.get("exit_quote_deviation_bps"),
+            "entry_quote_bid": fill_meta.get("entry_quote_bid"),
+            "entry_quote_ask": fill_meta.get("entry_quote_ask"),
+            "exit_quote_bid": fill_meta.get("exit_quote_bid"),
+            "exit_quote_ask": fill_meta.get("exit_quote_ask"),
+            "entry_quote_price_source": fill_meta.get("entry_quote_price_source"),
+            "exit_quote_price_source": fill_meta.get("exit_quote_price_source"),
+            "target_limit_bound_applied": bool(fill_meta.get("target_limit_bound_applied", False)),
+            "raw_pnl_pct": fill_meta.get("raw_pnl_pct", getattr(trade_obj, "pnl_pct", None)),
+            "raw_r_multiple": fill_meta.get("raw_r_multiple", getattr(trade_obj, "r_multiple", None)),
             "target_mode": getattr(plan_obj, "target_mode", None),
             "target_window_avg_pct": getattr(plan_obj, "target_window_avg_pct", None),
             "target_window_mult": getattr(plan_obj, "target_window_mult", None),
@@ -188,6 +757,7 @@ def _apply_portfolio_sizing(
             "watchlist_profit_factor": wl_stats.get("profit_factor"),
             "watchlist_trades_count": wl_stats.get("trades_count"),
             "watchlist_total_pnl_pct": wl_stats.get("total_pnl_pct"),
+            "watchlist_stats": wl_stats,
             "exit_date": trade_obj.exit_date,
             "exit_price": trade_obj.exit_price,
             "exit_reason": trade_obj.exit_reason,
@@ -214,6 +784,11 @@ def _apply_portfolio_sizing(
             "capacity_notional": capacity_notional,
             "sizing_state": state,
         }
+        for key, value in wl_stats.items():
+            prefixed = f"watchlist_{str(key)}"
+            if prefixed not in record:
+                record[prefixed] = value
+        return record
 
     if not intraday_only:
         # Legacy path for multi-day holds: realized PnL is applied in sequence.
@@ -231,21 +806,33 @@ def _apply_portfolio_sizing(
             )
             if qty <= 0:
                 continue
-            direction_mult = 1.0 if plan.direction == "long" else -1.0
-            pnl_per_share = (float(trade.exit_price) - plan.entry_price) * direction_mult
-            pnl_total = pnl_per_share * qty
+            fill_meta = _compute_fill_meta(trade, plan, qty)
+            _apply_fill_to_trade(trade, fill_meta)
+            pnl_total = _safe_float(fill_meta.get("pnl_per_share"), default=0.0) * qty
             equity_before = equity
             equity = equity + pnl_total
-            notional = plan.entry_price * qty
+            entry_fill_price = _safe_float(fill_meta.get("entry_fill_price"), default=_safe_float(plan.entry_price, default=0.0))
+            notional = entry_fill_price * qty
             capacity_qty = int((state or {}).get("capacity_qty") or qty)
-            capacity_notional = plan.entry_price * capacity_qty
+            capacity_notional = entry_fill_price * capacity_qty
             used_notional += capacity_notional
             open_positions += 1
             accepted.append(trade)
-            rec = _build_sized_record(trade, plan, qty, state, pnl_total, notional, capacity_notional)
+            rec = _build_sized_record(
+                trade,
+                plan,
+                qty,
+                state,
+                pnl_total,
+                notional,
+                capacity_notional,
+                fill_meta=fill_meta,
+            )
             rec["equity_before"] = equity_before
             rec["equity_after"] = equity
             sized_records.append(rec)
+            _log_fill_debug(plan, trade, qty, fill_meta)
+            _log_quote_debug(plan, trade, qty, fill_meta)
         return accepted, sized_records, equity
 
     work: List[Dict] = []
@@ -304,17 +891,29 @@ def _apply_portfolio_sizing(
         )
         if qty <= 0:
             continue
-        direction_mult = 1.0 if plan.direction == "long" else -1.0
-        pnl_per_share = (float(trade.exit_price) - plan.entry_price) * direction_mult
-        pnl_total = pnl_per_share * qty
-        notional = plan.entry_price * qty
+        fill_meta = _compute_fill_meta(trade, plan, qty)
+        _apply_fill_to_trade(trade, fill_meta)
+        pnl_total = _safe_float(fill_meta.get("pnl_per_share"), default=0.0) * qty
+        entry_fill_price = _safe_float(fill_meta.get("entry_fill_price"), default=_safe_float(plan.entry_price, default=0.0))
+        notional = entry_fill_price * qty
         capacity_qty = int((state or {}).get("capacity_qty") or qty)
-        capacity_notional = plan.entry_price * capacity_qty
+        capacity_notional = entry_fill_price * capacity_qty
         used_notional += capacity_notional
 
         accepted.append(trade)
-        rec = _build_sized_record(trade, plan, qty, state, pnl_total, notional, capacity_notional)
+        rec = _build_sized_record(
+            trade,
+            plan,
+            qty,
+            state,
+            pnl_total,
+            notional,
+            capacity_notional,
+            fill_meta=fill_meta,
+        )
         sized_records.append(rec)
+        _log_fill_debug(plan, trade, qty, fill_meta)
+        _log_quote_debug(plan, trade, qty, fill_meta)
         open_positions_state.append(
             {
                 "exit_dt": row["exit_dt"],
@@ -339,6 +938,11 @@ def run_backtest(
     run_id: Optional[str] = None,
 ) -> Tuple[Dict[str, float], List]:
     cfg = cfg or load_config()
+    global _FILL_MODEL_LOGGED, _FILL_MODEL_DEBUG_LOGS, _QUOTE_MODEL_LOGGED, _QUOTE_MODEL_DEBUG_LOGS
+    _FILL_MODEL_LOGGED = False
+    _FILL_MODEL_DEBUG_LOGS = 0
+    _QUOTE_MODEL_LOGGED = False
+    _QUOTE_MODEL_DEBUG_LOGS = 0
     rep = cfg.get("replay") or {}
     start = start_date or rep.get("start_date")
     end = end_date or rep.get("end_date") or start
@@ -700,9 +1304,55 @@ def run_backtest(
                     "plan": plan_dict,
                     "exit_date": t.exit_date,
                     "exit_price": t.exit_price,
+                    "raw_entry_price": plan.entry_price if plan is not None else None,
+                    "raw_exit_price": getattr(t, "raw_exit_price", None),
+                    "entry_fill_price": getattr(t, "entry_fill_price", None),
+                    "exit_fill_price": getattr(t, "exit_fill_price", None),
                     "exit_reason": t.exit_reason,
                     "pnl_pct": t.pnl_pct,
+                    "raw_pnl_pct": getattr(t, "raw_pnl_pct", None),
                     "r_multiple": t.r_multiple,
+                    "raw_r_multiple": getattr(t, "raw_r_multiple", None),
+                    "fill_model_enabled": getattr(t, "fill_model_enabled", None),
+                    "quote_fill_enabled": getattr(t, "quote_fill_enabled", None),
+                    "entry_fill_mode": getattr(t, "entry_fill_mode", None),
+                    "exit_fill_mode": getattr(t, "exit_fill_mode", None),
+                    "entry_quote_ok": getattr(t, "entry_quote_ok", None),
+                    "exit_quote_ok": getattr(t, "exit_quote_ok", None),
+                    "entry_quote_spread_cap_bps": getattr(t, "entry_quote_spread_cap_bps", None),
+                    "entry_quote_deviation_cap_bps": getattr(t, "entry_quote_deviation_cap_bps", None),
+                    "exit_quote_spread_cap_bps": getattr(t, "exit_quote_spread_cap_bps", None),
+                    "exit_quote_deviation_cap_bps": getattr(t, "exit_quote_deviation_cap_bps", None),
+                    "entry_quote_reason": getattr(t, "entry_quote_reason", None),
+                    "exit_quote_reason": getattr(t, "exit_quote_reason", None),
+                    "entry_quote_ts": getattr(t, "entry_quote_ts", None),
+                    "exit_quote_ts": getattr(t, "exit_quote_ts", None),
+                    "entry_quote_selection": getattr(t, "entry_quote_selection", None),
+                    "exit_quote_selection": getattr(t, "exit_quote_selection", None),
+                    "entry_quote_age_seconds": getattr(t, "entry_quote_age_seconds", None),
+                    "exit_quote_age_seconds": getattr(t, "exit_quote_age_seconds", None),
+                    "entry_quote_spread_bps": getattr(t, "entry_quote_spread_bps", None),
+                    "exit_quote_spread_bps": getattr(t, "exit_quote_spread_bps", None),
+                    "entry_quote_deviation_bps": getattr(t, "entry_quote_deviation_bps", None),
+                    "exit_quote_deviation_bps": getattr(t, "exit_quote_deviation_bps", None),
+                    "entry_quote_bid": getattr(t, "entry_quote_bid", None),
+                    "entry_quote_ask": getattr(t, "entry_quote_ask", None),
+                    "exit_quote_bid": getattr(t, "exit_quote_bid", None),
+                    "exit_quote_ask": getattr(t, "exit_quote_ask", None),
+                    "entry_quote_price_source": getattr(t, "entry_quote_price_source", None),
+                    "exit_quote_price_source": getattr(t, "exit_quote_price_source", None),
+                    "target_limit_bound_applied": getattr(t, "target_limit_bound_applied", None),
+                    "fill_exit_reason_bucket": getattr(t, "fill_exit_reason_bucket", None),
+                    "fill_entry_bps": getattr(t, "fill_entry_bps", None),
+                    "fill_exit_bps": getattr(t, "fill_exit_bps", None),
+                    "fill_entry_bps_model": getattr(t, "fill_entry_bps_model", None),
+                    "fill_exit_bps_model": getattr(t, "fill_exit_bps_model", None),
+                    "fill_half_spread_bps": getattr(t, "fill_half_spread_bps", None),
+                    "fill_entry_slippage_bps": getattr(t, "fill_entry_slippage_bps", None),
+                    "fill_exit_slippage_bps": getattr(t, "fill_exit_slippage_bps", None),
+                    "fill_cost_per_share": getattr(t, "fill_cost_per_share", None),
+                    "fill_cost_total": getattr(t, "fill_cost_total", None),
+                    "stop_distance_fill": getattr(t, "stop_distance_fill", None),
                     "mfe_pct": getattr(t, "mfe_pct", None),
                     "mae_pct": getattr(t, "mae_pct", None),
                     "mfe_r": getattr(t, "mfe_r", None),

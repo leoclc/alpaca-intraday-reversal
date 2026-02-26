@@ -165,7 +165,10 @@ def simulate_exit(
     entry_idx = _find_bar_index(bars_daily, trade_plan.entry_date)
     if entry_idx is None:
         return None
-    params = cfg.get("daily_trend_reversal") or {}
+    params = dict(cfg.get("daily_trend_reversal") or {})
+    plan_overrides = getattr(trade_plan, "param_overrides", None)
+    if isinstance(plan_overrides, dict) and plan_overrides:
+        params.update(plan_overrides)
     intraday_only = bool(params.get("intraday_only", False))
     time_stop_minutes = int(params.get("time_stop_minutes") or 0)
     require_intraday_exit = bool(params.get("require_intraday_exit", intraday_only or time_stop_minutes > 0))
@@ -308,7 +311,7 @@ def simulate_exit(
         exit_idx = _find_bar_index(bars_daily, trade_plan.time_exit_date)
         if exit_idx is None:
             exit_idx = len(bars_daily) - 1
-    stop_first = bool((cfg.get("daily_trend_reversal") or {}).get("stop_first_when_both", True))
+    stop_first = bool(params.get("stop_first_when_both", True))
     direction = str(trade_plan.direction).lower()
     for i in range(entry_idx, exit_idx + 1):
         bar = bars_daily[i]

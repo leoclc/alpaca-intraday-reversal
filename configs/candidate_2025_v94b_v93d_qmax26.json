@@ -31,7 +31,7 @@
     "min_available_funds_abs": 0.0,
     "min_available_funds_ratio_of_netliq": 0.0,
     "starting_equity": 30000.0,
-    "minute_report_enabled": false,
+    "minute_report_enabled": true,
     "minute_report_interval_sec": 60,
     "minute_report_max_symbols": 20,
     "minute_report_lookback_minutes": 5,
@@ -123,9 +123,7 @@
     "quality_sizing_stop_flip_share_cap": 0.6,
     "quality_sizing_positive_month_rate_floor": 0.45,
     "quality_sizing_positive_month_rate_cap": 0.8,
-    "quality_sizing_reserve_capacity": true,
-    "position_close_report_enabled": true,
-    "position_close_poll_interval_sec": 20
+    "quality_sizing_reserve_capacity": true
   },
   "watchlist": {
     "lookback_days": 252,
@@ -335,7 +333,7 @@
   "daily_bars_cache_dir": "alpaca-ohlc",
   "minute_bars_cache_dir": "cache/ohlc_minute",
   "minute_bars_refresh": false,
-  "watchlists_dir": "watchlists_v94b_qmax26_live",
+  "watchlists_dir": "watchlists_v84t_cap100_m95",
   "logs_dir": "logs",
   "watchlist_report_enabled": true,
   "symbols": [

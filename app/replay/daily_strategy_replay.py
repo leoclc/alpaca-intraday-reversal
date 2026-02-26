@@ -19,6 +19,18 @@ from app.watchlist.storage import read_watchlist
 _DEFAULT_RUN_ID: Optional[str] = None
 
 
+def _watchlist_stats_from_row(row: Dict, rank: int) -> Dict:
+    stats = {"rank": int(rank)}
+    if not isinstance(row, dict):
+        return stats
+    excluded = {"symbol", "direction", "entry_time_et", "param_overrides", "reasons"}
+    for key, value in row.items():
+        if str(key) in excluded:
+            continue
+        stats[str(key)] = value
+    return stats
+
+
 def _add_minutes(time_str: str, minutes: int) -> str:
     if not time_str or minutes <= 0:
         return time_str
@@ -28,6 +40,77 @@ def _add_minutes(time_str: str, minutes: int) -> str:
         return shifted.strftime("%H:%M")
     except Exception:
         return time_str
+
+
+def _merged_symbol_params(cfg: Dict, overrides: Optional[Dict]) -> Dict:
+    params = dict(cfg.get("daily_trend_reversal") or {})
+    if isinstance(overrides, dict) and overrides:
+        params.update(overrides)
+    return params
+
+
+def _intraday_minutes_needed(params: Dict, entry_time_et: str) -> int:
+    intraday_filter_enabled = bool(params.get("intraday_filter_enabled", False))
+    early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
+    max_early_pullback_bps = float(params.get("max_early_pullback_bps") or 0.0)
+    min_early_reversal_bps = float(params.get("min_early_reversal_bps") or 0.0)
+    requires_early_data = (
+        intraday_filter_enabled
+        and early_range_minutes > 0
+        and (max_early_pullback_bps > 0 or min_early_reversal_bps > 0)
+    )
+
+    time_stop_minutes = int(params.get("time_stop_minutes") or 0)
+    intraday_only = bool(params.get("intraday_only", False))
+    confirm_move_bps = float(params.get("confirm_move_bps") or 0.0)
+    confirm_minutes = int(params.get("confirm_minutes") or 0)
+    apply_confirm = confirm_move_bps > 0 and confirm_minutes > 0
+    confirm_pad = confirm_minutes if apply_confirm else 0
+    use_intraday_entry = bool(params.get("use_intraday_entry", False))
+
+    minutes_needed = 0
+    session_open_et = str(params.get("session_open_et") or "09:30")
+    entry_minutes_raw = 0
+    try:
+        open_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_open_et))
+        entry_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(str(entry_time_et or "")))
+        entry_minutes_raw = int((entry_dt - open_dt).total_seconds() / 60)
+        entry_minutes_raw = max(0, entry_minutes_raw)
+    except Exception:
+        entry_minutes_raw = 0
+
+    if requires_early_data:
+        minutes_needed = max(minutes_needed, early_range_minutes)
+    if use_intraday_entry:
+        minutes_needed = max(minutes_needed, max(1, entry_minutes_raw + 1))
+    if apply_confirm:
+        minutes_needed = max(minutes_needed, max(1, entry_minutes_raw + confirm_pad + 1))
+
+    cutoff_minutes = None
+    if time_stop_minutes > 0:
+        cutoff_minutes = entry_minutes_raw + confirm_pad + time_stop_minutes
+    if intraday_only:
+        try:
+            session_close_et = str(params.get("session_close_et") or "16:00")
+            flatten_buffer = int(params.get("flatten_buffer_minutes") or 0)
+            open_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_open_et))
+            close_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_close_et))
+            flatten_dt = close_dt - dt.timedelta(minutes=max(0, flatten_buffer))
+            flatten_minutes = max(1, int((flatten_dt - open_dt).total_seconds() / 60))
+            cutoff_minutes = flatten_minutes if cutoff_minutes is None else min(cutoff_minutes, flatten_minutes)
+        except Exception:
+            pass
+    if cutoff_minutes is not None and cutoff_minutes > 0:
+        minutes_needed = max(minutes_needed, cutoff_minutes + 1)
+    return int(max(0, minutes_needed))
+
+
+def _entry_cutoff_time(params: Dict, entry_time_et: str) -> str:
+    confirm_move_bps = float(params.get("confirm_move_bps") or 0.0)
+    confirm_minutes = int(params.get("confirm_minutes") or 0)
+    if confirm_move_bps > 0 and confirm_minutes > 0:
+        return _add_minutes(entry_time_et, confirm_minutes)
+    return entry_time_et
 
 
 def run_replay(
@@ -83,15 +166,7 @@ def run_replay(
             sym = str((row or {}).get("symbol") or "").upper()
             if not sym:
                 continue
-            symbol_watchlist_stats[sym] = {
-                "rank": idx,
-                "avgR": row.get("avgR"),
-                "avgR_stderr": row.get("avgR_stderr"),
-                "win_rate": row.get("win_rate"),
-                "profit_factor": row.get("profit_factor"),
-                "trades_count": row.get("trades_count"),
-                "total_pnl_pct": row.get("total_pnl_pct"),
-            }
+            symbol_watchlist_stats[sym] = _watchlist_stats_from_row(row, idx)
         symbols = list(symbol_entry_time.keys())
         day_trades = 0
         skip_counts = {
@@ -114,102 +189,118 @@ def run_replay(
             entry_times = [str(t) for t in entry_times_raw if t]
         else:
             entry_times = [str(params.get("entry_time_et") or "09:35")]
-        # Watchlist may include per-symbol entry-time overrides (from the daily builder). Make sure we
-        # fetch enough intraday minutes to cover the latest entry time in the watchlist too.
-        wl_entry_times = [str(t) for t in symbol_entry_time.values() if t]
-        entry_times_for_fetch = sorted({t for t in (entry_times + wl_entry_times) if t})
-        intraday_filter_enabled = bool(params.get("intraday_filter_enabled", False))
-        early_range_minutes = int(params.get("early_range_minutes") or 0) if intraday_filter_enabled else 0
-        time_stop_minutes = int(params.get("time_stop_minutes") or 0)
-        intraday_only = bool(params.get("intraday_only", False))
-        confirm_move_bps = float(params.get("confirm_move_bps") or 0.0)
-        confirm_minutes = int(params.get("confirm_minutes") or 0)
-        apply_confirm = confirm_move_bps > 0 and confirm_minutes > 0
-        minutes_needed = 0
-        if early_range_minutes > 0:
-            minutes_needed = max(minutes_needed, early_range_minutes)
-        use_intraday_entry = bool(params.get("use_intraday_entry", False))
-        max_entry_minutes = 0
-        try:
-            session_open_et = str(params.get("session_open_et") or "09:30")
-            open_time = parse_time_hhmm(session_open_et)
-            # Precompute the flatten cutoff (intraday_only) in "minutes from open".
-            flatten_minutes_from_open = None
-            if intraday_only:
-                try:
-                    session_close_et = str(params.get("session_close_et") or "16:00")
-                    flatten_buffer = int(params.get("flatten_buffer_minutes") or 0)
-                    open_dt = dt.datetime.combine(dt.date.today(), open_time)
-                    close_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_close_et))
-                    flatten_dt = close_dt - dt.timedelta(minutes=max(0, flatten_buffer))
-                    flatten_minutes_from_open = int((flatten_dt - open_dt).total_seconds() / 60)
-                    flatten_minutes_from_open = max(1, flatten_minutes_from_open)
-                except Exception:
-                    flatten_minutes_from_open = None
-
-            confirm_pad = confirm_minutes if apply_confirm else 0
-            for entry_time_et in entry_times_for_fetch:
-                entry_time = parse_time_hhmm(entry_time_et)
-                entry_minutes_raw = int(
-                    (dt.datetime.combine(dt.date.today(), entry_time) - dt.datetime.combine(dt.date.today(), open_time)).total_seconds()
-                    / 60
-                )
-                entry_minutes_raw = max(0, entry_minutes_raw)
-
-                # Ensure we can reference the last completed bar before the entry timestamp.
-                max_entry_minutes = max(max_entry_minutes, max(1, entry_minutes_raw + 1))
-
-                # Confirmation needs bars through (entry + confirm) to evaluate [entry, cutoff).
-                if apply_confirm:
-                    minutes_needed = max(minutes_needed, max(1, entry_minutes_raw + confirm_pad + 1))
-
-                # Exit simulation needs intraday bars through the effective cutoff (time-stop and/or flatten).
-                cutoff_minutes = None
-                if time_stop_minutes > 0:
-                    cutoff_minutes = entry_minutes_raw + confirm_pad + time_stop_minutes
-                if intraday_only and flatten_minutes_from_open is not None:
-                    cutoff_minutes = flatten_minutes_from_open if cutoff_minutes is None else min(cutoff_minutes, flatten_minutes_from_open)
-                if cutoff_minutes is not None and cutoff_minutes > 0:
-                    # +1 to safely include the last completed bar before the cutoff even if the data API treats
-                    # end timestamps as exclusive.
-                    minutes_needed = max(minutes_needed, cutoff_minutes + 1)
-        except Exception:
-            max_entry_minutes = max(max_entry_minutes, 1)
-        if use_intraday_entry:
-            minutes_needed = max(minutes_needed, max_entry_minutes)
+        watch_cfg = cfg.get("watchlist") or {}
+        entry_time_mode = str(watch_cfg.get("entry_time_mode") or "fixed").lower().strip()
+        scan_first_valid_mode = entry_time_mode in {"scan_first_valid", "dynamic_first_valid", "scan"}
+        entry_time_sort_mode = str(watch_cfg.get("entry_time_sort_mode") or "asc").lower().strip()
+        if entry_times:
+            seen_times = set()
+            deduped: List[str] = []
+            for t in entry_times:
+                ts = str(t or "")
+                if not ts or ts in seen_times:
+                    continue
+                seen_times.add(ts)
+                deduped.append(ts)
+            entry_times = deduped or [str(params.get("entry_time_et") or "09:35")]
+        if entry_time_sort_mode in {"asc", "sorted", "time_asc"}:
+            try:
+                entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t))
+            except Exception:
+                pass
+        elif entry_time_sort_mode in {"desc", "time_desc", "reverse"}:
+            try:
+                entry_times = sorted(entry_times, key=lambda t: parse_time_hhmm(t), reverse=True)
+            except Exception:
+                entry_times = list(reversed(entry_times))
         for symbol in symbols:
             signal = generate_signal_for_date(symbol, date_str, cfg, data_store)
             if not signal:
                 skip_counts["no_signal"] += 1
                 continue
+            symbol_override = symbol_overrides.get(symbol) or {}
+            symbol_params = _merged_symbol_params(cfg, symbol_override)
+            entry_time_override = symbol_entry_time.get(symbol) or None
+            scan_times_for_symbol = list(entry_times) if scan_first_valid_mode else []
+            if scan_first_valid_mode and scan_times_for_symbol and entry_time_override:
+                if entry_time_override in scan_times_for_symbol:
+                    scan_times_for_symbol = scan_times_for_symbol[scan_times_for_symbol.index(entry_time_override) :]
+                else:
+                    try:
+                        start_t = parse_time_hhmm(str(entry_time_override))
+                        filtered = [t for t in scan_times_for_symbol if parse_time_hhmm(t) >= start_t]
+                        if filtered:
+                            scan_times_for_symbol = filtered
+                    except Exception:
+                        pass
+            if not scan_times_for_symbol and entry_time_override:
+                scan_times_for_symbol = [entry_time_override]
+            if not scan_times_for_symbol:
+                scan_times_for_symbol = [str(symbol_params.get("entry_time_et") or "09:35")]
+            minutes_needed = 0
+            for t in scan_times_for_symbol:
+                minutes_needed = max(minutes_needed, _intraday_minutes_needed(symbol_params, t))
             bars_intraday = None
             if minutes_needed > 0:
                 bars_intraday = get_intraday_bars(symbol, date_str, minutes_needed, cfg=cfg, allow_fetch=True)
                 if not bars_intraday:
                     skip_counts["no_intraday"] += 1
                     continue
-            entry_time_override = symbol_entry_time.get(symbol) or None
-            entry_time_cutoff = entry_time_override or (entry_times[0] if entry_times else "09:35")
-            if apply_confirm:
-                entry_time_cutoff = _add_minutes(entry_time_cutoff, confirm_minutes)
-            bars_intraday_entry = bars_intraday
-            if bars_intraday and entry_time_cutoff:
-                bars_intraday_entry = filter_intraday_bars_until(
-                    bars_intraday,
-                    date_str,
-                    entry_time_cutoff,
+            plan = None
+            first_missing_intraday_cutoff = False
+            intraday_cutoff_cache: Dict[str, List[Dict]] = {}
+            if scan_first_valid_mode:
+                for scan_time in scan_times_for_symbol:
+                    entry_time_cutoff = _entry_cutoff_time(symbol_params, scan_time)
+                    bars_intraday_entry = bars_intraday
+                    if bars_intraday and entry_time_cutoff:
+                        if entry_time_cutoff not in intraday_cutoff_cache:
+                            intraday_cutoff_cache[entry_time_cutoff] = filter_intraday_bars_until(
+                                bars_intraday,
+                                date_str,
+                                entry_time_cutoff,
+                            )
+                        bars_intraday_entry = intraday_cutoff_cache.get(entry_time_cutoff) or []
+                        if not bars_intraday_entry:
+                            first_missing_intraday_cutoff = True
+                            continue
+                    plan = build_trade(
+                        signal,
+                        cfg,
+                        data_store,
+                        context="replay",
+                        bars_intraday=bars_intraday_entry,
+                        entry_time_override=scan_time,
+                        param_overrides=symbol_override or None,
+                    )
+                    if plan:
+                        break
+            else:
+                entry_time_for_symbol = (
+                    entry_time_override
+                    or (entry_times[0] if entry_times else str(symbol_params.get("entry_time_et") or "09:35"))
                 )
-                if not bars_intraday_entry:
-                    skip_counts["no_intraday_before_cutoff"] += 1
-            plan = build_trade(
-                signal,
-                cfg,
-                data_store,
-                context="replay",
-                bars_intraday=bars_intraday_entry,
-                entry_time_override=entry_time_override,
-                param_overrides=symbol_overrides.get(symbol) or None,
-            )
+                entry_time_cutoff = _entry_cutoff_time(symbol_params, entry_time_for_symbol)
+                bars_intraday_entry = bars_intraday
+                if bars_intraday and entry_time_cutoff:
+                    bars_intraday_entry = filter_intraday_bars_until(
+                        bars_intraday,
+                        date_str,
+                        entry_time_cutoff,
+                    )
+                    if not bars_intraday_entry:
+                        first_missing_intraday_cutoff = True
+                plan = build_trade(
+                    signal,
+                    cfg,
+                    data_store,
+                    context="replay",
+                    bars_intraday=bars_intraday_entry,
+                    entry_time_override=entry_time_override,
+                    param_overrides=symbol_override or None,
+                )
+            if first_missing_intraday_cutoff and plan is None:
+                skip_counts["no_intraday_before_cutoff"] += 1
             if not plan:
                 skip_counts["no_plan"] += 1
                 if debug_limit > 0 and debug_emitted < debug_limit:
@@ -222,7 +313,7 @@ def run_replay(
                         if bars_intraday:
                             first_ts = bars_intraday[0].get("timestamp")
                             last_ts = bars_intraday[-1].get("timestamp")
-                        if bars_intraday_entry:
+                        if locals().get("bars_intraday_entry"):
                             first_ts_entry = bars_intraday_entry[0].get("timestamp")
                             last_ts_entry = bars_intraday_entry[-1].get("timestamp")
                     except Exception:
@@ -231,8 +322,8 @@ def run_replay(
                         "[REPLAY_NO_PLAN] date=%s symbol=%s entry_time_override=%s cutoff=%s intraday_bars=%s intraday_first=%s intraday_last=%s entry_bars=%s entry_first=%s entry_last=%s",
                         date_str,
                         symbol,
-                        entry_time_override,
-                        entry_time_cutoff,
+                        (entry_time_override if not scan_first_valid_mode else "scan_first_valid"),
+                        (entry_time_cutoff if "entry_time_cutoff" in locals() else None),
                         (len(bars_intraday) if bars_intraday else 0),
                         first_ts,
                         last_ts,
@@ -254,72 +345,71 @@ def run_replay(
             pnl_pct = (pnl / plan.entry_price) * 100.0
             r_multiple = pnl / plan.stop_distance
             if details_root is not None:
-                day_details.append(
-                    {
-                        "symbol": symbol,
-                        "param_overrides": getattr(plan, "param_overrides", None),
-                        "signal_date": signal.signal_date,
-                        "direction": signal.direction,
-                        "trend_state": signal.trend_state,
-                        "return_pct": signal.return_pct,
-                        "entry_date": plan.entry_date,
-                        "entry_time_et": plan.entry_time_et,
-                        "entry_price": plan.entry_price,
-                        "entry_price_mode": getattr(plan, "entry_price_mode", None),
-                        "stop_price": plan.stop_price,
-                        "target_price": plan.target_price,
-                        "time_exit_date": plan.time_exit_date,
-                        "stop_distance": plan.stop_distance,
-                        "target_rr": plan.target_rr,
-                        "target_mode": getattr(plan, "target_mode", None),
-                        "target_window_avg_pct": getattr(plan, "target_window_avg_pct", None),
-                        "target_window_mult": getattr(plan, "target_window_mult", None),
-                        "target_window_minutes": getattr(plan, "target_window_minutes", None),
-                        "target_window_samples": getattr(plan, "target_window_samples", None),
-                        "gap_bps": getattr(plan, "gap_bps", None),
-                        "early_pullback_bps": getattr(plan, "early_pullback_bps", None),
-                        "early_reversal_bps": getattr(plan, "early_reversal_bps", None),
-                        "confirm_move_bps": getattr(plan, "confirm_move_bps", None),
-                        "confirm_minutes": getattr(plan, "confirm_minutes", None),
-                        "confirm_hit_bps": getattr(plan, "confirm_hit_bps", None),
-                        "signal_return_pct": getattr(plan, "signal_return_pct", None),
-                        "signal_return_atr": getattr(plan, "signal_return_atr", None),
-                        "atr": getattr(plan, "atr", None),
-                        "watchlist_rank": (plan.watchlist_stats or {}).get("rank") if getattr(plan, "watchlist_stats", None) else None,
-                        "watchlist_avgR": (plan.watchlist_stats or {}).get("avgR") if getattr(plan, "watchlist_stats", None) else None,
-                        "watchlist_avgR_stderr": (plan.watchlist_stats or {}).get("avgR_stderr")
-                        if getattr(plan, "watchlist_stats", None)
-                        else None,
-                        "watchlist_win_rate": (plan.watchlist_stats or {}).get("win_rate")
-                        if getattr(plan, "watchlist_stats", None)
-                        else None,
-                        "watchlist_profit_factor": (plan.watchlist_stats or {}).get("profit_factor")
-                        if getattr(plan, "watchlist_stats", None)
-                        else None,
-                        "watchlist_trades_count": (plan.watchlist_stats or {}).get("trades_count")
-                        if getattr(plan, "watchlist_stats", None)
-                        else None,
-                        "watchlist_total_pnl_pct": (plan.watchlist_stats or {}).get("total_pnl_pct")
-                        if getattr(plan, "watchlist_stats", None)
-                        else None,
-                        "exit_date": str(exit_info["exit_date"]),
-                        "exit_price": float(exit_info["exit_price"]),
-                        "exit_reason": str(exit_info["exit_reason"]),
-                        "exit_ts": exit_info.get("exit_ts"),
-                        "stop_hit_ts": exit_info.get("stop_hit_ts"),
-                        "target_hit_ts": exit_info.get("target_hit_ts"),
-                        "pnl_pct": pnl_pct,
-                        "r_multiple": r_multiple,
-                        "mfe_pct": exit_info.get("mfe_pct"),
-                        "mae_pct": exit_info.get("mae_pct"),
-                        "mfe_r": exit_info.get("mfe_r"),
-                        "mae_r": exit_info.get("mae_r"),
-                        "mfe_r_full": exit_info.get("mfe_r_full"),
-                        "mae_r_full": exit_info.get("mae_r_full"),
-                        "mfe_r_before_stop": exit_info.get("mfe_r_before_stop"),
-                        "mae_r_to_target": exit_info.get("mae_r_to_target"),
-                    }
+                wl_stats = (
+                    plan.watchlist_stats
+                    if isinstance(getattr(plan, "watchlist_stats", None), dict)
+                    else {}
                 )
+                detail = {
+                    "symbol": symbol,
+                    "param_overrides": getattr(plan, "param_overrides", None),
+                    "signal_date": signal.signal_date,
+                    "direction": signal.direction,
+                    "trend_state": signal.trend_state,
+                    "return_pct": signal.return_pct,
+                    "entry_date": plan.entry_date,
+                    "entry_time_et": plan.entry_time_et,
+                    "entry_price": plan.entry_price,
+                    "entry_price_mode": getattr(plan, "entry_price_mode", None),
+                    "stop_price": plan.stop_price,
+                    "target_price": plan.target_price,
+                    "time_exit_date": plan.time_exit_date,
+                    "stop_distance": plan.stop_distance,
+                    "target_rr": plan.target_rr,
+                    "target_mode": getattr(plan, "target_mode", None),
+                    "target_window_avg_pct": getattr(plan, "target_window_avg_pct", None),
+                    "target_window_mult": getattr(plan, "target_window_mult", None),
+                    "target_window_minutes": getattr(plan, "target_window_minutes", None),
+                    "target_window_samples": getattr(plan, "target_window_samples", None),
+                    "gap_bps": getattr(plan, "gap_bps", None),
+                    "early_pullback_bps": getattr(plan, "early_pullback_bps", None),
+                    "early_reversal_bps": getattr(plan, "early_reversal_bps", None),
+                    "confirm_move_bps": getattr(plan, "confirm_move_bps", None),
+                    "confirm_minutes": getattr(plan, "confirm_minutes", None),
+                    "confirm_hit_bps": getattr(plan, "confirm_hit_bps", None),
+                    "signal_return_pct": getattr(plan, "signal_return_pct", None),
+                    "signal_return_atr": getattr(plan, "signal_return_atr", None),
+                    "atr": getattr(plan, "atr", None),
+                    "watchlist_rank": wl_stats.get("rank"),
+                    "watchlist_avgR": wl_stats.get("avgR"),
+                    "watchlist_avgR_stderr": wl_stats.get("avgR_stderr"),
+                    "watchlist_win_rate": wl_stats.get("win_rate"),
+                    "watchlist_profit_factor": wl_stats.get("profit_factor"),
+                    "watchlist_trades_count": wl_stats.get("trades_count"),
+                    "watchlist_total_pnl_pct": wl_stats.get("total_pnl_pct"),
+                    "watchlist_stats": wl_stats,
+                    "exit_date": str(exit_info["exit_date"]),
+                    "exit_price": float(exit_info["exit_price"]),
+                    "exit_reason": str(exit_info["exit_reason"]),
+                    "exit_ts": exit_info.get("exit_ts"),
+                    "stop_hit_ts": exit_info.get("stop_hit_ts"),
+                    "target_hit_ts": exit_info.get("target_hit_ts"),
+                    "pnl_pct": pnl_pct,
+                    "r_multiple": r_multiple,
+                    "mfe_pct": exit_info.get("mfe_pct"),
+                    "mae_pct": exit_info.get("mae_pct"),
+                    "mfe_r": exit_info.get("mfe_r"),
+                    "mae_r": exit_info.get("mae_r"),
+                    "mfe_r_full": exit_info.get("mfe_r_full"),
+                    "mae_r_full": exit_info.get("mae_r_full"),
+                    "mfe_r_before_stop": exit_info.get("mfe_r_before_stop"),
+                    "mae_r_to_target": exit_info.get("mae_r_to_target"),
+                }
+                for key, value in wl_stats.items():
+                    prefixed = f"watchlist_{str(key)}"
+                    if prefixed not in detail:
+                        detail[prefixed] = value
+                day_details.append(detail)
             trades.append(
                 TradeResult(
                     plan=plan,

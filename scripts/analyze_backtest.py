@@ -166,21 +166,140 @@ def _enrich_trade(t: Dict[str, Any]) -> Dict[str, Any]:
     out["_early_pullback_bps"] = _safe_float(pb, default=0.0) if pb is not None else None
     po = t.get("param_overrides")
     out["param_overrides_json"] = _stable_json(po) if isinstance(po, dict) and po else ""
+    out["_fill_r_delta"] = None
+    if t.get("raw_r_multiple") is not None and t.get("r_multiple") is not None:
+        out["_fill_r_delta"] = _safe_float(t.get("r_multiple")) - _safe_float(t.get("raw_r_multiple"))
+    out["_fill_pnl_pct_delta"] = None
+    if t.get("raw_pnl_pct") is not None and t.get("pnl_pct") is not None:
+        out["_fill_pnl_pct_delta"] = _safe_float(t.get("pnl_pct")) - _safe_float(t.get("raw_pnl_pct"))
+    out["_fill_cost_bps_notional"] = None
+    notional = _safe_float(t.get("notional"), default=0.0)
+    if t.get("fill_cost_total") is not None and notional > 0:
+        out["_fill_cost_bps_notional"] = (_safe_float(t.get("fill_cost_total")) / notional) * 10000.0
     # Prefer persisted watchlist stats from the trade record when available.
-    if t.get("watchlist_rank") is not None:
-        out["_watchlist_rank"] = _safe_int(t.get("watchlist_rank"), default=0)
-    if t.get("watchlist_avgR") is not None:
-        out["_watchlist_avgR"] = _safe_float(t.get("watchlist_avgR"), default=0.0)
-    if t.get("watchlist_avgR_stderr") is not None:
-        out["_watchlist_avgR_stderr"] = _safe_float(t.get("watchlist_avgR_stderr"), default=0.0)
-    if t.get("watchlist_win_rate") is not None:
-        out["_watchlist_win_rate"] = _safe_float(t.get("watchlist_win_rate"), default=0.0)
-    if t.get("watchlist_profit_factor") is not None:
-        out["_watchlist_profit_factor"] = _safe_float(t.get("watchlist_profit_factor"), default=0.0)
-    if t.get("watchlist_trades_count") is not None:
-        out["_watchlist_trades_count"] = _safe_int(t.get("watchlist_trades_count"), default=0)
-    if t.get("watchlist_total_pnl_pct") is not None:
-        out["_watchlist_total_pnl_pct"] = _safe_float(t.get("watchlist_total_pnl_pct"), default=0.0)
+    wl_stats = t.get("watchlist_stats") if isinstance(t.get("watchlist_stats"), dict) else {}
+
+    def _wl_raw(key: str):
+        pref = f"watchlist_{key}"
+        if t.get(pref) is not None:
+            return t.get(pref)
+        return wl_stats.get(key)
+
+    if _wl_raw("rank") is not None:
+        out["_watchlist_rank"] = _safe_int(_wl_raw("rank"), default=0)
+    if _wl_raw("avgR") is not None:
+        out["_watchlist_avgR"] = _safe_float(_wl_raw("avgR"), default=0.0)
+    if _wl_raw("avgR_stderr") is not None:
+        out["_watchlist_avgR_stderr"] = _safe_float(_wl_raw("avgR_stderr"), default=0.0)
+    if _wl_raw("win_rate") is not None:
+        out["_watchlist_win_rate"] = _safe_float(_wl_raw("win_rate"), default=0.0)
+    if _wl_raw("profit_factor") is not None:
+        out["_watchlist_profit_factor"] = _safe_float(_wl_raw("profit_factor"), default=0.0)
+    if _wl_raw("trades_count") is not None:
+        out["_watchlist_trades_count"] = _safe_int(_wl_raw("trades_count"), default=0)
+    if _wl_raw("total_pnl_pct") is not None:
+        out["_watchlist_total_pnl_pct"] = _safe_float(_wl_raw("total_pnl_pct"), default=0.0)
+    if _wl_raw("stop_count") is not None:
+        out["_watchlist_stop_count"] = _safe_int(_wl_raw("stop_count"), default=0)
+    if _wl_raw("target_count") is not None:
+        out["_watchlist_target_count"] = _safe_int(_wl_raw("target_count"), default=0)
+    if _wl_raw("cutoff_count") is not None:
+        out["_watchlist_cutoff_count"] = _safe_int(_wl_raw("cutoff_count"), default=0)
+    if _wl_raw("stop_rate") is not None:
+        out["_watchlist_stop_rate"] = _safe_float(_wl_raw("stop_rate"), default=0.0)
+    if _wl_raw("target_rate") is not None:
+        out["_watchlist_target_rate"] = _safe_float(_wl_raw("target_rate"), default=0.0)
+    if _wl_raw("cutoff_rate") is not None:
+        out["_watchlist_cutoff_rate"] = _safe_float(_wl_raw("cutoff_rate"), default=0.0)
+    if _wl_raw("cutoff_avg_mfe_r") is not None:
+        out["_watchlist_cutoff_avg_mfe_r"] = _safe_float(_wl_raw("cutoff_avg_mfe_r"), default=0.0)
+    if _wl_raw("cutoff_avg_abs_mae_r") is not None:
+        out["_watchlist_cutoff_avg_abs_mae_r"] = _safe_float(_wl_raw("cutoff_avg_abs_mae_r"), default=0.0)
+    if _wl_raw("avg_target_r") is not None:
+        out["_watchlist_avg_target_r"] = _safe_float(_wl_raw("avg_target_r"), default=0.0)
+    if _wl_raw("cutoff_target_fit_ratio") is not None:
+        out["_watchlist_cutoff_target_fit_ratio"] = _safe_float(_wl_raw("cutoff_target_fit_ratio"), default=0.0)
+    if _wl_raw("stop_flip_share_any") is not None:
+        out["_watchlist_stop_flip_share_any"] = _safe_float(_wl_raw("stop_flip_share_any"), default=0.0)
+    if _wl_raw("stop_flip_share_050") is not None:
+        out["_watchlist_stop_flip_share_050"] = _safe_float(_wl_raw("stop_flip_share_050"), default=0.0)
+    if _wl_raw("stop_flip_share_100") is not None:
+        out["_watchlist_stop_flip_share_100"] = _safe_float(_wl_raw("stop_flip_share_100"), default=0.0)
+    if _wl_raw("stop_no_progress_share") is not None:
+        out["_watchlist_stop_no_progress_share"] = _safe_float(_wl_raw("stop_no_progress_share"), default=0.0)
+    if _wl_raw("stop_near_target_share") is not None:
+        out["_watchlist_stop_near_target_share"] = _safe_float(_wl_raw("stop_near_target_share"), default=0.0)
+    if _wl_raw("cutoff_no_progress_share") is not None:
+        out["_watchlist_cutoff_no_progress_share"] = _safe_float(_wl_raw("cutoff_no_progress_share"), default=0.0)
+    if _wl_raw("cutoff_near_target_share") is not None:
+        out["_watchlist_cutoff_near_target_share"] = _safe_float(_wl_raw("cutoff_near_target_share"), default=0.0)
+    if _wl_raw("stop_reach_target_with_wider_stop_share") is not None:
+        out["_watchlist_stop_reach_target_with_wider_stop_share"] = _safe_float(
+            _wl_raw("stop_reach_target_with_wider_stop_share"),
+            default=0.0,
+        )
+    if _wl_raw("avg_stop_mult_needed_for_target") is not None:
+        out["_watchlist_avg_stop_mult_needed_for_target"] = _safe_float(
+            _wl_raw("avg_stop_mult_needed_for_target"),
+            default=0.0,
+        )
+    if _wl_raw("loser_count") is not None:
+        out["_watchlist_loser_count"] = _safe_int(_wl_raw("loser_count"), default=0)
+    if _wl_raw("loser_no_progress_share") is not None:
+        out["_watchlist_loser_no_progress_share"] = _safe_float(_wl_raw("loser_no_progress_share"), default=0.0)
+    if _wl_raw("loser_near_target_share") is not None:
+        out["_watchlist_loser_near_target_share"] = _safe_float(_wl_raw("loser_near_target_share"), default=0.0)
+    if _wl_raw("positive_month_rate") is not None:
+        out["_watchlist_positive_month_rate"] = _safe_float(_wl_raw("positive_month_rate"), default=0.0)
+    if _wl_raw("max_monthly_drawdown_pct") is not None:
+        out["_watchlist_max_monthly_drawdown_pct"] = _safe_float(_wl_raw("max_monthly_drawdown_pct"), default=0.0)
+    if _wl_raw("param_override_source") is not None:
+        out["_watchlist_param_override_source"] = str(_wl_raw("param_override_source") or "")
+    if _wl_raw("auto_tuning_applied") is not None:
+        out["_watchlist_auto_tuning_applied"] = bool(_wl_raw("auto_tuning_applied"))
+    if _wl_raw("auto_tuning_reason") is not None:
+        out["_watchlist_auto_tuning_reason"] = str(_wl_raw("auto_tuning_reason") or "")
+    if _wl_raw("auto_tuning_score_delta") is not None:
+        out["_watchlist_auto_tuning_score_delta"] = _safe_float(_wl_raw("auto_tuning_score_delta"), default=0.0)
+    if _wl_raw("auto_tuning_candidate_count") is not None:
+        out["_watchlist_auto_tuning_candidate_count"] = _safe_int(_wl_raw("auto_tuning_candidate_count"), default=0)
+    if _wl_raw("wf_recent_lookback_days") is not None:
+        out["_watchlist_wf_recent_lookback_days"] = _safe_int(_wl_raw("wf_recent_lookback_days"), default=0)
+    if _wl_raw("wf_recent_trades_count") is not None:
+        out["_watchlist_wf_recent_trades_count"] = _safe_int(_wl_raw("wf_recent_trades_count"), default=0)
+    if _wl_raw("wf_recent_win_rate") is not None:
+        out["_watchlist_wf_recent_win_rate"] = _safe_float(_wl_raw("wf_recent_win_rate"), default=0.0)
+    if _wl_raw("wf_recent_avgR") is not None:
+        out["_watchlist_wf_recent_avgR"] = _safe_float(_wl_raw("wf_recent_avgR"), default=0.0)
+    if _wl_raw("wf_recent_profit_factor") is not None:
+        out["_watchlist_wf_recent_profit_factor"] = _safe_float(_wl_raw("wf_recent_profit_factor"), default=0.0)
+    if _wl_raw("wf_recent_total_pnl_pct") is not None:
+        out["_watchlist_wf_recent_total_pnl_pct"] = _safe_float(_wl_raw("wf_recent_total_pnl_pct"), default=0.0)
+    if _wl_raw("wf_recent_stop_rate") is not None:
+        out["_watchlist_wf_recent_stop_rate"] = _safe_float(_wl_raw("wf_recent_stop_rate"), default=0.0)
+    if _wl_raw("wf_recent_stop_no_progress_share") is not None:
+        out["_watchlist_wf_recent_stop_no_progress_share"] = _safe_float(
+            _wl_raw("wf_recent_stop_no_progress_share"),
+            default=0.0,
+        )
+    if _wl_raw("wf_recent_cutoff_rate") is not None:
+        out["_watchlist_wf_recent_cutoff_rate"] = _safe_float(_wl_raw("wf_recent_cutoff_rate"), default=0.0)
+    if _wl_raw("wf_recent_cutoff_avg_mfe_r") is not None:
+        out["_watchlist_wf_recent_cutoff_avg_mfe_r"] = _safe_float(_wl_raw("wf_recent_cutoff_avg_mfe_r"), default=0.0)
+    if _wl_raw("wf_recent_cutoff_no_progress_share") is not None:
+        out["_watchlist_wf_recent_cutoff_no_progress_share"] = _safe_float(
+            _wl_raw("wf_recent_cutoff_no_progress_share"),
+            default=0.0,
+        )
+    if _wl_raw("wf_recent_loser_no_progress_share") is not None:
+        out["_watchlist_wf_recent_loser_no_progress_share"] = _safe_float(
+            _wl_raw("wf_recent_loser_no_progress_share"),
+            default=0.0,
+        )
+    if _wl_raw("wf_recent_suppressed") is not None:
+        out["_watchlist_wf_recent_suppressed"] = bool(_wl_raw("wf_recent_suppressed"))
+    if _wl_raw("wf_recent_reasons") is not None:
+        out["_watchlist_wf_recent_reasons"] = _stable_json(_wl_raw("wf_recent_reasons"))
     if t.get("quality_risk_mult") is not None:
         out["_quality_risk_mult"] = _safe_float(t.get("quality_risk_mult"), default=0.0)
     if t.get("quality_score") is not None:
@@ -217,6 +336,55 @@ def _enrich_trade(t: Dict[str, Any]) -> Dict[str, Any]:
     out["_flip_target_r_max_by_cutoff"] = None
     if exit_reason in {"time_stop", "eod_flat", "time_exit"} and r_mult <= 0 and mfe_r_full is not None:
         out["_flip_target_r_max_by_cutoff"] = mfe_r_full
+
+    # Root-cause bucketing for losing/flat outcomes.
+    out["_loss_bucket"] = "win_or_flat"
+    out["_entry_quality_issue"] = 0
+    out["_bracket_issue"] = 0
+    out["_target_issue"] = 0
+    if r_mult <= 0:
+        if exit_reason == "stop":
+            near_thresh = (0.75 * float(target_r)) if (target_r is not None and float(target_r) > 0) else 0.75
+            near_target_before_stop = (
+                mfe_r_before_stop is not None
+                and near_thresh > 0
+                and float(mfe_r_before_stop) >= near_thresh
+            )
+            recoverable_with_wider_stop = out["_flip_stop_mult_needed_for_original_target"] is not None
+            if mfe_r_before_stop is not None and float(mfe_r_before_stop) <= 1e-9:
+                out["_loss_bucket"] = "stop_no_progress"
+                out["_entry_quality_issue"] = 1
+            elif near_target_before_stop and recoverable_with_wider_stop:
+                out["_loss_bucket"] = "stop_near_target_recoverable"
+                out["_bracket_issue"] = 1
+            elif near_target_before_stop:
+                out["_loss_bucket"] = "stop_near_target"
+                out["_bracket_issue"] = 1
+            elif recoverable_with_wider_stop:
+                out["_loss_bucket"] = "stop_recoverable_with_wider_stop"
+                out["_bracket_issue"] = 1
+            else:
+                out["_loss_bucket"] = "stop_midpath_reversal"
+        elif exit_reason in _CUTOFF_EXIT_REASONS:
+            near_thresh = (0.75 * float(target_r)) if (target_r is not None and float(target_r) > 0) else 0.75
+            cutoff_near_target = (
+                mfe_r_full is not None
+                and near_thresh > 0
+                and float(mfe_r_full) >= near_thresh
+            )
+            if mfe_r_full is not None and float(mfe_r_full) <= 1e-9:
+                out["_loss_bucket"] = "cutoff_no_progress"
+                out["_entry_quality_issue"] = 1
+            elif cutoff_near_target:
+                out["_loss_bucket"] = "cutoff_near_target_time_limited"
+                out["_target_issue"] = 1
+            elif out["_flip_target_r_max_by_cutoff"] is not None:
+                out["_loss_bucket"] = "cutoff_partial_progress"
+                out["_target_issue"] = 1
+            else:
+                out["_loss_bucket"] = "cutoff_no_edge"
+        else:
+            out["_loss_bucket"] = f"loss_{exit_reason or 'other'}"
     return out
 
 
@@ -311,6 +479,94 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
     analysis_dir = run_dir / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
+    watchlist_funnel_rows: List[Dict[str, Any]] = []
+    watchlist_funnel_summary: Optional[Dict[str, Any]] = None
+    watchlist_reject_top: List[Tuple[str, int]] = []
+    if watchlists_dir and watchlists_dir.exists():
+        reject_keys = [
+            "min_trades",
+            "neg_pnl",
+            "min_pf",
+            "min_avg_r",
+            "min_win_rate",
+            "min_months_count",
+            "min_positive_month_rate",
+            "max_negative_months",
+            "max_monthly_drawdown_pct",
+            "max_longest_negative_month_streak",
+            "min_worst_month_pnl_pct",
+        ]
+        dates = sorted({str(t.get("entry_date") or "") for t in trades if str(t.get("entry_date") or "")})
+        min_date = dates[0] if dates else ""
+        max_date = dates[-1] if dates else ""
+        for path in sorted(watchlists_dir.glob("*.json")):
+            date = str(path.stem or "")
+            if min_date and date < min_date:
+                continue
+            if max_date and date > max_date:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            meta = payload.get("meta") if isinstance(payload, dict) else {}
+            if not isinstance(meta, dict):
+                continue
+            funnel = meta.get("funnel") if isinstance(meta.get("funnel"), dict) else {}
+            reject_counts = meta.get("reject_counts") if isinstance(meta.get("reject_counts"), dict) else {}
+            filters = meta.get("filters") if isinstance(meta.get("filters"), dict) else {}
+            row: Dict[str, Any] = {
+                "date": date,
+                "scanned_symbols": _safe_int(funnel.get("scanned_symbols"), default=0),
+                "signals_found": _safe_int(funnel.get("signals_found"), default=0),
+                "trades_simulated": _safe_int(funnel.get("trades_simulated"), default=0),
+                "symbols_passing_filters": _safe_int(funnel.get("symbols_passing_filters"), default=0),
+                "watchlist_size": _safe_int(funnel.get("watchlist_size"), default=0),
+                "minTrades": _safe_int(filters.get("minTrades"), default=0),
+                "top_k": _safe_int(filters.get("top_k"), default=0),
+            }
+            for k in reject_keys:
+                row[f"reject_{k}"] = _safe_int(reject_counts.get(k), default=0)
+            row["bound_by_top_k"] = 1 if (row["top_k"] > 0 and row["symbols_passing_filters"] > row["watchlist_size"]) else 0
+            watchlist_funnel_rows.append(row)
+
+        if watchlist_funnel_rows:
+            daily_fields = [
+                "date",
+                "scanned_symbols",
+                "signals_found",
+                "trades_simulated",
+                "symbols_passing_filters",
+                "watchlist_size",
+                "minTrades",
+                "top_k",
+                "bound_by_top_k",
+            ] + [f"reject_{k}" for k in reject_keys]
+            _write_csv(analysis_dir / "watchlist_funnel_daily.csv", daily_fields, watchlist_funnel_rows)
+
+            n_days = len(watchlist_funnel_rows)
+            avg_scanned = sum(_safe_float(r.get("scanned_symbols"), default=0.0) for r in watchlist_funnel_rows) / float(n_days)
+            avg_passed = sum(_safe_float(r.get("symbols_passing_filters"), default=0.0) for r in watchlist_funnel_rows) / float(n_days)
+            avg_watchlist = sum(_safe_float(r.get("watchlist_size"), default=0.0) for r in watchlist_funnel_rows) / float(n_days)
+            top_k_bound_days = sum(int(_safe_int(r.get("bound_by_top_k"), default=0) > 0) for r in watchlist_funnel_rows)
+            summary: Dict[str, Any] = {
+                "days": n_days,
+                "avg_scanned_symbols": avg_scanned,
+                "avg_symbols_passing_filters": avg_passed,
+                "avg_watchlist_size": avg_watchlist,
+                "days_bound_by_top_k": top_k_bound_days,
+                "bound_by_top_k_share": (top_k_bound_days / float(n_days)) if n_days > 0 else 0.0,
+            }
+            for k in reject_keys:
+                summary[f"total_reject_{k}"] = sum(_safe_int(r.get(f"reject_{k}"), default=0) for r in watchlist_funnel_rows)
+            _write_csv(analysis_dir / "watchlist_funnel_summary.csv", list(summary.keys()), [summary])
+            watchlist_funnel_summary = summary
+            watchlist_reject_top = sorted(
+                [(k, int(summary.get(f"total_reject_{k}") or 0)) for k in reject_keys],
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+
     # Trade table (trade-by-trade).
     po_keys = sorted(
         {
@@ -342,9 +598,55 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "equity_before",
         "equity_after",
         "stop_distance",
+        "stop_distance_fill",
         "atr",
         "target_price",
         "entry_price",
+        "raw_entry_price",
+        "entry_fill_price",
+        "raw_exit_price",
+        "exit_fill_price",
+        "fill_model_enabled",
+        "quote_fill_enabled",
+        "entry_fill_mode",
+        "exit_fill_mode",
+        "entry_quote_ok",
+        "exit_quote_ok",
+        "entry_quote_spread_cap_bps",
+        "entry_quote_deviation_cap_bps",
+        "exit_quote_spread_cap_bps",
+        "exit_quote_deviation_cap_bps",
+        "entry_quote_reason",
+        "exit_quote_reason",
+        "entry_quote_ts",
+        "exit_quote_ts",
+        "entry_quote_selection",
+        "exit_quote_selection",
+        "entry_quote_age_seconds",
+        "exit_quote_age_seconds",
+        "entry_quote_spread_bps",
+        "exit_quote_spread_bps",
+        "entry_quote_deviation_bps",
+        "exit_quote_deviation_bps",
+        "entry_quote_bid",
+        "entry_quote_ask",
+        "exit_quote_bid",
+        "exit_quote_ask",
+        "entry_quote_price_source",
+        "exit_quote_price_source",
+        "target_limit_bound_applied",
+        "fill_exit_reason_bucket",
+        "fill_half_spread_bps",
+        "fill_entry_slippage_bps",
+        "fill_exit_slippage_bps",
+        "fill_entry_bps",
+        "fill_exit_bps",
+        "fill_entry_bps_model",
+        "fill_exit_bps_model",
+        "fill_cost_per_share",
+        "fill_cost_total",
+        "raw_pnl_pct",
+        "raw_r_multiple",
         "gap_bps",
         "early_pullback_bps",
         "early_reversal_bps",
@@ -362,6 +664,9 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "_target_r",
         "_stop_atr",
         "_gap_fav_bps",
+        "_fill_r_delta",
+        "_fill_pnl_pct_delta",
+        "_fill_cost_bps_notional",
         "_stop_shakeout_day_hit_target",
         "_flip_target_r_max_before_stop",
         "_flip_stop_mult_needed_for_original_target",
@@ -373,8 +678,53 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "_watchlist_profit_factor",
         "_watchlist_trades_count",
         "_watchlist_total_pnl_pct",
+        "_watchlist_stop_count",
+        "_watchlist_target_count",
+        "_watchlist_cutoff_count",
+        "_watchlist_stop_rate",
+        "_watchlist_target_rate",
+        "_watchlist_cutoff_rate",
+        "_watchlist_cutoff_avg_mfe_r",
+        "_watchlist_cutoff_avg_abs_mae_r",
+        "_watchlist_stop_flip_share_any",
+        "_watchlist_stop_flip_share_050",
+        "_watchlist_stop_flip_share_100",
+        "_watchlist_stop_no_progress_share",
+        "_watchlist_stop_near_target_share",
+        "_watchlist_cutoff_no_progress_share",
+        "_watchlist_cutoff_near_target_share",
+        "_watchlist_stop_reach_target_with_wider_stop_share",
+        "_watchlist_avg_stop_mult_needed_for_target",
+        "_watchlist_loser_count",
+        "_watchlist_loser_no_progress_share",
+        "_watchlist_loser_near_target_share",
+        "_watchlist_positive_month_rate",
+        "_watchlist_max_monthly_drawdown_pct",
+        "_watchlist_param_override_source",
+        "_watchlist_auto_tuning_applied",
+        "_watchlist_auto_tuning_reason",
+        "_watchlist_auto_tuning_score_delta",
+        "_watchlist_auto_tuning_candidate_count",
+        "_watchlist_wf_recent_lookback_days",
+        "_watchlist_wf_recent_trades_count",
+        "_watchlist_wf_recent_win_rate",
+        "_watchlist_wf_recent_avgR",
+        "_watchlist_wf_recent_profit_factor",
+        "_watchlist_wf_recent_total_pnl_pct",
+        "_watchlist_wf_recent_stop_rate",
+        "_watchlist_wf_recent_stop_no_progress_share",
+        "_watchlist_wf_recent_cutoff_rate",
+        "_watchlist_wf_recent_cutoff_avg_mfe_r",
+        "_watchlist_wf_recent_cutoff_no_progress_share",
+        "_watchlist_wf_recent_loser_no_progress_share",
+        "_watchlist_wf_recent_suppressed",
+        "_watchlist_wf_recent_reasons",
         "_quality_risk_mult",
         "_quality_score",
+        "_loss_bucket",
+        "_entry_quality_issue",
+        "_bracket_issue",
+        "_target_issue",
     ]
     trade_fields.extend([f"po__{k}" for k in po_keys])
     _write_csv(analysis_dir / "trades_enriched.csv", trade_fields, trades)
@@ -489,6 +839,153 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
             analysis_dir / "rank_bins.csv",
             ["rank_bin", "trades", "win_rate", "avgR", "pnl_total", "stops", "targets"],
             rank_rows,
+        )
+
+    # Entry-quality surfaces (historical, no lookahead): which minute entries work better.
+    entry_time_rows: List[Dict[str, Any]] = []
+    entry_time_symbol_rows: List[Dict[str, Any]] = []
+
+    def _entry_quality_stats(ts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        a = _agg_trades(ts)
+        n = int(a.get("trades") or 0)
+        if n <= 0:
+            return {
+                "trades": 0,
+                "win_rate": 0.0,
+                "avgR": 0.0,
+                "pnl_total": 0.0,
+                "stop_rate": 0.0,
+                "target_rate": 0.0,
+                "cutoff_rate": 0.0,
+                "stop_no_progress_share": 0.0,
+                "cutoff_no_progress_share": 0.0,
+                "stop_shakeout_share": 0.0,
+                "avg_target_r": None,
+                "avg_stop_atr": None,
+                "avg_mfe_r_full": None,
+                "avg_abs_mae_r_full": None,
+                "mfe_to_mae_ratio": None,
+            }
+        stop_count = int(a.get("stops") or 0)
+        target_count = int(a.get("targets") or 0)
+        cutoff_count = sum(1 for t in ts if str(t.get("exit_reason") or "") in _CUTOFF_EXIT_REASONS)
+        stop_no_prog = sum(
+            1
+            for t in ts
+            if str(t.get("exit_reason") or "") == "stop"
+            and t.get("mfe_r_before_stop") is not None
+            and _safe_float(t.get("mfe_r_before_stop")) <= 1e-9
+        )
+        cutoff_no_prog = sum(
+            1
+            for t in ts
+            if str(t.get("exit_reason") or "") in _CUTOFF_EXIT_REASONS
+            and t.get("mfe_r_full") is not None
+            and _safe_float(t.get("mfe_r_full")) <= 1e-9
+        )
+        stop_shakeout_count = sum(
+            1
+            for t in ts
+            if str(t.get("exit_reason") or "") == "stop"
+            and t.get("_stop_shakeout_day_hit_target") is True
+        )
+        avg_target_r = _mean([_safe_float(t.get("_target_r")) for t in ts if t.get("_target_r") is not None])
+        avg_stop_atr = _mean([_safe_float(t.get("_stop_atr")) for t in ts if t.get("_stop_atr") is not None])
+        avg_mfe_r_full = _mean([_safe_float(t.get("mfe_r_full")) for t in ts if t.get("mfe_r_full") is not None])
+        avg_abs_mae_r_full = _mean(
+            [abs(_safe_float(t.get("mae_r_full"))) for t in ts if t.get("mae_r_full") is not None]
+        )
+        mfe_to_mae_ratio = None
+        if avg_mfe_r_full is not None and avg_abs_mae_r_full is not None and avg_abs_mae_r_full > 1e-9:
+            mfe_to_mae_ratio = float(avg_mfe_r_full) / float(avg_abs_mae_r_full)
+        return {
+            "trades": n,
+            "win_rate": a["win_rate"],
+            "avgR": a["avgR"],
+            "pnl_total": a["pnl_total"],
+            "stop_rate": stop_count / float(n),
+            "target_rate": target_count / float(n),
+            "cutoff_rate": cutoff_count / float(n),
+            "stop_no_progress_share": (stop_no_prog / float(stop_count)) if stop_count > 0 else 0.0,
+            "cutoff_no_progress_share": (cutoff_no_prog / float(cutoff_count)) if cutoff_count > 0 else 0.0,
+            "stop_shakeout_share": (stop_shakeout_count / float(stop_count)) if stop_count > 0 else 0.0,
+            "avg_target_r": avg_target_r,
+            "avg_stop_atr": avg_stop_atr,
+            "avg_mfe_r_full": avg_mfe_r_full,
+            "avg_abs_mae_r_full": avg_abs_mae_r_full,
+            "mfe_to_mae_ratio": mfe_to_mae_ratio,
+        }
+
+    by_entry_time: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_symbol_entry_time: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for t in trades:
+        et = str(t.get("entry_time_et") or "")
+        sym = str(t.get("symbol") or "").upper()
+        if et:
+            by_entry_time[et].append(t)
+            if sym:
+                by_symbol_entry_time[(sym, et)].append(t)
+
+    for et, ts in by_entry_time.items():
+        row = {"entry_time_et": et}
+        row.update(_entry_quality_stats(ts))
+        entry_time_rows.append(row)
+    entry_time_rows.sort(key=lambda r: str(r.get("entry_time_et") or ""))
+    if entry_time_rows:
+        _write_csv(
+            analysis_dir / "entry_time_quality.csv",
+            [
+                "entry_time_et",
+                "trades",
+                "win_rate",
+                "avgR",
+                "pnl_total",
+                "stop_rate",
+                "target_rate",
+                "cutoff_rate",
+                "stop_no_progress_share",
+                "cutoff_no_progress_share",
+                "stop_shakeout_share",
+                "avg_target_r",
+                "avg_stop_atr",
+                "avg_mfe_r_full",
+                "avg_abs_mae_r_full",
+                "mfe_to_mae_ratio",
+            ],
+            entry_time_rows,
+        )
+
+    for (sym, et), ts in by_symbol_entry_time.items():
+        row = {
+            "symbol": sym,
+            "entry_time_et": et,
+        }
+        row.update(_entry_quality_stats(ts))
+        entry_time_symbol_rows.append(row)
+    entry_time_symbol_rows.sort(key=lambda r: (str(r.get("symbol") or ""), -int(r.get("trades") or 0), str(r.get("entry_time_et") or "")))
+    if entry_time_symbol_rows:
+        _write_csv(
+            analysis_dir / "entry_time_symbol_quality.csv",
+            [
+                "symbol",
+                "entry_time_et",
+                "trades",
+                "win_rate",
+                "avgR",
+                "pnl_total",
+                "stop_rate",
+                "target_rate",
+                "cutoff_rate",
+                "stop_no_progress_share",
+                "cutoff_no_progress_share",
+                "stop_shakeout_share",
+                "avg_target_r",
+                "avg_stop_atr",
+                "avg_mfe_r_full",
+                "avg_abs_mae_r_full",
+                "mfe_to_mae_ratio",
+            ],
+            entry_time_symbol_rows,
         )
 
     # Symbol summary.
@@ -910,6 +1407,91 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
             symbol_flip_stop_grid_rows,
         )
 
+    # Loss attribution buckets: entry quality vs bracket/target geometry.
+    loss_bucket_rows: List[Dict[str, Any]] = []
+    symbol_loss_rows: List[Dict[str, Any]] = []
+    by_loss_bucket: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for t in trades:
+        if _safe_float(t.get("r_multiple"), default=0.0) <= 0:
+            by_loss_bucket[str(t.get("_loss_bucket") or "")].append(t)
+    total_losers = sum(len(v) for v in by_loss_bucket.values())
+    for bucket, ts in by_loss_bucket.items():
+        n = len(ts)
+        loss_bucket_rows.append(
+            {
+                "loss_bucket": bucket,
+                "trades": n,
+                "share_of_losers": (n / float(total_losers)) if total_losers > 0 else 0.0,
+                "avgR": _mean([_safe_float(t.get("r_multiple")) for t in ts]) or 0.0,
+                "pnl_total": sum(_safe_float(t.get("pnl_total")) for t in ts),
+            }
+        )
+    if loss_bucket_rows:
+        loss_bucket_rows.sort(key=lambda r: float(r.get("trades") or 0), reverse=True)
+        _write_csv(
+            analysis_dir / "loss_bucket_summary.csv",
+            ["loss_bucket", "trades", "share_of_losers", "avgR", "pnl_total"],
+            loss_bucket_rows,
+        )
+
+    for sym, ts in by_sym.items():
+        losses = [t for t in ts if _safe_float(t.get("r_multiple"), default=0.0) <= 0]
+        if not losses:
+            continue
+        c = Counter(str(t.get("_loss_bucket") or "") for t in losses)
+        n = len(losses)
+        top_bucket, top_count = c.most_common(1)[0]
+        symbol_loss_rows.append(
+            {
+                "symbol": sym,
+                "trades": len(ts),
+                "losses": n,
+                "pnl_total": sum(_safe_float(t.get("pnl_total")) for t in ts),
+                "avgR": _mean([_safe_float(t.get("r_multiple")) for t in ts]) or 0.0,
+                "entry_issue_share": sum(_safe_int(t.get("_entry_quality_issue"), default=0) for t in losses) / float(n),
+                "bracket_issue_share": sum(_safe_int(t.get("_bracket_issue"), default=0) for t in losses) / float(n),
+                "target_issue_share": sum(_safe_int(t.get("_target_issue"), default=0) for t in losses) / float(n),
+                "stop_no_progress": c.get("stop_no_progress", 0),
+                "stop_midpath_reversal": c.get("stop_midpath_reversal", 0),
+                "stop_recoverable_with_wider_stop": c.get("stop_recoverable_with_wider_stop", 0),
+                "stop_near_target": c.get("stop_near_target", 0),
+                "stop_near_target_recoverable": c.get("stop_near_target_recoverable", 0),
+                "cutoff_no_progress": c.get("cutoff_no_progress", 0),
+                "cutoff_partial_progress": c.get("cutoff_partial_progress", 0),
+                "cutoff_near_target_time_limited": c.get("cutoff_near_target_time_limited", 0),
+                "cutoff_no_edge": c.get("cutoff_no_edge", 0),
+                "top_loss_bucket": top_bucket,
+                "top_loss_bucket_share": top_count / float(n),
+            }
+        )
+    if symbol_loss_rows:
+        symbol_loss_rows.sort(key=lambda r: float(r.get("pnl_total") or 0.0))
+        _write_csv(
+            analysis_dir / "symbol_loss_attribution.csv",
+            [
+                "symbol",
+                "trades",
+                "losses",
+                "pnl_total",
+                "avgR",
+                "entry_issue_share",
+                "bracket_issue_share",
+                "target_issue_share",
+                "stop_no_progress",
+                "stop_midpath_reversal",
+                "stop_recoverable_with_wider_stop",
+                "stop_near_target",
+                "stop_near_target_recoverable",
+                "cutoff_no_progress",
+                "cutoff_partial_progress",
+                "cutoff_near_target_time_limited",
+                "cutoff_no_edge",
+                "top_loss_bucket",
+                "top_loss_bucket_share",
+            ],
+            symbol_loss_rows,
+        )
+
     # Trade-by-trade "flip" table (safe thresholds).
     flip_rows: List[Dict[str, Any]] = []
     for t in trades:
@@ -1059,6 +1641,25 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         f"- gap_fav_bps (gap aligned with mean-reversion direction): p25={_format_float(_pct(gap_fav_vals,0.25),1)} "
         f"p50={_format_float(_pct(gap_fav_vals,0.50),1)} p75={_format_float(_pct(gap_fav_vals,0.75),1)}\n"
     )
+    if watchlist_funnel_summary is not None:
+        lines.append("\n## Watchlist Funnel\n")
+        lines.append("See `watchlist_funnel_daily.csv` and `watchlist_funnel_summary.csv`.\n")
+        lines.append(
+            f"- days={int(watchlist_funnel_summary.get('days') or 0)} "
+            f"avg_scanned={_format_float(watchlist_funnel_summary.get('avg_scanned_symbols'))} "
+            f"avg_passed={_format_float(watchlist_funnel_summary.get('avg_symbols_passing_filters'))} "
+            f"avg_watchlist={_format_float(watchlist_funnel_summary.get('avg_watchlist_size'))}\n"
+        )
+        lines.append(
+            f"- top_k binding days: {int(watchlist_funnel_summary.get('days_bound_by_top_k') or 0)}/"
+            f"{int(watchlist_funnel_summary.get('days') or 0)} "
+            f"({float(watchlist_funnel_summary.get('bound_by_top_k_share') or 0.0):.3f})\n"
+        )
+        top_reject_nonzero = [r for r in watchlist_reject_top if int(r[1]) > 0]
+        if top_reject_nonzero:
+            lines.append("- largest reject drivers:\n")
+            for key, cnt in top_reject_nonzero[:5]:
+                lines.append(f"  {key}={int(cnt)}\n")
 
     lines.append("\n## Month By Month\n")
     lines.append("See `month_summary.csv` for full table.\n")
@@ -1093,6 +1694,38 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
                 f"- rank {r['rank_bin']}: trades={r['trades']} win_rate={float(r['win_rate']):.3f} "
                 f"avgR={float(r['avgR']):.3f} pnl_total=${float(r['pnl_total']):.2f}\n"
             )
+
+    if entry_time_rows:
+        lines.append("\n## Entry-Time Quality\n")
+        lines.append("See `entry_time_quality.csv` and `entry_time_symbol_quality.csv`.\n")
+        qualified_entry_times = [r for r in entry_time_rows if int(r.get("trades") or 0) >= 20]
+        if not qualified_entry_times:
+            qualified_entry_times = list(entry_time_rows)
+        best_entry_times = sorted(
+            qualified_entry_times,
+            key=lambda r: (float(r.get("avgR") or 0.0), float(r.get("win_rate") or 0.0)),
+            reverse=True,
+        )[:5]
+        worst_entry_times = sorted(
+            qualified_entry_times,
+            key=lambda r: (float(r.get("avgR") or 0.0), float(r.get("win_rate") or 0.0)),
+        )[:5]
+        if best_entry_times:
+            lines.append("\nBest entry minutes:\n")
+            for r in best_entry_times:
+                lines.append(
+                    f"- {r['entry_time_et']}: trades={int(r['trades'])} win_rate={float(r['win_rate']):.3f} "
+                    f"avgR={float(r['avgR']):.3f} stop_rate={float(r['stop_rate']):.3f} "
+                    f"cutoff_rate={float(r['cutoff_rate']):.3f}\n"
+                )
+        if worst_entry_times:
+            lines.append("\nWeakest entry minutes:\n")
+            for r in worst_entry_times:
+                lines.append(
+                    f"- {r['entry_time_et']}: trades={int(r['trades'])} win_rate={float(r['win_rate']):.3f} "
+                    f"avgR={float(r['avgR']):.3f} stop_rate={float(r['stop_rate']):.3f} "
+                    f"cutoff_rate={float(r['cutoff_rate']):.3f}\n"
+                )
 
     if symbol_stability_rows:
         lines.append("\n## Symbol Stability\n")
@@ -1144,6 +1777,25 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
                 lines.append(
                     f"- {r['symbol']}: delta_total_r={float(r['delta_total_r']):.3f} "
                     f"flipped_stopouts={int(r['stopouts_flipped'])}/{int(r['stopouts'])}\n"
+                )
+    if loss_bucket_rows:
+        lines.append("\n## Loss Attribution\n")
+        lines.append("See `loss_bucket_summary.csv` and `symbol_loss_attribution.csv`.\n")
+        for row in loss_bucket_rows[:8]:
+            lines.append(
+                f"- {row['loss_bucket']}: trades={int(row['trades'])} share={float(row['share_of_losers']):.3f} "
+                f"avgR={float(row['avgR']):.3f} pnl_total=${float(row['pnl_total']):.2f}\n"
+            )
+        if symbol_loss_rows:
+            weakest = sorted(symbol_loss_rows, key=lambda r: float(r.get("pnl_total") or 0.0))[:6]
+            lines.append("\nWorst symbols by loss composition:\n")
+            for r in weakest:
+                lines.append(
+                    f"- {r['symbol']}: pnl_total=${float(r['pnl_total']):.2f} "
+                    f"entry_issue_share={float(r['entry_issue_share']):.3f} "
+                    f"bracket_issue_share={float(r['bracket_issue_share']):.3f} "
+                    f"target_issue_share={float(r['target_issue_share']):.3f} "
+                    f"top_bucket={r['top_loss_bucket']}\n"
                 )
 
     # Put actionable diagnostics at the end.
