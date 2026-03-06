@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Tuple
 
 from app.strategies.types import TradePlan
@@ -16,6 +17,72 @@ def _safe_float_opt(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _safe_int_opt(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def estimate_slot_target_from_stats(
+    stats_rows: list[Dict[str, Any]],
+    lookback_days: float,
+    *,
+    min_slots: int = 1,
+    max_slots: int = 0,
+    cap_by_candidates: bool = True,
+) -> Tuple[int, Dict[str, Any]]:
+    rows = [r for r in (stats_rows or []) if isinstance(r, dict)]
+    n_candidates = len(rows)
+    if n_candidates <= 0:
+        return 0, {"rows": 0, "expected_trades_per_day": 0.0}
+
+    lb_days = float(lookback_days or 0.0)
+    if lb_days <= 0:
+        return 0, {"rows": n_candidates, "expected_trades_per_day": 0.0, "reason": "lookback_days_zero"}
+
+    expected = 0.0
+    used_rows = 0
+    for row in rows:
+        trades_count = _safe_int_opt(row.get("trades_count"))
+        if trades_count is None:
+            trades_count = _safe_int_opt(row.get("watchlist_trades_count"))
+        if trades_count is None or trades_count <= 0:
+            continue
+        # One symbol can only be entered once per day in this strategy, so cap contribution at 1.
+        expected += min(1.0, float(trades_count) / lb_days)
+        used_rows += 1
+
+    if expected <= 0:
+        return 0, {
+            "rows": n_candidates,
+            "rows_with_trades_count": used_rows,
+            "expected_trades_per_day": 0.0,
+            "reason": "no_valid_trades_count",
+        }
+
+    target = int(math.ceil(expected))
+    min_slots_eff = max(1, int(min_slots or 1))
+    target = max(min_slots_eff, target)
+    if max_slots and int(max_slots) > 0:
+        target = min(target, int(max_slots))
+    if cap_by_candidates:
+        target = min(target, n_candidates)
+    target = max(0, target)
+
+    return target, {
+        "rows": n_candidates,
+        "rows_with_trades_count": used_rows,
+        "expected_trades_per_day": expected,
+        "slot_target": target,
+        "lookback_days": lb_days,
+        "min_slots": min_slots_eff,
+        "max_slots": int(max_slots or 0),
+    }
 
 
 def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[str, Any]]:
@@ -164,17 +231,41 @@ def compute_qty_with_guards(
     *,
     allowed_total_override: Optional[float] = None,
     open_positions: int = 0,
+    slot_target_override: Optional[int] = None,
 ) -> Tuple[int, Dict]:
     params = cfg.get("daily_trend_reversal") or {}
-    max_positions = int(params.get("max_positions") or 0)
+    max_positions_cfg = int(params.get("max_positions") or 0)
     risk_per_trade = float(params.get("risk_per_trade") or 0.0)
     leverage = float(params.get("leverage") or 1.0)
     max_margin_usage = float(params.get("max_margin_usage") or 1.0)
     margin_safety_buffer = float(params.get("margin_safety_buffer") or 0.0)
     per_trade_max_pct_available = float(params.get("per_trade_max_pct_available") or 1.0)
-    equal_split = bool(params.get("equal_split_across_max_slots", False))
+    equal_split_cfg = bool(params.get("equal_split_across_max_slots", False))
     min_af_abs = float(params.get("min_available_funds_abs") or 0.0)
     min_af_ratio = float(params.get("min_available_funds_ratio_of_netliq") or 0.0)
+    slot_distribution_enabled = bool(params.get("slot_distribution_enabled", False))
+    slot_min_slots = max(1, int(params.get("slot_distribution_min_slots") or 1))
+    slot_max_slots = max(0, int(params.get("slot_distribution_max_slots") or 0))
+    slot_default_slots = max(0, int(params.get("slot_distribution_default_slots") or 0))
+
+    slot_target = 0
+    if slot_distribution_enabled:
+        if slot_target_override is not None and int(slot_target_override) > 0:
+            slot_target = int(slot_target_override)
+        else:
+            slot_target = slot_default_slots
+        if slot_target > 0:
+            slot_target = max(slot_min_slots, slot_target)
+            if slot_max_slots > 0:
+                slot_target = min(slot_target, slot_max_slots)
+    effective_max_positions = max_positions_cfg
+    effective_equal_split = equal_split_cfg
+    if slot_distribution_enabled and slot_target > 0:
+        if max_positions_cfg > 0:
+            effective_max_positions = min(max_positions_cfg, slot_target)
+        else:
+            effective_max_positions = slot_target
+        effective_equal_split = True
 
     state = {
         "equity": equity,
@@ -184,12 +275,19 @@ def compute_qty_with_guards(
         "max_margin_usage": max_margin_usage,
         "margin_safety_buffer": margin_safety_buffer,
         "per_trade_max_pct_available": per_trade_max_pct_available,
-        "equal_split_across_max_slots": equal_split,
-        "max_positions": max_positions,
+        "equal_split_across_max_slots": equal_split_cfg,
+        "max_positions": max_positions_cfg,
+        "slot_distribution_enabled": slot_distribution_enabled,
+        "slot_target": slot_target,
+        "slot_target_override": slot_target_override,
+        "slot_distribution_min_slots": slot_min_slots,
+        "slot_distribution_max_slots": slot_max_slots,
+        "effective_equal_split": effective_equal_split,
+        "effective_max_positions": effective_max_positions,
         "open_positions": open_positions,
     }
 
-    if max_positions > 0 and open_positions >= max_positions:
+    if effective_max_positions > 0 and open_positions >= effective_max_positions:
         state["reject_reason"] = "max_positions"
         return 0, state
 
@@ -238,8 +336,8 @@ def compute_qty_with_guards(
     state["net_available"] = net_avail
     state["headroom_cap"] = headroom_cap
 
-    if equal_split and max_positions > 0:
-        eq_cap = allowed_total / max_positions
+    if effective_equal_split and effective_max_positions > 0:
+        eq_cap = allowed_total / effective_max_positions
         state["equal_split_cap"] = eq_cap
         net_avail = min(net_avail, eq_cap)
 

@@ -11,7 +11,7 @@ from app.config.loader import load_config
 from app.data.alpaca_quote_store import resolve_quote_for_timestamp
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
 from app.market.filters import market_filter_decision
-from app.portfolio.sizing import compute_qty_with_guards
+from app.portfolio.sizing import compute_qty_with_guards, estimate_slot_target_from_stats
 from app.replay.daily_strategy_replay import run_replay
 from app.utils.time import ensure_et, iter_trading_days, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
@@ -176,6 +176,11 @@ def _apply_portfolio_sizing(
     )
     quote_debug = bool(params.get("backtest_quote_debug", False))
     quote_debug_max_logs = max(0, _safe_int(params.get("backtest_quote_debug_max_logs"), default=40))
+    slot_distribution_enabled = bool(params.get("slot_distribution_enabled", False))
+    watch_cfg = cfg.get("watchlist") or {}
+    slot_lookback_days = float(watch_cfg.get("lookback_days") or 252)
+    slot_min_slots = int(params.get("slot_distribution_min_slots") or 1)
+    slot_max_slots = int(params.get("slot_distribution_max_slots") or 0)
     used_notional = 0.0
     accepted: List = []
     sized_records: List[Dict] = []
@@ -793,16 +798,34 @@ def _apply_portfolio_sizing(
     if not intraday_only:
         # Legacy path for multi-day holds: realized PnL is applied in sequence.
         open_positions = 0
-        for trade in day_trades:
+        for idx, trade in enumerate(day_trades):
             plan = getattr(trade, "plan", None)
             if plan is None:
                 continue
+            slot_target = None
+            if slot_distribution_enabled:
+                stats_rows = []
+                for pending in day_trades[idx:]:
+                    p = getattr(pending, "plan", None)
+                    s = getattr(p, "watchlist_stats", None) if p is not None else None
+                    if isinstance(s, dict):
+                        stats_rows.append(s)
+                target, _ = estimate_slot_target_from_stats(
+                    stats_rows,
+                    slot_lookback_days,
+                    min_slots=slot_min_slots,
+                    max_slots=slot_max_slots,
+                    cap_by_candidates=True,
+                )
+                if target > 0:
+                    slot_target = target
             qty, state = compute_qty_with_guards(
                 plan,
                 equity,
                 used_notional,
                 cfg,
                 open_positions=open_positions,
+                slot_target_override=slot_target,
             )
             if qty <= 0:
                 continue
@@ -877,17 +900,34 @@ def _apply_portfolio_sizing(
                 still_open.append(pos)
         open_positions_state = still_open
 
-    for row in work:
+    for row_idx, row in enumerate(work):
         trade = row["trade"]
         plan = row["plan"]
         entry_dt_obj = row["entry_dt"]
         _realize_until(entry_dt_obj)
+        slot_target = None
+        if slot_distribution_enabled:
+            stats_rows = []
+            for pending in work[row_idx:]:
+                s = getattr(pending.get("plan"), "watchlist_stats", None)
+                if isinstance(s, dict):
+                    stats_rows.append(s)
+            target, _ = estimate_slot_target_from_stats(
+                stats_rows,
+                slot_lookback_days,
+                min_slots=slot_min_slots,
+                max_slots=slot_max_slots,
+                cap_by_candidates=True,
+            )
+            if target > 0:
+                slot_target = target
         qty, state = compute_qty_with_guards(
             plan,
             equity,
             used_notional,
             cfg,
             open_positions=len(open_positions_state),
+            slot_target_override=slot_target,
         )
         if qty <= 0:
             continue

@@ -26,7 +26,7 @@
     "leverage": 4.0,
     "max_margin_usage": 1.0,
     "margin_safety_buffer": 0.05,
-    "per_trade_max_pct_available": 1.0,
+    "per_trade_max_pct_available": 0.7,
     "equal_split_across_max_slots": false,
     "slot_distribution_enabled": false,
     "slot_distribution_min_slots": 2,

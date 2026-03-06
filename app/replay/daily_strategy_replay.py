@@ -14,6 +14,7 @@ from app.strategies.daily_trend_reversal import build_trade, generate_signal_for
 from app.strategies.types import TradeResult
 from app.utils.time import iter_trading_days, parse_time_hhmm
 from app.watchlist.day_filter import day_filter_decision
+from app.watchlist.prioritization import sort_symbols_by_watchlist_priority
 from app.watchlist.storage import read_watchlist
 
 _DEFAULT_RUN_ID: Optional[str] = None
@@ -168,6 +169,7 @@ def run_replay(
                 continue
             symbol_watchlist_stats[sym] = _watchlist_stats_from_row(row, idx)
         symbols = list(symbol_entry_time.keys())
+        symbols = sort_symbols_by_watchlist_priority(symbols, symbol_watchlist_stats)
         day_trades = 0
         skip_counts = {
             "no_signal": 0,

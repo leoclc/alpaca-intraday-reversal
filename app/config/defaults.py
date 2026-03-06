@@ -29,6 +29,14 @@ DEFAULT_CONFIG: dict = {
         "margin_safety_buffer": 0.25,
         "per_trade_max_pct_available": 0.25,
         "equal_split_across_max_slots": False,
+        # Optional dynamic slot distribution: split capital across expected trade count
+        # estimated from watchlist trades_count / watchlist.lookback_days.
+        "slot_distribution_enabled": False,
+        "slot_distribution_min_slots": 1,
+        # If > 0, cap dynamic slots at this value.
+        "slot_distribution_max_slots": 0,
+        # Fallback when enabled but expected slots can't be estimated from stats.
+        "slot_distribution_default_slots": 0,
         "min_available_funds_abs": 0.0,
         "min_available_funds_ratio_of_netliq": 0.0,
         "starting_equity": 30000.0,

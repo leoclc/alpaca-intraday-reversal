@@ -26,7 +26,7 @@
     "leverage": 4.0,
     "max_margin_usage": 1.0,
     "margin_safety_buffer": 0.05,
-    "per_trade_max_pct_available": 1.0,
+    "per_trade_max_pct_available": 0.8,
     "equal_split_across_max_slots": false,
     "slot_distribution_enabled": false,
     "slot_distribution_min_slots": 2,
@@ -127,7 +127,7 @@
     "quality_sizing_stop_flip_share_cap": 0.6,
     "quality_sizing_positive_month_rate_floor": 0.45,
     "quality_sizing_positive_month_rate_cap": 0.8,
-    "quality_sizing_reserve_capacity": true,
+    "quality_sizing_reserve_capacity": false,
     "position_close_report_enabled": true,
     "position_close_poll_interval_sec": 20
   },
