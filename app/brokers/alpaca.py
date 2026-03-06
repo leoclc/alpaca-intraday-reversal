@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import requests
 from typing import Any, Dict, Optional
 
@@ -58,24 +59,47 @@ class AlpacaBroker:
         def _min_tick(base: float) -> float:
             return 0.01 if base >= 1 else 0.0001
 
+        def _sanitize_bracket_prices(base: float, tp_in: float, sl_in: float) -> tuple[float, float]:
+            tick = _min_tick(base)
+            tp = float(tp_in)
+            sl = float(sl_in)
+            if str(side).lower() == "buy":
+                if tp < base + tick:
+                    tp = base + tick
+                if sl > base - tick:
+                    sl = base - tick
+            else:
+                if tp > base - tick:
+                    tp = base - tick
+                if sl < base + tick:
+                    sl = base + tick
+            return _round_price(tp), _round_price(sl)
+
+        def _extract_base_price_from_422(resp: requests.Response) -> Optional[float]:
+            try:
+                payload = resp.json() if resp is not None else {}
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("base_price") is not None:
+                try:
+                    return float(payload.get("base_price"))
+                except Exception:
+                    pass
+            message = str(payload.get("message") or "")
+            m = re.search(r"base_price\s*([0-9]+(?:\.[0-9]+)?)", message)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    return None
+            return None
+
         if base_price is None:
             base_price = float(entry_price) if entry_price is not None else float(take_profit)
         base_price = float(base_price)
-        tick = _min_tick(base_price)
-        tp = float(take_profit)
-        sl = float(stop_loss)
-        if str(side).lower() == "buy":
-            if tp < base_price + tick:
-                tp = base_price + tick
-            if sl > base_price - tick:
-                sl = base_price - tick
-        else:
-            if tp > base_price - tick:
-                tp = base_price - tick
-            if sl < base_price + tick:
-                sl = base_price + tick
-        tp = _round_price(tp)
-        sl = _round_price(sl)
+        tp, sl = _sanitize_bracket_prices(base_price, float(take_profit), float(stop_loss))
 
         payload: Dict[str, Any] = {
             "symbol": symbol,
@@ -91,7 +115,19 @@ class AlpacaBroker:
             if entry_price is None:
                 raise ValueError("limit order requires entry_price")
             payload["limit_price"] = _round_price(entry_price)
-        return self.submit_order(payload)
+        try:
+            return self.submit_order(payload)
+        except requests.HTTPError as exc:
+            resp = getattr(exc, "response", None)
+            if resp is None or int(getattr(resp, "status_code", 0)) != 422:
+                raise
+            retry_base = _extract_base_price_from_422(resp)
+            if retry_base is None or retry_base <= 0:
+                raise
+            tp_retry, sl_retry = _sanitize_bracket_prices(retry_base, float(take_profit), float(stop_loss))
+            payload["take_profit"] = {"limit_price": tp_retry}
+            payload["stop_loss"] = {"stop_price": sl_retry}
+            return self.submit_order(payload)
 
     def list_positions(self) -> Dict[str, Any]:
         if not self.ready():

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.brokers.alpaca import AlpacaBroker
 from app.config.loader import load_config
@@ -13,10 +13,11 @@ from app.data.alpaca_intraday_store import (
     get_latest_intraday_prices,
 )
 from app.market.filters import market_filter_decision
-from app.portfolio.sizing import compute_qty_with_guards
+from app.portfolio.sizing import compute_qty_with_guards, estimate_slot_target_from_stats
 from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
 from app.utils.time import ensure_et, et_now, parse_time_hhmm
 from app.watchlist.day_filter import day_filter_decision
+from app.watchlist.prioritization import sort_symbols_by_watchlist_priority
 from app.watchlist.storage import expected_watchlist_date_str, read_watchlist
 
 
@@ -37,6 +38,52 @@ def _merged_symbol_params(cfg: Dict, overrides: Optional[Dict]) -> Dict:
     if isinstance(overrides, dict) and overrides:
         params.update(overrides)
     return params
+
+
+def _estimate_slot_target_for_live_pass(
+    cfg: Dict,
+    wl_rows: List[Dict],
+    symbols: List[str],
+    entry_time_et: Optional[str],
+    scan_first_valid_mode: bool,
+) -> tuple[Optional[int], Dict]:
+    params = cfg.get("daily_trend_reversal") or {}
+    if not bool(params.get("slot_distribution_enabled", False)):
+        return None, {"enabled": False}
+    watch_cfg = cfg.get("watchlist") or {}
+    lookback_days = float(watch_cfg.get("lookback_days") or 252)
+    slot_min_slots = int(params.get("slot_distribution_min_slots") or 1)
+    slot_max_slots = int(params.get("slot_distribution_max_slots") or 0)
+    symbols_set = {str(s or "").upper() for s in (symbols or []) if s}
+    current_et = str(entry_time_et or "").strip()
+    rows_eligible: List[Dict] = []
+    for row in wl_rows or []:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        if not sym or sym not in symbols_set:
+            continue
+        if scan_first_valid_mode and current_et:
+            row_et = str(row.get("entry_time_et") or "").strip()
+            if row_et:
+                try:
+                    if parse_time_hhmm(row_et) > parse_time_hhmm(current_et):
+                        continue
+                except Exception:
+                    pass
+        rows_eligible.append(row)
+    slot_target, meta = estimate_slot_target_from_stats(
+        rows_eligible,
+        lookback_days,
+        min_slots=slot_min_slots,
+        max_slots=slot_max_slots,
+        cap_by_candidates=True,
+    )
+    meta = dict(meta or {})
+    meta["enabled"] = True
+    meta["eligible_symbols"] = len(rows_eligible)
+    meta["entry_time_et"] = current_et or None
+    return (slot_target if slot_target > 0 else None), meta
 
 
 def _intraday_minutes_needed(params: Dict, entry_time_et: str) -> int:
@@ -107,7 +154,149 @@ def _entry_cutoff_time(params: Dict, entry_time_et: str) -> str:
     return entry_time_et
 
 
-def _compute_qty(cfg: Dict, plan, broker: AlpacaBroker) -> tuple[int, Dict, float, float, int]:
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _account_buying_power(acct: Optional[Dict[str, Any]]) -> tuple[float, bool]:
+    if not isinstance(acct, dict):
+        return 0.0, False
+    for key in ("buying_power", "daytrading_buying_power", "regt_buying_power"):
+        if key not in acct or acct.get(key) is None:
+            continue
+        try:
+            return max(0.0, float(acct.get(key) or 0.0)), True
+        except Exception:
+            continue
+    return 0.0, False
+
+
+def _seed_runtime_exposure(
+    cfg: Dict,
+    broker: AlpacaBroker,
+    *,
+    emit_debug: bool = True,
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[int], Optional[float], bool]:
+    params = cfg.get("daily_trend_reversal") or {}
+    if not broker.ready():
+        return None, None, None, None, None, False
+    try:
+        acct = broker.get_account() or {}
+        equity_seed = _safe_float(acct.get("equity"), 0.0)
+        leverage_cfg = params.get("leverage")
+        try:
+            leverage = float(leverage_cfg) if leverage_cfg is not None else _safe_float(acct.get("multiplier"), 4.0)
+        except Exception:
+            leverage = 4.0
+        buying_power, bp_present = _account_buying_power(acct)
+        max_margin_usage = float(params.get("max_margin_usage") or 0.70)
+        allowed_total_seed = max(0.0, equity_seed * leverage)
+        if bp_present:
+            allowed_total_seed = min(allowed_total_seed, buying_power)
+        allowed_total_seed *= max(0.0, min(max_margin_usage, 1.0))
+
+        used_positions = 0.0
+        positions = broker.list_positions() or []
+        for pos in positions:
+            used_positions += abs(_safe_float(pos.get("market_value"), 0.0))
+        open_order_notional, open_order_count = _estimate_open_entry_order_exposure(cfg, broker)
+        used_notional_runtime = used_positions + open_order_notional
+        open_positions_runtime = len(positions) + open_order_count
+        if emit_debug:
+            logging.info(
+                "[LIVE_DEBUG] exposure_seed equity=%.2f allowed_total=%.2f used_positions=%.2f used_open_orders=%.2f used_total=%.2f open_positions=%s open_entry_orders=%s buying_power=%.2f bp_present=%s",
+                equity_seed,
+                allowed_total_seed,
+                used_positions,
+                open_order_notional,
+                used_notional_runtime,
+                len(positions),
+                open_order_count,
+                buying_power,
+                bp_present,
+            )
+        return (
+            equity_seed,
+            allowed_total_seed,
+            used_notional_runtime,
+            open_positions_runtime,
+            buying_power,
+            bp_present,
+        )
+    except Exception as exc:
+        if emit_debug:
+            logging.info("[LIVE_DEBUG] exposure_seed_failed error=%s", exc)
+        return None, None, None, None, None, False
+
+
+def _estimate_open_entry_order_exposure(cfg: Dict, broker: AlpacaBroker) -> tuple[float, int]:
+    if not broker.ready():
+        return 0.0, 0
+    try:
+        orders = broker.list_orders(status="open", limit=500) or []
+    except Exception:
+        return 0.0, 0
+    unresolved: List[tuple[str, float, float]] = []
+    symbols_needing_px: List[str] = []
+    exposure = 0.0
+    count = 0
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        position_intent = str(order.get("position_intent") or "").strip().lower()
+        if "open" not in position_intent or "close" in position_intent:
+            continue
+        qty_total = _safe_float(order.get("qty"), 0.0)
+        filled_qty = _safe_float(order.get("filled_qty"), 0.0)
+        remaining_qty = max(0.0, qty_total - filled_qty)
+        if remaining_qty <= 0:
+            continue
+        notional = _safe_float(order.get("notional"), 0.0)
+        if notional > 0:
+            exposure += abs(notional)
+            count += 1
+            continue
+        limit_price = _safe_float(order.get("limit_price"), 0.0)
+        if limit_price > 0:
+            exposure += remaining_qty * limit_price
+            count += 1
+            continue
+        symbol = str(order.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        stop_price = _safe_float(order.get("stop_price"), 0.0)
+        unresolved.append((symbol, remaining_qty, stop_price))
+        symbols_needing_px.append(symbol)
+    px_map: Dict[str, float] = {}
+    if symbols_needing_px:
+        try:
+            px_map = get_latest_intraday_prices(sorted(set(symbols_needing_px)), cfg=cfg, lookback_minutes=5)
+        except Exception:
+            px_map = {}
+    for symbol, remaining_qty, stop_price in unresolved:
+        px = _safe_float(px_map.get(symbol), 0.0)
+        if px <= 0 and stop_price > 0:
+            px = stop_price
+        if px > 0:
+            exposure += remaining_qty * px
+            count += 1
+    return exposure, count
+
+
+def _compute_qty(
+    cfg: Dict,
+    plan,
+    broker: AlpacaBroker,
+    *,
+    slot_target: Optional[int] = None,
+    equity_override: Optional[float] = None,
+    allowed_total_override: Optional[float] = None,
+    used_notional_override: Optional[float] = None,
+    open_positions_override: Optional[int] = None,
+) -> tuple[int, Dict, float, float, int]:
     params = cfg.get("daily_trend_reversal") or {}
     fixed_qty = params.get("fixed_qty")
     if fixed_qty:
@@ -115,42 +304,57 @@ def _compute_qty(cfg: Dict, plan, broker: AlpacaBroker) -> tuple[int, Dict, floa
     risk_per_trade = float(params.get("risk_per_trade") or 0.0)
     if risk_per_trade <= 0:
         return 1, {"risk_per_trade": risk_per_trade}, 0.0, 0.0, 0
-    acct = broker.get_account() if broker.ready() else None
-    if not acct:
-        return 1, {"account": "missing"}, 0.0, 0.0, 0
-    try:
-        equity = float(acct.get("equity") or 0.0)
-    except Exception:
-        return 1, {"equity": "parse_error"}, 0.0, 0.0, 0
+    acct = None
+    if equity_override is None or allowed_total_override is None:
+        acct = broker.get_account() if broker.ready() else None
+        if not acct:
+            return 1, {"account": "missing"}, 0.0, 0.0, 0
+    if equity_override is not None:
+        equity = _safe_float(equity_override, 0.0)
+    else:
+        try:
+            equity = float((acct or {}).get("equity") or 0.0)
+        except Exception:
+            return 1, {"equity": "parse_error"}, 0.0, 0.0, 0
 
     leverage_cfg = params.get("leverage")
     max_margin_usage = float(params.get("max_margin_usage") or 0.70)
-    try:
-        leverage = float(leverage_cfg) if leverage_cfg is not None else float(acct.get("multiplier") or 4.0)
-    except Exception:
-        leverage = 4.0
-    try:
-        buying_power = float(acct.get("buying_power") or 0.0)
-    except Exception:
-        buying_power = 0.0
-    allowed_total = max(0.0, equity * leverage)
-    if buying_power > 0:
-        allowed_total = min(allowed_total, buying_power)
-    allowed_total *= max(0.0, min(max_margin_usage, 1.0))
+    if allowed_total_override is not None:
+        allowed_total = max(0.0, _safe_float(allowed_total_override, 0.0))
+    else:
+        try:
+            leverage = float(leverage_cfg) if leverage_cfg is not None else float((acct or {}).get("multiplier") or 4.0)
+        except Exception:
+            leverage = 4.0
+        try:
+            buying_power = float((acct or {}).get("buying_power") or 0.0)
+        except Exception:
+            buying_power = 0.0
+        allowed_total = max(0.0, equity * leverage)
+        if buying_power > 0:
+            allowed_total = min(allowed_total, buying_power)
+        allowed_total *= max(0.0, min(max_margin_usage, 1.0))
 
-    used_notional = 0.0
-    positions = []
-    try:
-        positions = broker.list_positions() or []
-        for pos in positions:
-            try:
-                mv = float(pos.get("market_value") or 0.0)
-            except Exception:
-                mv = 0.0
-            used_notional += abs(mv)
-    except Exception:
+    if used_notional_override is not None:
+        used_notional = max(0.0, _safe_float(used_notional_override, 0.0))
+        open_positions = max(0, int(open_positions_override or 0))
+    else:
         used_notional = 0.0
         positions = []
+        try:
+            positions = broker.list_positions() or []
+            for pos in positions:
+                try:
+                    mv = float(pos.get("market_value") or 0.0)
+                except Exception:
+                    mv = 0.0
+                used_notional += abs(mv)
+        except Exception:
+            used_notional = 0.0
+            positions = []
+        open_positions = len(positions)
+    if open_positions_override is not None:
+        open_positions = max(0, int(open_positions_override))
 
     qty, state = compute_qty_with_guards(
         plan,
@@ -158,9 +362,10 @@ def _compute_qty(cfg: Dict, plan, broker: AlpacaBroker) -> tuple[int, Dict, floa
         used_notional,
         cfg,
         allowed_total_override=allowed_total,
-        open_positions=len(positions),
+        open_positions=open_positions,
+        slot_target_override=slot_target,
     )
-    return qty, state, allowed_total, used_notional, len(positions)
+    return qty, state, allowed_total, used_notional, open_positions
 
 
 def flatten_intraday_positions_if_needed(cfg: Dict, broker: AlpacaBroker) -> List[Dict]:
@@ -349,6 +554,28 @@ def run_live(
         symbol_watchlist_stats[sym] = _watchlist_stats_from_row(row, idx)
     if symbols_allow is not None:
         symbols = [s for s in symbols if s in symbols_allow]
+    symbols = sort_symbols_by_watchlist_priority(symbols, symbol_watchlist_stats)
+    if debug and symbols:
+        preview = []
+        for s in symbols[:12]:
+            st = symbol_watchlist_stats.get(s) or {}
+            preview.append(
+                {
+                    "symbol": s,
+                    "rank": st.get("rank"),
+                    "selection_score": st.get("selection_score"),
+                    "avgR": st.get("avgR"),
+                    "trades_count": st.get("trades_count"),
+                }
+            )
+        _log_debug("execution_priority_top=%s", preview)
+    slot_target, slot_meta = _estimate_slot_target_for_live_pass(
+        cfg,
+        wl_rows,
+        symbols,
+        entry_time_et,
+        scan_first_valid_mode,
+    )
     entry_type = str(params.get("entry_order_type") or "market").lower()
     tif = str(params.get("order_tif") or "day").lower()
     use_brackets = bool(params.get("use_brackets", True))
@@ -362,10 +589,31 @@ def run_live(
         params.get("time_stop_minutes"),
         entry_time_et,
     )
+    _log_debug(
+        "slot_distribution enabled=%s slot_target=%s meta=%s",
+        bool((cfg.get("daily_trend_reversal") or {}).get("slot_distribution_enabled", False)),
+        slot_target,
+        slot_meta,
+    )
     if not symbols:
         logging.warning("[LIVE] no watchlist entries for date=%s", tgt)
         return ([], []) if return_plans else []
     broker = AlpacaBroker(cfg)
+    equity_seed: Optional[float] = None
+    allowed_total_seed: Optional[float] = None
+    used_notional_runtime: Optional[float] = None
+    open_positions_runtime: Optional[int] = None
+    live_buying_power: Optional[float] = None
+    live_buying_power_present = False
+    if broker.ready():
+        (
+            equity_seed,
+            allowed_total_seed,
+            used_notional_runtime,
+            open_positions_runtime,
+            live_buying_power,
+            live_buying_power_present,
+        ) = _seed_runtime_exposure(cfg, broker, emit_debug=debug)
     placed: List[Dict] = []
     plans: List = []
     for symbol in symbols:
@@ -479,7 +727,43 @@ def run_live(
             if base_price is None:
                 base_price = plan.entry_price
             _log_debug("symbol=%s base_price=%s", symbol, base_price)
-        qty, state, allowed_total, used_notional, open_positions = _compute_qty(cfg, plan, broker)
+        if broker.ready():
+            try:
+                acct_now = broker.get_account() or {}
+                equity_now = _safe_float(acct_now.get("equity"), 0.0)
+                bp_now, bp_now_present = _account_buying_power(acct_now)
+                if equity_now > 0:
+                    equity_seed = equity_now
+                if bp_now_present:
+                    max_margin_usage = float(params.get("max_margin_usage") or 0.70)
+                    bp_budget = bp_now * max(0.0, min(max_margin_usage, 1.0))
+                    if used_notional_runtime is not None:
+                        allowed_total_seed = max(0.0, used_notional_runtime + bp_budget)
+                    else:
+                        allowed_total_seed = bp_budget
+                    live_buying_power = bp_now
+                    live_buying_power_present = True
+                    _log_debug(
+                        "symbol=%s broker_bp_snapshot equity=%.2f buying_power=%.2f bp_budget=%.2f allowed_total_seed=%.2f used_notional_runtime=%s",
+                        symbol,
+                        equity_seed or 0.0,
+                        bp_now,
+                        bp_budget,
+                        allowed_total_seed or 0.0,
+                        used_notional_runtime,
+                    )
+            except Exception as exc:
+                _log_debug("symbol=%s broker_bp_snapshot_failed error=%s", symbol, exc)
+        qty, state, allowed_total, used_notional, open_positions = _compute_qty(
+            cfg,
+            plan,
+            broker,
+            slot_target=slot_target,
+            equity_override=equity_seed,
+            allowed_total_override=allowed_total_seed,
+            used_notional_override=used_notional_runtime,
+            open_positions_override=open_positions_runtime,
+        )
         _log_debug(
             "symbol=%s qty=%s allowed_total=%.2f used_notional=%.2f open_positions=%s state=%s",
             symbol,
@@ -489,6 +773,27 @@ def run_live(
             open_positions,
             state,
         )
+        if qty > 0 and live_buying_power_present:
+            ref_px = _safe_float(base_price, 0.0) if entry_type == "market" else _safe_float(plan.entry_price, 0.0)
+            if ref_px > 0:
+                bp_buffer = float(params.get("live_buying_power_buffer") or params.get("margin_safety_buffer") or 0.0)
+                bp_buffer = max(0.0, min(bp_buffer, 0.5))
+                bp_budget = max(0.0, (live_buying_power or 0.0) * (1.0 - bp_buffer))
+                bp_qty_cap = int(bp_budget // ref_px) if bp_budget > 0 else 0
+                if bp_qty_cap < qty:
+                    _log_debug(
+                        "symbol=%s qty_capped_by_broker_bp qty=%s cap=%s buying_power=%.2f bp_buffer=%.3f ref_px=%.4f",
+                        symbol,
+                        qty,
+                        bp_qty_cap,
+                        live_buying_power or 0.0,
+                        bp_buffer,
+                        ref_px,
+                    )
+                    qty = max(0, bp_qty_cap)
+                    if isinstance(state, dict):
+                        state["broker_buying_power"] = live_buying_power
+                        state["broker_bp_qty_cap"] = bp_qty_cap
         if qty <= 0:
             continue
         if not broker.ready():
@@ -522,14 +827,56 @@ def run_live(
             placed.append(resp)
             logging.info("[LIVE] order placed symbol=%s side=%s qty=%s", symbol, side, qty)
             _log_debug("symbol=%s order_response=%s", symbol, resp)
+            if used_notional_runtime is not None and open_positions_runtime is not None:
+                reserve_qty = int((state or {}).get("capacity_qty") or qty)
+                reserve_px = 0.0
+                if entry_type == "market":
+                    reserve_px = _safe_float(base_price, 0.0)
+                if reserve_px <= 0:
+                    reserve_px = _safe_float(getattr(plan, "entry_price", 0.0), 0.0)
+                reserve_notional = max(0.0, reserve_qty * reserve_px)
+                used_notional_runtime += reserve_notional
+                open_positions_runtime += 1
+                _log_debug(
+                    "symbol=%s reserve_notional=%.2f reserve_qty=%s reserve_px=%.4f used_notional_runtime=%.2f open_positions_runtime=%s",
+                    symbol,
+                    reserve_notional,
+                    reserve_qty,
+                    reserve_px,
+                    used_notional_runtime,
+                    open_positions_runtime,
+                )
         except Exception as exc:
             logging.error("[LIVE] order failed symbol=%s error=%s", symbol, exc)
             resp = getattr(exc, "response", None)
+            status_code = None
+            body_text = ""
             if resp is not None:
                 try:
+                    status_code = resp.status_code
+                    body_text = str(resp.text or "")
                     logging.error("[LIVE] order failed symbol=%s status=%s body=%s", symbol, resp.status_code, resp.text)
                 except Exception:
                     pass
+            if status_code in (403, 422) and "buying power" in body_text.lower():
+                (
+                    equity_seed,
+                    allowed_total_seed,
+                    used_notional_runtime,
+                    open_positions_runtime,
+                    live_buying_power,
+                    live_buying_power_present,
+                ) = _seed_runtime_exposure(cfg, broker, emit_debug=False)
+                _log_debug(
+                    "symbol=%s exposure_resync_after_bp_reject equity=%.2f allowed_total=%.2f used_notional=%.2f open_positions=%s buying_power=%.2f bp_present=%s",
+                    symbol,
+                    equity_seed or 0.0,
+                    allowed_total_seed or 0.0,
+                    used_notional_runtime or 0.0,
+                    open_positions_runtime or 0,
+                    live_buying_power or 0.0,
+                    live_buying_power_present,
+                )
     flatten_intraday_positions_if_needed(cfg, broker)
     return (placed, plans) if return_plans else placed
 
