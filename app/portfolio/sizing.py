@@ -283,6 +283,11 @@ def compute_qty_with_guards(
     slot_default_slots = max(0, int(params.get("slot_distribution_default_slots") or 0))
     sizing_stop_pct_floor = max(0.0, float(params.get("sizing_stop_pct_floor") or 0.0))
     sizing_stop_abs_floor = max(0.0, float(params.get("sizing_stop_abs_floor") or 0.0))
+    equity_taper_enabled = bool(params.get("equity_risk_taper_enabled", False))
+    equity_taper_start_mult = max(0.0, float(params.get("equity_risk_taper_start_mult") or 0.0))
+    equity_taper_full_mult = max(equity_taper_start_mult, float(params.get("equity_risk_taper_full_mult") or 0.0))
+    equity_taper_max_reduction = max(0.0, min(1.0, float(params.get("equity_risk_taper_max_reduction") or 0.0)))
+    starting_equity_cfg = max(0.0, float(params.get("starting_equity") or 0.0))
 
     slot_target = 0
     if slot_distribution_enabled:
@@ -324,6 +329,11 @@ def compute_qty_with_guards(
         "open_positions": open_positions,
         "sizing_stop_pct_floor": sizing_stop_pct_floor,
         "sizing_stop_abs_floor": sizing_stop_abs_floor,
+        "equity_risk_taper_enabled": equity_taper_enabled,
+        "equity_risk_taper_start_mult": equity_taper_start_mult,
+        "equity_risk_taper_full_mult": equity_taper_full_mult,
+        "equity_risk_taper_max_reduction": equity_taper_max_reduction,
+        "starting_equity_cfg": starting_equity_cfg,
     }
 
     if effective_max_positions > 0 and open_positions >= effective_max_positions:
@@ -358,6 +368,34 @@ def compute_qty_with_guards(
     risk_amt_base = max(0.0, equity * risk_per_trade)
     risk_amt = risk_amt_base
     state["risk_amount_base"] = risk_amt_base
+    state["risk_amount_equity_taper_scale"] = 1.0
+    state["equity_risk_taper_progress"] = 0.0
+    state["equity_risk_taper_start_equity"] = None
+    state["equity_risk_taper_full_equity"] = None
+    if (
+        equity_taper_enabled
+        and equity_taper_max_reduction > 0.0
+        and starting_equity_cfg > 0.0
+        and equity_taper_start_mult > 0.0
+    ):
+        taper_start_equity = starting_equity_cfg * equity_taper_start_mult
+        taper_full_equity = starting_equity_cfg * max(equity_taper_full_mult, equity_taper_start_mult)
+        state["equity_risk_taper_start_equity"] = taper_start_equity
+        state["equity_risk_taper_full_equity"] = taper_full_equity
+        taper_progress = 0.0
+        if equity > taper_start_equity:
+            if taper_full_equity <= taper_start_equity:
+                taper_progress = 1.0
+            else:
+                taper_progress = _clamp(
+                    (equity - taper_start_equity) / (taper_full_equity - taper_start_equity),
+                    0.0,
+                    1.0,
+                )
+        taper_scale = max(0.0, 1.0 - (equity_taper_max_reduction * taper_progress))
+        risk_amt *= taper_scale
+        state["equity_risk_taper_progress"] = taper_progress
+        state["risk_amount_equity_taper_scale"] = taper_scale
     state["risk_amount_daily_scale"] = 1.0
     state["daily_drawdown_pct"] = 0.0
     dd_scale_enabled = bool(params.get("daily_drawdown_risk_scale_enabled", False))
