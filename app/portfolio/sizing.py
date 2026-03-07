@@ -154,11 +154,6 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
             w_worst_month = 0.0
         if w_stop_no_progress < 0:
             w_stop_no_progress = 0.0
-        w_sum = w_avg + w_pf + w_wr + w_n + w_stop + w_stop_flip + w_month + w_stdr + w_worst_month + w_stop_no_progress
-        if w_sum <= 0:
-            w_avg, w_pf, w_wr, w_n = 0.5, 0.2, 0.2, 0.1
-            w_stop, w_stop_flip, w_month, w_stdr, w_worst_month, w_stop_no_progress = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-            w_sum = 1.0
 
         avg_r = _safe_float_opt(stats.get("avgR"))
         avg_r_stderr = _safe_float_opt(stats.get("avgR_stderr"))
@@ -167,9 +162,11 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
         trades_count = _safe_float_opt(stats.get("trades_count"))
         stop_rate = _safe_float_opt(stats.get("stop_rate"))
         stop_flip_share = _safe_float_opt(stats.get("stop_flip_share_050"))
+        stop_flip_share_100 = _safe_float_opt(stats.get("stop_flip_share_100"))
         positive_month_rate = _safe_float_opt(stats.get("positive_month_rate"))
         std_r = _safe_float_opt(stats.get("stdR"))
         worst_month_pnl_pct = _safe_float_opt(stats.get("worst_month_pnl_pct"))
+        max_monthly_drawdown_pct = _safe_float_opt(stats.get("max_monthly_drawdown_pct"))
         stop_no_progress_share = _safe_float_opt(stats.get("stop_no_progress_share"))
 
         avg_eff = avg_r
@@ -189,10 +186,42 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
         score_n = _score(trades_count, 0.0, float(trades_ref))
         score_stop = 1.0 - _score(stop_rate, stop_rate_floor, stop_rate_cap)
         score_stop_flip = 1.0 - _score(stop_flip_share, stop_flip_floor, stop_flip_cap)
+        stop_flip_100_floor = float(params.get("quality_sizing_stop_flip_share_100_floor") or stop_flip_floor)
+        stop_flip_100_cap = float(params.get("quality_sizing_stop_flip_share_100_cap") or max(stop_flip_cap, stop_flip_100_floor))
+        score_stop_flip_100 = 1.0 - _score(stop_flip_share_100, stop_flip_100_floor, stop_flip_100_cap)
         score_month = _score(positive_month_rate, positive_month_floor, positive_month_cap)
         score_stdr = 1.0 - _score(std_r, stdr_floor, stdr_cap)
         score_worst_month = _score(worst_month_pnl_pct, worst_month_floor, worst_month_cap)
+        max_mdd_floor = float(params.get("quality_sizing_max_monthly_drawdown_pct_floor") or 2.0)
+        max_mdd_cap = float(params.get("quality_sizing_max_monthly_drawdown_pct_cap") or 12.0)
+        score_max_monthly_drawdown = 1.0 - _score(max_monthly_drawdown_pct, max_mdd_floor, max_mdd_cap)
         score_stop_no_progress = 1.0 - _score(stop_no_progress_share, stop_no_progress_floor, stop_no_progress_cap)
+
+        w_stop_flip_100 = float(params.get("quality_sizing_weight_stop_flip_share_100") or 0.0)
+        w_max_monthly_drawdown = float(params.get("quality_sizing_weight_max_monthly_drawdown_pct") or 0.0)
+        if w_stop_flip_100 < 0:
+            w_stop_flip_100 = 0.0
+        if w_max_monthly_drawdown < 0:
+            w_max_monthly_drawdown = 0.0
+        w_sum = (
+            w_avg
+            + w_pf
+            + w_wr
+            + w_n
+            + w_stop
+            + w_stop_flip
+            + w_stop_flip_100
+            + w_month
+            + w_stdr
+            + w_worst_month
+            + w_max_monthly_drawdown
+            + w_stop_no_progress
+        )
+        if w_sum <= 0:
+            w_avg, w_pf, w_wr, w_n = 0.5, 0.2, 0.2, 0.1
+            w_stop, w_stop_flip, w_stop_flip_100, w_month = 0.0, 0.0, 0.0, 0.0
+            w_stdr, w_worst_month, w_max_monthly_drawdown, w_stop_no_progress = 0.0, 0.0, 0.0, 0.0
+            w_sum = 1.0
 
         score = (
             (w_avg * score_avg)
@@ -201,9 +230,11 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
             + (w_n * score_n)
             + (w_stop * score_stop)
             + (w_stop_flip * score_stop_flip)
+            + (w_stop_flip_100 * score_stop_flip_100)
             + (w_month * score_month)
             + (w_stdr * score_stdr)
             + (w_worst_month * score_worst_month)
+            + (w_max_monthly_drawdown * score_max_monthly_drawdown)
             + (w_stop_no_progress * score_stop_no_progress)
         ) / w_sum
         risk_multiplier = _clamp(min_mult + (max_mult - min_mult) * score, min_mult, max_mult)
@@ -220,9 +251,11 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
                 "trades_count": trades_count,
                 "stop_rate": stop_rate,
                 "stop_flip_share_050": stop_flip_share,
+                "stop_flip_share_100": stop_flip_share_100,
                 "positive_month_rate": positive_month_rate,
                 "stdR": std_r,
                 "worst_month_pnl_pct": worst_month_pnl_pct,
+                "max_monthly_drawdown_pct": max_monthly_drawdown_pct,
                 "stop_no_progress_share": stop_no_progress_share,
                 "score_avg": score_avg,
                 "score_pf": score_pf,
@@ -230,9 +263,11 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
                 "score_trades": score_n,
                 "score_stop_rate": score_stop,
                 "score_stop_flip_share": score_stop_flip,
+                "score_stop_flip_share_100": score_stop_flip_100,
                 "score_positive_month_rate": score_month,
                 "score_stdR": score_stdr,
                 "score_worst_month_pnl_pct": score_worst_month,
+                "score_max_monthly_drawdown_pct": score_max_monthly_drawdown,
                 "score_stop_no_progress_share": score_stop_no_progress,
                 "score": score,
                 "risk_multiplier": risk_multiplier,
@@ -244,9 +279,11 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
                 "weight_trades": w_n,
                 "weight_stop_rate": w_stop,
                 "weight_stop_flip_share": w_stop_flip,
+                "weight_stop_flip_share_100": w_stop_flip_100,
                 "weight_positive_month_rate": w_month,
                 "weight_stdR": w_stdr,
                 "weight_worst_month_pnl_pct": w_worst_month,
+                "weight_max_monthly_drawdown_pct": w_max_monthly_drawdown,
                 "weight_stop_no_progress_share": w_stop_no_progress,
             }
         )
@@ -283,6 +320,9 @@ def compute_qty_with_guards(
     slot_default_slots = max(0, int(params.get("slot_distribution_default_slots") or 0))
     sizing_stop_pct_floor = max(0.0, float(params.get("sizing_stop_pct_floor") or 0.0))
     sizing_stop_abs_floor = max(0.0, float(params.get("sizing_stop_abs_floor") or 0.0))
+    tight_stop_exposure_cap_enabled = bool(params.get("tight_stop_exposure_cap_enabled", False))
+    tight_stop_exposure_full_stop_pct = max(0.0, float(params.get("tight_stop_exposure_full_stop_pct") or 0.0))
+    tight_stop_exposure_min_factor = _clamp(float(params.get("tight_stop_exposure_min_factor") or 0.0), 0.0, 1.0)
     equity_taper_enabled = bool(params.get("equity_risk_taper_enabled", False))
     equity_taper_start_mult = max(0.0, float(params.get("equity_risk_taper_start_mult") or 0.0))
     equity_taper_full_mult = max(equity_taper_start_mult, float(params.get("equity_risk_taper_full_mult") or 0.0))
@@ -329,6 +369,9 @@ def compute_qty_with_guards(
         "open_positions": open_positions,
         "sizing_stop_pct_floor": sizing_stop_pct_floor,
         "sizing_stop_abs_floor": sizing_stop_abs_floor,
+        "tight_stop_exposure_cap_enabled": tight_stop_exposure_cap_enabled,
+        "tight_stop_exposure_full_stop_pct": tight_stop_exposure_full_stop_pct,
+        "tight_stop_exposure_min_factor": tight_stop_exposure_min_factor,
         "equity_risk_taper_enabled": equity_taper_enabled,
         "equity_risk_taper_start_mult": equity_taper_start_mult,
         "equity_risk_taper_full_mult": equity_taper_full_mult,
@@ -458,6 +501,25 @@ def compute_qty_with_guards(
         state["per_trade_cap"] = per_trade_cap
         capped_avail = min(net_avail, per_trade_cap)
         per_trade_cap_applied = capped_avail < net_avail
+        net_avail = capped_avail
+
+    state["tight_stop_exposure_factor"] = 1.0
+    state["tight_stop_exposure_cap"] = None
+    state["tight_stop_exposure_applied"] = False
+    if tight_stop_exposure_cap_enabled and tight_stop_exposure_full_stop_pct > 0.0:
+        # Tight stops create oversized notional under pure risk sizing; cap exposure until stop% is wide enough.
+        stop_pct_eff = state.get("stop_pct_effective")
+        stop_pct_val = float(stop_pct_eff) if stop_pct_eff is not None else 0.0
+        exposure_factor = _clamp(
+            stop_pct_val / max(1e-9, tight_stop_exposure_full_stop_pct),
+            tight_stop_exposure_min_factor,
+            1.0,
+        )
+        tight_cap = available * (1.0 - msb) * exposure_factor
+        state["tight_stop_exposure_factor"] = exposure_factor
+        state["tight_stop_exposure_cap"] = tight_cap
+        capped_avail = min(net_avail, tight_cap)
+        state["tight_stop_exposure_applied"] = capped_avail < net_avail
         net_avail = capped_avail
 
     state["quality_sizing"] = quality_state
