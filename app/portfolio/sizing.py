@@ -323,6 +323,9 @@ def compute_qty_with_guards(
     tight_stop_exposure_cap_enabled = bool(params.get("tight_stop_exposure_cap_enabled", False))
     tight_stop_exposure_full_stop_pct = max(0.0, float(params.get("tight_stop_exposure_full_stop_pct") or 0.0))
     tight_stop_exposure_min_factor = _clamp(float(params.get("tight_stop_exposure_min_factor") or 0.0), 0.0, 1.0)
+    tight_stop_exposure_apply_if_rank_at_least = int(params.get("tight_stop_exposure_apply_if_rank_at_least") or 0)
+    tight_stop_exposure_apply_if_score_below = _safe_float_opt(params.get("tight_stop_exposure_apply_if_score_below"))
+    tight_stop_exposure_activate_equity_mult = max(0.0, float(params.get("tight_stop_exposure_activate_equity_mult") or 0.0))
     equity_taper_enabled = bool(params.get("equity_risk_taper_enabled", False))
     equity_taper_start_mult = max(0.0, float(params.get("equity_risk_taper_start_mult") or 0.0))
     equity_taper_full_mult = max(equity_taper_start_mult, float(params.get("equity_risk_taper_full_mult") or 0.0))
@@ -372,6 +375,9 @@ def compute_qty_with_guards(
         "tight_stop_exposure_cap_enabled": tight_stop_exposure_cap_enabled,
         "tight_stop_exposure_full_stop_pct": tight_stop_exposure_full_stop_pct,
         "tight_stop_exposure_min_factor": tight_stop_exposure_min_factor,
+        "tight_stop_exposure_apply_if_rank_at_least": tight_stop_exposure_apply_if_rank_at_least,
+        "tight_stop_exposure_apply_if_score_below": tight_stop_exposure_apply_if_score_below,
+        "tight_stop_exposure_activate_equity_mult": tight_stop_exposure_activate_equity_mult,
         "equity_risk_taper_enabled": equity_taper_enabled,
         "equity_risk_taper_start_mult": equity_taper_start_mult,
         "equity_risk_taper_full_mult": equity_taper_full_mult,
@@ -506,21 +512,43 @@ def compute_qty_with_guards(
     state["tight_stop_exposure_factor"] = 1.0
     state["tight_stop_exposure_cap"] = None
     state["tight_stop_exposure_applied"] = False
+    state["tight_stop_exposure_enabled_for_trade"] = True
     if tight_stop_exposure_cap_enabled and tight_stop_exposure_full_stop_pct > 0.0:
-        # Tight stops create oversized notional under pure risk sizing; cap exposure until stop% is wide enough.
-        stop_pct_eff = state.get("stop_pct_effective")
-        stop_pct_val = float(stop_pct_eff) if stop_pct_eff is not None else 0.0
-        exposure_factor = _clamp(
-            stop_pct_val / max(1e-9, tight_stop_exposure_full_stop_pct),
-            tight_stop_exposure_min_factor,
-            1.0,
-        )
-        tight_cap = available * (1.0 - msb) * exposure_factor
-        state["tight_stop_exposure_factor"] = exposure_factor
-        state["tight_stop_exposure_cap"] = tight_cap
-        capped_avail = min(net_avail, tight_cap)
-        state["tight_stop_exposure_applied"] = capped_avail < net_avail
-        net_avail = capped_avail
+        enabled_for_trade = True
+        if tight_stop_exposure_apply_if_rank_at_least > 0:
+            rank_val = quality_state.get("rank")
+            try:
+                rank_num = int(rank_val) if rank_val is not None else None
+            except Exception:
+                rank_num = None
+            if rank_num is None or rank_num < tight_stop_exposure_apply_if_rank_at_least:
+                enabled_for_trade = False
+        if tight_stop_exposure_apply_if_score_below is not None:
+            score_val = _safe_float_opt(quality_state.get("score"))
+            if score_val is None or score_val >= float(tight_stop_exposure_apply_if_score_below):
+                enabled_for_trade = False
+        if tight_stop_exposure_activate_equity_mult > 0.0:
+            base_equity_for_activation = starting_equity_cfg if starting_equity_cfg > 0.0 else equity
+            activation_equity = base_equity_for_activation * tight_stop_exposure_activate_equity_mult
+            state["tight_stop_exposure_activation_equity"] = activation_equity
+            if equity < activation_equity:
+                enabled_for_trade = False
+        state["tight_stop_exposure_enabled_for_trade"] = enabled_for_trade
+        if enabled_for_trade:
+            # Tight stops create oversized notional under pure risk sizing; cap exposure until stop% is wide enough.
+            stop_pct_eff = state.get("stop_pct_effective")
+            stop_pct_val = float(stop_pct_eff) if stop_pct_eff is not None else 0.0
+            exposure_factor = _clamp(
+                stop_pct_val / max(1e-9, tight_stop_exposure_full_stop_pct),
+                tight_stop_exposure_min_factor,
+                1.0,
+            )
+            tight_cap = available * (1.0 - msb) * exposure_factor
+            state["tight_stop_exposure_factor"] = exposure_factor
+            state["tight_stop_exposure_cap"] = tight_cap
+            capped_avail = min(net_avail, tight_cap)
+            state["tight_stop_exposure_applied"] = capped_avail < net_avail
+            net_avail = capped_avail
 
     state["quality_sizing"] = quality_state
     state["quality_qty_multiplier"] = quality_mult
