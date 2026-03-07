@@ -16,6 +16,7 @@ from app.replay.daily_strategy_replay import run_replay
 from app.utils.time import ensure_et, iter_trading_days, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
 from app.watchlist.node_assets import read_asset_universe_snapshot, resolve_asset_universe_symbols
+from app.watchlist.storage import watchlist_path
 
 _FILL_MODEL_LOGGED = False
 _FILL_MODEL_DEBUG_LOGS = 0
@@ -1013,6 +1014,7 @@ def run_backtest(
     skip_count = 0
     skip_reasons: Dict[str, int] = {}
     params = cfg.get("daily_trend_reversal") or {}
+    reuse_existing_watchlists = bool(params.get("backtest_reuse_existing_watchlists", False))
     starting_equity = float(params.get("starting_equity") or 100000.0)
     equity = starting_equity
     run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1087,8 +1089,15 @@ def run_backtest(
                 date_str,
                 len(symbols_for_day),
             )
-        logging.info("[BACKTEST] build watchlist date=%s symbols=%s", date_str, len(symbols_for_day))
-        _ = build_watchlist(cfg, target_date=date_str, symbols=symbols_for_day, data_store=data_store, run_id=run_id)
+        skip_watchlist_build = False
+        if reuse_existing_watchlists:
+            wl_path = watchlist_path(date_str, cfg)
+            if wl_path.exists() and wl_path.stat().st_size > 0:
+                skip_watchlist_build = True
+                logging.info("[BACKTEST] reuse watchlist date=%s path=%s", date_str, wl_path)
+        if not skip_watchlist_build:
+            logging.info("[BACKTEST] build watchlist date=%s symbols=%s", date_str, len(symbols_for_day))
+            _ = build_watchlist(cfg, target_date=date_str, symbols=symbols_for_day, data_store=data_store, run_id=run_id)
         skip, info = market_filter_decision(date_str, cfg, data_store)
         if skip:
             skip_count += 1

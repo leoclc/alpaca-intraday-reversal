@@ -92,6 +92,9 @@ DEFAULT_CONFIG: dict = {
         "entry_order_type": "market",
         "order_tif": "day",
         "use_brackets": True,
+        # If true, backtest reuses existing watchlist files from watchlists_dir when present.
+        # Useful for fast parity/sizing sweeps while keeping the signal set fixed.
+        "backtest_reuse_existing_watchlists": False,
         # Optional floor on stop_distance vs daily ATR (stop_distance / ATR).
         # If 0, disabled.
         "min_stop_atr": 0.0,
