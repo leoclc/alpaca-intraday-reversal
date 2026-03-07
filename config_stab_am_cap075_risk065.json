@@ -1,0 +1,467 @@
+{
+    "strategy":  {
+                     "name":  "daily_trend_reversal"
+                 },
+    "daily_trend_reversal":  {
+                                 "trend_ma_days":  200,
+                                 "reversal_mode":  "atr",
+                                 "reversal_threshold_pct":  2.0,
+                                 "reversal_threshold_atr":  0.08,
+                                 "reversal_lookback_days":  1,
+                                 "reversal_quantile":  0.35,
+                                 "reversal_quantile_lookback_days":  30,
+                                 "entry_time_et":  "09:35",
+                                 "entry_times_et":  [
+                                                        "09:35",
+                                                        "09:36",
+                                                        "09:37",
+                                                        "09:38",
+                                                        "09:39"
+                                                    ],
+                                 "entry_start_et":  "09:35",
+                                 "entry_end_et":  "11:30",
+                                 "session_open_et":  "09:30",
+                                 "max_positions":  0,
+                                 "risk_per_trade":  0.065,
+                                 "leverage":  4.0,
+                                 "max_margin_usage":  1.0,
+                                 "margin_safety_buffer":  0.05,
+                                 "equal_split_across_max_slots":  false,
+                                 "slot_distribution_enabled":  false,
+                                 "slot_distribution_min_slots":  2,
+                                 "slot_distribution_max_slots":  3,
+                                 "slot_distribution_default_slots":  2,
+                                 "min_available_funds_abs":  0.0,
+                                 "min_available_funds_ratio_of_netliq":  0.0,
+                                 "starting_equity":  30000.0,
+                                 "minute_report_enabled":  false,
+                                 "minute_report_interval_sec":  60,
+                                 "minute_report_max_symbols":  20,
+                                 "minute_report_lookback_minutes":  5,
+                                 "live_order_debug":  true,
+                                 "stop_mode":  "target_rr",
+                                 "atr_period":  14,
+                                 "stop_atr_mult":  0.6,
+                                 "stop_pct":  0.3,
+                                 "target_rr":  1.5,
+                                 "stop_r":  1.0,
+                                 "target_r":  1.5,
+                                 "target_mode":  "rr",
+                                 "target_window_minutes":  30,
+                                 "target_window_lookback_days":  20,
+                                 "target_window_mult":  0.8,
+                                 "target_window_min_samples":  5,
+                                 "target_window_min_pct":  0.05,
+                                 "target_window_max_pct":  3.0,
+                                 "min_rr":  1.0,
+                                 "time_exit_days":  2,
+                                 "time_stop_minutes":  30,
+                                 "intraday_only":  true,
+                                 "intraday_filter_enabled":  true,
+                                 "intraday_filter_require_bars":  false,
+                                 "intraday_filter_apply_in_watchlist":  true,
+                                 "confirm_move_bps":  0.0,
+                                 "confirm_minutes":  0,
+                                 "confirm_apply_in_watchlist":  true,
+                                 "confirm_entry_price_mode":  "close",
+                                 "min_gap_bps_long":  0,
+                                 "min_gap_bps_short":  0,
+                                 "early_range_minutes":  10,
+                                 "max_early_pullback_bps":  26,
+                                 "min_early_reversal_bps":  22,
+                                 "session_close_et":  "16:00",
+                                 "flatten_buffer_minutes":  5,
+                                 "trend_fast_len":  0,
+                                 "trend_slow_len":  0,
+                                 "trend_min_slope_bps":  0,
+                                 "trend_min_distance_atr":  0.0,
+                                 "volume_lookback_days":  60,
+                                 "volume_min_ratio":  0.0,
+                                 "entry_price_mode":  "open",
+                                 "use_intraday_entry":  true,
+                                 "intraday_entry_in_watchlist":  true,
+                                 "entry_order_type":  "market",
+                                 "order_tif":  "day",
+                                 "use_brackets":  true,
+                                 "backtest_fill_model_enabled":  false,
+                                 "backtest_half_spread_bps":  4.0,
+                                 "backtest_entry_slippage_bps":  1.0,
+                                 "backtest_stop_slippage_bps":  2.0,
+                                 "backtest_target_slippage_bps":  0.5,
+                                 "backtest_time_slippage_bps":  1.5,
+                                 "backtest_fill_debug":  false,
+                                 "backtest_fill_debug_max_logs":  20,
+                                 "backtest_quote_fill_enabled":  true,
+                                 "backtest_quote_lookback_seconds":  120,
+                                 "backtest_quote_forward_seconds":  15,
+                                 "backtest_quote_max_age_seconds":  300,
+                                 "backtest_quote_fallback_to_bps":  false,
+                                 "backtest_quote_target_limit_protect":  true,
+                                 "backtest_quote_require_both_sides":  true,
+                                 "backtest_quote_max_spread_bps":  80.0,
+                                 "backtest_quote_max_deviation_bps":  120.0,
+                                 "backtest_quote_debug":  false,
+                                 "backtest_quote_debug_max_logs":  20,
+                                 "quality_sizing_enabled":  true,
+                                 "quality_sizing_min_mult":  0.3,
+                                 "quality_sizing_max_mult":  2.6,
+                                 "quality_sizing_avgR_floor":  -0.05,
+                                 "quality_sizing_avgR_cap":  0.35,
+                                 "quality_sizing_pf_floor":  0.9,
+                                 "quality_sizing_pf_cap":  2.2,
+                                 "quality_sizing_win_rate_floor":  0.42,
+                                 "quality_sizing_win_rate_cap":  0.7,
+                                 "quality_sizing_trades_ref":  18,
+                                 "quality_sizing_lcb_z":  0.5,
+                                 "quality_sizing_weight_avgR":  0.3,
+                                 "quality_sizing_weight_pf":  0.2,
+                                 "quality_sizing_weight_win_rate":  0.1,
+                                 "quality_sizing_weight_trades":  0.1,
+                                 "quality_sizing_weight_stop_rate":  0.2,
+                                 "quality_sizing_weight_stop_flip_share":  0.08,
+                                 "quality_sizing_weight_positive_month_rate":  0.02,
+                                 "quality_sizing_stop_rate_floor":  0.3,
+                                 "quality_sizing_stop_rate_cap":  0.75,
+                                 "quality_sizing_stop_flip_share_floor":  0.15,
+                                 "quality_sizing_stop_flip_share_cap":  0.6,
+                                 "quality_sizing_positive_month_rate_floor":  0.45,
+                                 "quality_sizing_positive_month_rate_cap":  0.8,
+                                 "quality_sizing_reserve_capacity":  true,
+                                 "position_close_report_enabled":  true,
+                                 "position_close_poll_interval_sec":  20,
+                                 "backtest_reuse_existing_watchlists":  true,
+                                 "per_trade_max_pct_available":  0.75,
+                                 "per_trade_cap_reserve_capacity":  false
+                             },
+    "watchlist":  {
+                      "lookback_days":  252,
+                      "minTrades":  16,
+                      "reject_negative_pnl":  true,
+                      "minProfitFactor":  0.6,
+                      "minAvgR":  -0.05,
+                      "minWinRate":  0.59,
+                      "maxStopRate":  0.28,
+                      "param_rank_by":  "entry_quality_score",
+                      "param_grid":  {
+                                         "target_rr":  [
+                                                           0.8,
+                                                           1.0
+                                                       ]
+                                     },
+                      "entry_time_rank_by":  "entry_quality_score",
+                      "entry_time_mode":  "scan_first_valid",
+                      "top_k_rank_by":  "entry_quality_score",
+                      "top_k":  25,
+                      "min_months_count":  6,
+                      "min_positive_month_rate":  0.52,
+                      "max_negative_months":  4,
+                      "max_monthly_drawdown_pct":  7.5,
+                      "max_longest_negative_month_streak":  2,
+                      "min_worst_month_pnl_pct":  -4.5,
+                      "symbol_param_override_mode":  "merge",
+                      "symbol_param_overrides":  {
+                                                     "CRM":  {
+                                                                 "target_rr":  0.8
+                                                             },
+                                                     "AES":  {
+                                                                 "target_rr":  0.8
+                                                             },
+                                                     "DDOG":  {
+                                                                  "target_rr":  1.0
+                                                              },
+                                                     "LI":  {
+                                                                "target_rr":  0.8
+                                                            },
+                                                     "PAAS":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "MOS":  {
+                                                                 "target_rr":  0.8
+                                                             },
+                                                     "QXO":  {
+                                                                 "target_rr":  1.0
+                                                             },
+                                                     "VOD":  {
+                                                                 "target_rr":  0.8
+                                                             },
+                                                     "PAA":  {
+                                                                 "target_rr":  1.0
+                                                             },
+                                                     "VST":  {
+                                                                 "target_rr":  1.0
+                                                             },
+                                                     "PRMB":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "VZ":  {
+                                                                "target_rr":  1.0
+                                                            },
+                                                     "MTCH":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "LRCX":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "MCHI":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "CMCSA":  {
+                                                                   "target_rr":  0.8
+                                                               },
+                                                     "BP":  {
+                                                                "target_rr":  0.8
+                                                            },
+                                                     "QCOM":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "CRH":  {
+                                                                 "target_rr":  0.8
+                                                             },
+                                                     "BBWI":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "CSGP":  {
+                                                                  "target_rr":  0.6
+                                                              },
+                                                     "CVS":  {
+                                                                 "target_rr":  0.6
+                                                             },
+                                                     "RBLX":  {
+                                                                  "target_rr":  0.6
+                                                              },
+                                                     "APH":  {
+                                                                 "target_rr":  0.6
+                                                             },
+                                                     "DXCM":  {
+                                                                  "target_rr":  0.6
+                                                              },
+                                                     "AMZN":  {
+                                                                  "target_rr":  0.8
+                                                              },
+                                                     "CSX":  {
+                                                                 "target_rr":  0.6
+                                                             }
+                                                 },
+                      "auto_symbol_tuning":  {
+                                                 "enabled":  true,
+                                                 "allow_with_symbol_override":  true,
+                                                 "require_improvement":  true,
+                                                 "min_score_improvement":  0.01,
+                                                 "min_trades":  10,
+                                                 "min_stop_count":  4,
+                                                 "min_stop_flip_share_050":  0.3,
+                                                 "min_stop_flip_share_100":  0.15,
+                                                 "target_rr_reduce_mult":  0.85,
+                                                 "target_rr_min":  0.6,
+                                                 "target_rr_max":  1.4,
+                                                 "cutoff_rate_threshold":  0.4,
+                                                 "cutoff_target_rr_reduce_mult":  0.9,
+                                                 "min_wider_stop_share":  0.18,
+                                                 "min_stop_rate_for_stop_flip_tuning":  0.35,
+                                                 "min_stop_rate_for_wider_stop_tuning":  0.3,
+                                                 "stop_r_widen_mult":  1.2,
+                                                 "stop_r_widen_buffer":  1.05,
+                                                 "stop_r_max":  1.8,
+                                                 "target_window_mult_reduce_mult":  0.95,
+                                                 "cutoff_target_window_mult_reduce_mult":  0.95,
+                                                 "max_candidates":  10,
+                                                 "entry_quality_min_stop_rate":  0.3,
+                                                 "entry_quality_min_stop_no_progress_share":  0.35,
+                                                 "entry_quality_min_loser_no_progress_share":  0.33,
+                                                 "entry_quality_min_cutoff_no_progress_share":  0.45,
+                                                 "entry_quality_enable_early_filter_tuning":  true,
+                                                 "entry_quality_enable_confirm_candidates":  true,
+                                                 "entry_quality_min_early_reversal_bps_values":  [
+                                                                                                     20,
+                                                                                                     25,
+                                                                                                     30
+                                                                                                 ],
+                                                 "entry_quality_max_early_pullback_bps_values":  [
+                                                                                                     30,
+                                                                                                     25,
+                                                                                                     20
+                                                                                                 ],
+                                                 "entry_quality_confirm_move_bps_values":  [
+                                                                                               2,
+                                                                                               3
+                                                                                           ],
+                                                 "entry_quality_confirm_minutes_values":  [
+                                                                                              2,
+                                                                                              3
+                                                                                          ],
+                                                 "entry_quality_min_cutoff_near_target_share":  0.4,
+                                                 "time_stop_expand_mult":  1.3,
+                                                 "time_stop_max":  60
+                                             },
+                      "rank_lcb_z":  1.25,
+                      "scan_first_valid_candidate_mode":  "per_start_time",
+                      "entry_time_sort_mode":  "preserve",
+                      "max_loser_no_progress_share":  0.35,
+                      "max_stop_no_progress_share":  0.4,
+                      "entry_quality_score_trades_ref":  26,
+                      "scan_start_min_selected_trades":  8,
+                      "scan_start_min_selected_share":  0.1,
+                      "entry_quality_score_weight_lcb":  1.2,
+                      "entry_quality_score_weight_stop_rate":  0.25,
+                      "entry_quality_score_weight_cutoff_rate":  0.1,
+                      "entry_quality_score_weight_stop_no_progress":  0.35,
+                      "entry_quality_score_weight_cutoff_no_progress":  0.15,
+                      "entry_quality_score_weight_loser_no_progress":  0.15,
+                      "entry_quality_score_weight_target_rate":  0.15,
+                      "scan_block_selected_entry_times":  [
+                                                              "09:37"
+                                                          ],
+                      "scan_max_blocked_selected_share":  0.35
+                  },
+    "watchlist_source":  "config",
+    "watchlist_node_base":  "http://localhost:3000",
+    "watchlist_asset_filters":  {
+                                    "asset_class":  "us_equity",
+                                    "status":  "active",
+                                    "price_min":  15,
+                                    "price_max":  1000,
+                                    "max_spread_bps_median":  10,
+                                    "shortable":  true,
+                                    "marginable":  true,
+                                    "easy_to_borrow":  true,
+                                    "tradable":  true
+                                },
+    "alpaca":  {
+                   "base_url":  "https://paper-api.alpaca.markets",
+                   "data_url":  "https://data.alpaca.markets",
+                   "api_key_id":  "",
+                   "api_secret_key":  "",
+                   "data_feed":  "iex",
+                   "bars_chunk_size":  50,
+                   "adjustment":  "raw",
+                   "timeout_sec":  30,
+                   "max_retries":  3,
+                   "retry_backoff_sec":  2
+               },
+    "daily_bars_cache_dir":  "alpaca-ohlc",
+    "minute_bars_cache_dir":  "cache/ohlc_minute",
+    "minute_bars_refresh":  false,
+    "watchlists_dir":  "C:\\Users\\leocl\\OneDrive\\Documentos\\Projects\\alpaca-ohlc\\watchlists_v94b_qmax26_live",
+    "logs_dir":  "logs",
+    "watchlist_report_enabled":  true,
+    "symbols":  [
+                    "TLT",
+                    "CVS",
+                    "ANET",
+                    "MRK",
+                    "QQQ",
+                    "ARM",
+                    "XOM",
+                    "APA",
+                    "GME",
+                    "QCOM",
+                    "ZETA",
+                    "O",
+                    "ORLY",
+                    "SIRI",
+                    "AS",
+                    "MNST",
+                    "ALAB",
+                    "TECK",
+                    "CPNG",
+                    "KVYO",
+                    "ETSY",
+                    "AMZN",
+                    "MP",
+                    "RUN",
+                    "KDP",
+                    "NKE",
+                    "IEF",
+                    "ENPH",
+                    "TME",
+                    "RBLX",
+                    "BEKE",
+                    "AXTA",
+                    "CMG",
+                    "MAT",
+                    "AMD",
+                    "EXE",
+                    "FISV",
+                    "VST",
+                    "MDLZ",
+                    "CSX",
+                    "CAG",
+                    "BBWI",
+                    "VXUS",
+                    "BMY",
+                    "NOV",
+                    "TOST",
+                    "IOT",
+                    "XPEV",
+                    "NI",
+                    "DHR",
+                    "BP",
+                    "IQV",
+                    "AAPL",
+                    "LUNR",
+                    "RDDT",
+                    "HMY",
+                    "SPOT",
+                    "GFS",
+                    "PAA",
+                    "IBKR",
+                    "KVUE",
+                    "CSGP",
+                    "CMCSA",
+                    "AMAT",
+                    "PM",
+                    "SBSW",
+                    "SCHW",
+                    "PFE",
+                    "ORCL",
+                    "UL",
+                    "COHR",
+                    "DDOG",
+                    "BEN",
+                    "ICLN",
+                    "APH",
+                    "DXCM",
+                    "QXO",
+                    "WT",
+                    "BKR",
+                    "TGT",
+                    "PL",
+                    "PYPL",
+                    "AA",
+                    "RF",
+                    "INTU",
+                    "BZ",
+                    "TFC",
+                    "RTX",
+                    "FITB",
+                    "UNH",
+                    "EW",
+                    "AMH",
+                    "PANW",
+                    "FTI",
+                    "UBER",
+                    "CRH",
+                    "MBB",
+                    "VZ",
+                    "ACWI",
+                    "HR"
+                ],
+    "replay":  {
+                   "start_date":  "2025-01-01",
+                   "end_date":  "2025-12-31",
+                   "emit_daily_details":  true
+               },
+    "market_filters":  {
+                           "enabled":  false,
+                           "symbol":  "SPY",
+                           "use_atr":  true,
+                           "atr_period":  14,
+                           "atr_max_pct":  2.5,
+                           "use_gap":  true,
+                           "gap_bps_max":  80,
+                           "use_trend":  false,
+                           "trend_ma_days":  200,
+                           "log_details":  false
+                       },
+    "asset_universe_dir":  "logs/asset_universe_top100_janapr"
+}

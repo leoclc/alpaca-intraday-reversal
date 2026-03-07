@@ -281,6 +281,8 @@ def compute_qty_with_guards(
     slot_min_slots = max(1, int(params.get("slot_distribution_min_slots") or 1))
     slot_max_slots = max(0, int(params.get("slot_distribution_max_slots") or 0))
     slot_default_slots = max(0, int(params.get("slot_distribution_default_slots") or 0))
+    sizing_stop_pct_floor = max(0.0, float(params.get("sizing_stop_pct_floor") or 0.0))
+    sizing_stop_abs_floor = max(0.0, float(params.get("sizing_stop_abs_floor") or 0.0))
 
     slot_target = 0
     if slot_distribution_enabled:
@@ -320,6 +322,8 @@ def compute_qty_with_guards(
         "effective_equal_split": effective_equal_split,
         "effective_max_positions": effective_max_positions,
         "open_positions": open_positions,
+        "sizing_stop_pct_floor": sizing_stop_pct_floor,
+        "sizing_stop_abs_floor": sizing_stop_abs_floor,
     }
 
     if effective_max_positions > 0 and open_positions >= effective_max_positions:
@@ -374,11 +378,23 @@ def compute_qty_with_guards(
                 risk_amt = risk_amt_base * dd_scale
                 state["risk_amount_daily_scale"] = dd_scale
     state["risk_amount"] = risk_amt
-    if plan.stop_distance <= 0:
+    raw_stop_distance = float(plan.stop_distance)
+    if raw_stop_distance <= 0:
         state["reject_reason"] = "stop_distance_zero"
         return 0, state
+    entry_price = max(1e-9, float(plan.entry_price))
+    min_stop_distance = 0.0
+    if sizing_stop_pct_floor > 0.0:
+        min_stop_distance = max(min_stop_distance, entry_price * (sizing_stop_pct_floor / 100.0))
+    if sizing_stop_abs_floor > 0.0:
+        min_stop_distance = max(min_stop_distance, sizing_stop_abs_floor)
+    effective_stop_distance = max(raw_stop_distance, min_stop_distance)
+    state["stop_distance_raw"] = raw_stop_distance
+    state["stop_distance_min_for_sizing"] = min_stop_distance
+    state["stop_distance_effective"] = effective_stop_distance
+    state["stop_pct_effective"] = (effective_stop_distance / entry_price) * 100.0
 
-    risk_qty_base = int(risk_amt // plan.stop_distance) if risk_amt > 0 else 0
+    risk_qty_base = int(risk_amt // effective_stop_distance) if risk_amt > 0 else 0
     state["risk_qty_base"] = risk_qty_base
     if risk_qty_base <= 0:
         state["reject_reason"] = "risk_qty_zero"
@@ -409,9 +425,9 @@ def compute_qty_with_guards(
     state["quality_sizing"] = quality_state
     state["quality_qty_multiplier"] = quality_mult
     state["net_available_final"] = net_avail
-    budget_qty = int(net_avail // max(1e-9, float(plan.entry_price))) if net_avail > 0 else 0
+    budget_qty = int(net_avail // entry_price) if net_avail > 0 else 0
     budget_qty_pre_cap = (
-        int(net_avail_before_per_trade_cap // max(1e-9, float(plan.entry_price)))
+        int(net_avail_before_per_trade_cap // entry_price)
         if net_avail_before_per_trade_cap > 0
         else 0
     )
@@ -424,7 +440,7 @@ def compute_qty_with_guards(
 
     quality_mult_eff = max(0.0, quality_mult) if quality_state.get("applied") else 1.0
     risk_amt_adjusted = risk_amt * quality_mult_eff
-    risk_qty_adjusted = int(risk_amt_adjusted // plan.stop_distance) if risk_amt_adjusted > 0 else 0
+    risk_qty_adjusted = int(risk_amt_adjusted // effective_stop_distance) if risk_amt_adjusted > 0 else 0
     state["risk_amount_adjusted"] = risk_amt_adjusted
     state["risk_qty_adjusted"] = risk_qty_adjusted
     state["risk_qty"] = risk_qty_adjusted
