@@ -117,6 +117,12 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
         stop_flip_cap = float(params.get("quality_sizing_stop_flip_share_cap") or 0.70)
         positive_month_floor = float(params.get("quality_sizing_positive_month_rate_floor") or 0.45)
         positive_month_cap = float(params.get("quality_sizing_positive_month_rate_cap") or 0.85)
+        stdr_floor = float(params.get("quality_sizing_stdR_floor") or 0.2)
+        stdr_cap = float(params.get("quality_sizing_stdR_cap") or 1.2)
+        worst_month_floor = float(params.get("quality_sizing_worst_month_pnl_pct_floor") or -15.0)
+        worst_month_cap = float(params.get("quality_sizing_worst_month_pnl_pct_cap") or 0.0)
+        stop_no_progress_floor = float(params.get("quality_sizing_stop_no_progress_share_floor") or 0.2)
+        stop_no_progress_cap = float(params.get("quality_sizing_stop_no_progress_share_cap") or 0.75)
 
         w_avg = float(params.get("quality_sizing_weight_avgR") or 0.5)
         w_pf = float(params.get("quality_sizing_weight_pf") or 0.2)
@@ -125,6 +131,9 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
         w_stop = float(params.get("quality_sizing_weight_stop_rate") or 0.0)
         w_stop_flip = float(params.get("quality_sizing_weight_stop_flip_share") or 0.0)
         w_month = float(params.get("quality_sizing_weight_positive_month_rate") or 0.0)
+        w_stdr = float(params.get("quality_sizing_weight_stdR") or 0.0)
+        w_worst_month = float(params.get("quality_sizing_weight_worst_month_pnl_pct") or 0.0)
+        w_stop_no_progress = float(params.get("quality_sizing_weight_stop_no_progress_share") or 0.0)
         if w_avg < 0:
             w_avg = 0.0
         if w_pf < 0:
@@ -139,10 +148,16 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
             w_stop_flip = 0.0
         if w_month < 0:
             w_month = 0.0
-        w_sum = w_avg + w_pf + w_wr + w_n + w_stop + w_stop_flip + w_month
+        if w_stdr < 0:
+            w_stdr = 0.0
+        if w_worst_month < 0:
+            w_worst_month = 0.0
+        if w_stop_no_progress < 0:
+            w_stop_no_progress = 0.0
+        w_sum = w_avg + w_pf + w_wr + w_n + w_stop + w_stop_flip + w_month + w_stdr + w_worst_month + w_stop_no_progress
         if w_sum <= 0:
             w_avg, w_pf, w_wr, w_n = 0.5, 0.2, 0.2, 0.1
-            w_stop, w_stop_flip, w_month = 0.0, 0.0, 0.0
+            w_stop, w_stop_flip, w_month, w_stdr, w_worst_month, w_stop_no_progress = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             w_sum = 1.0
 
         avg_r = _safe_float_opt(stats.get("avgR"))
@@ -153,6 +168,9 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
         stop_rate = _safe_float_opt(stats.get("stop_rate"))
         stop_flip_share = _safe_float_opt(stats.get("stop_flip_share_050"))
         positive_month_rate = _safe_float_opt(stats.get("positive_month_rate"))
+        std_r = _safe_float_opt(stats.get("stdR"))
+        worst_month_pnl_pct = _safe_float_opt(stats.get("worst_month_pnl_pct"))
+        stop_no_progress_share = _safe_float_opt(stats.get("stop_no_progress_share"))
 
         avg_eff = avg_r
         if avg_r is not None and avg_r_stderr is not None and lcb_z > 0:
@@ -172,6 +190,9 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
         score_stop = 1.0 - _score(stop_rate, stop_rate_floor, stop_rate_cap)
         score_stop_flip = 1.0 - _score(stop_flip_share, stop_flip_floor, stop_flip_cap)
         score_month = _score(positive_month_rate, positive_month_floor, positive_month_cap)
+        score_stdr = 1.0 - _score(std_r, stdr_floor, stdr_cap)
+        score_worst_month = _score(worst_month_pnl_pct, worst_month_floor, worst_month_cap)
+        score_stop_no_progress = 1.0 - _score(stop_no_progress_share, stop_no_progress_floor, stop_no_progress_cap)
 
         score = (
             (w_avg * score_avg)
@@ -181,6 +202,9 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
             + (w_stop * score_stop)
             + (w_stop_flip * score_stop_flip)
             + (w_month * score_month)
+            + (w_stdr * score_stdr)
+            + (w_worst_month * score_worst_month)
+            + (w_stop_no_progress * score_stop_no_progress)
         ) / w_sum
         risk_multiplier = _clamp(min_mult + (max_mult - min_mult) * score, min_mult, max_mult)
 
@@ -197,6 +221,9 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
                 "stop_rate": stop_rate,
                 "stop_flip_share_050": stop_flip_share,
                 "positive_month_rate": positive_month_rate,
+                "stdR": std_r,
+                "worst_month_pnl_pct": worst_month_pnl_pct,
+                "stop_no_progress_share": stop_no_progress_share,
                 "score_avg": score_avg,
                 "score_pf": score_pf,
                 "score_win_rate": score_wr,
@@ -204,6 +231,9 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
                 "score_stop_rate": score_stop,
                 "score_stop_flip_share": score_stop_flip,
                 "score_positive_month_rate": score_month,
+                "score_stdR": score_stdr,
+                "score_worst_month_pnl_pct": score_worst_month,
+                "score_stop_no_progress_share": score_stop_no_progress,
                 "score": score,
                 "risk_multiplier": risk_multiplier,
                 "min_mult": min_mult,
@@ -215,6 +245,9 @@ def _quality_risk_multiplier(plan: TradePlan, cfg: Dict) -> Tuple[float, Dict[st
                 "weight_stop_rate": w_stop,
                 "weight_stop_flip_share": w_stop_flip,
                 "weight_positive_month_rate": w_month,
+                "weight_stdR": w_stdr,
+                "weight_worst_month_pnl_pct": w_worst_month,
+                "weight_stop_no_progress_share": w_stop_no_progress,
             }
         )
         return risk_multiplier, meta
@@ -232,6 +265,7 @@ def compute_qty_with_guards(
     allowed_total_override: Optional[float] = None,
     open_positions: int = 0,
     slot_target_override: Optional[int] = None,
+    day_start_equity: Optional[float] = None,
 ) -> Tuple[int, Dict]:
     params = cfg.get("daily_trend_reversal") or {}
     max_positions_cfg = int(params.get("max_positions") or 0)
@@ -269,6 +303,7 @@ def compute_qty_with_guards(
 
     state = {
         "equity": equity,
+        "day_start_equity": day_start_equity,
         "used_notional": used_notional,
         "risk_per_trade": risk_per_trade,
         "leverage": leverage,
@@ -316,8 +351,28 @@ def compute_qty_with_guards(
         return 0, state
 
     quality_mult, quality_state = _quality_risk_multiplier(plan, cfg)
-    risk_amt = max(0.0, equity * risk_per_trade)
-    state["risk_amount_base"] = risk_amt
+    risk_amt_base = max(0.0, equity * risk_per_trade)
+    risk_amt = risk_amt_base
+    state["risk_amount_base"] = risk_amt_base
+    state["risk_amount_daily_scale"] = 1.0
+    state["daily_drawdown_pct"] = 0.0
+    dd_scale_enabled = bool(params.get("daily_drawdown_risk_scale_enabled", False))
+    dd_max_reduction = max(0.0, min(1.0, float(params.get("daily_drawdown_risk_max_reduction") or 0.0)))
+    dd_trigger_pct = max(0.0, float(params.get("daily_drawdown_risk_trigger_pct") or 0.0))
+    dd_full_pct = max(dd_trigger_pct, float(params.get("daily_drawdown_risk_full_pct") or max(2.0, dd_trigger_pct)))
+    if dd_scale_enabled and dd_max_reduction > 0.0:
+        start_eq = _safe_float_opt(day_start_equity)
+        if start_eq is not None and start_eq > 0.0:
+            dd_pct = max(0.0, ((start_eq - equity) / start_eq) * 100.0)
+            state["daily_drawdown_pct"] = dd_pct
+            if dd_pct > dd_trigger_pct:
+                if dd_full_pct <= dd_trigger_pct:
+                    progress = 1.0
+                else:
+                    progress = _clamp((dd_pct - dd_trigger_pct) / (dd_full_pct - dd_trigger_pct), 0.0, 1.0)
+                dd_scale = max(0.0, 1.0 - (dd_max_reduction * progress))
+                risk_amt = risk_amt_base * dd_scale
+                state["risk_amount_daily_scale"] = dd_scale
     state["risk_amount"] = risk_amt
     if plan.stop_distance <= 0:
         state["reject_reason"] = "stop_distance_zero"
@@ -340,17 +395,28 @@ def compute_qty_with_guards(
         eq_cap = allowed_total / effective_max_positions
         state["equal_split_cap"] = eq_cap
         net_avail = min(net_avail, eq_cap)
+    net_avail_before_per_trade_cap = net_avail
+    per_trade_cap_applied = False
 
     if per_trade_max_pct_available < 1.0:
         cap_pct = max(0.0, min(per_trade_max_pct_available, 1.0))
         per_trade_cap = available * (1.0 - msb) * cap_pct
         state["per_trade_cap"] = per_trade_cap
-        net_avail = min(net_avail, per_trade_cap)
+        capped_avail = min(net_avail, per_trade_cap)
+        per_trade_cap_applied = capped_avail < net_avail
+        net_avail = capped_avail
 
     state["quality_sizing"] = quality_state
     state["quality_qty_multiplier"] = quality_mult
     state["net_available_final"] = net_avail
     budget_qty = int(net_avail // max(1e-9, float(plan.entry_price))) if net_avail > 0 else 0
+    budget_qty_pre_cap = (
+        int(net_avail_before_per_trade_cap // max(1e-9, float(plan.entry_price)))
+        if net_avail_before_per_trade_cap > 0
+        else 0
+    )
+    state["budget_qty_pre_cap"] = budget_qty_pre_cap
+    state["per_trade_cap_applied"] = per_trade_cap_applied
     state["budget_qty"] = budget_qty
     if budget_qty <= 0:
         state["reject_reason"] = "budget_zero"
@@ -364,9 +430,12 @@ def compute_qty_with_guards(
     state["risk_qty"] = risk_qty_adjusted
 
     base_qty = min(risk_qty_base, budget_qty)
+    base_qty_pre_cap = min(risk_qty_base, budget_qty_pre_cap)
+    state["base_qty_pre_cap"] = base_qty_pre_cap
     state["base_qty"] = base_qty
     qty = min(risk_qty_adjusted, budget_qty)
     reserve_capacity = bool(params.get("quality_sizing_reserve_capacity", True))
+    reserve_pre_cap = bool(params.get("per_trade_cap_reserve_capacity", False))
     if quality_state.get("applied"):
         # Avoid silently dropping otherwise valid trades due to integer truncation.
         if base_qty > 0 and quality_mult_eff > 0 and qty <= 0:
@@ -376,6 +445,10 @@ def compute_qty_with_guards(
         # If quality scaling trims size, keep capacity accounting at the unscaled base size to avoid
         # refilling the same notional with lower-quality symbols later in the same allocation pass.
         capacity_qty = base_qty
+    if reserve_capacity and reserve_pre_cap and per_trade_cap_applied and base_qty_pre_cap > capacity_qty:
+        # Optional: if per-trade cap forced size down, reserve pre-cap capacity so we don't
+        # refill the remaining budget with lower-priority symbols in the same pass.
+        capacity_qty = base_qty_pre_cap
     state["capacity_qty"] = capacity_qty
     state["final_qty"] = qty
     if qty <= 0:

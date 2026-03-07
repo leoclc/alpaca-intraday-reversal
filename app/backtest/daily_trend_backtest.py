@@ -185,6 +185,7 @@ def _apply_portfolio_sizing(
     used_notional = 0.0
     accepted: List = []
     sized_records: List[Dict] = []
+    day_start_equity = equity
 
     if fill_model_enabled:
         global _FILL_MODEL_LOGGED
@@ -827,6 +828,7 @@ def _apply_portfolio_sizing(
                 cfg,
                 open_positions=open_positions,
                 slot_target_override=slot_target,
+                day_start_equity=day_start_equity,
             )
             if qty <= 0:
                 continue
@@ -929,6 +931,7 @@ def _apply_portfolio_sizing(
             cfg,
             open_positions=len(open_positions_state),
             slot_target_override=slot_target,
+            day_start_equity=day_start_equity,
         )
         if qty <= 0:
             continue

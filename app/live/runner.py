@@ -296,6 +296,7 @@ def _compute_qty(
     allowed_total_override: Optional[float] = None,
     used_notional_override: Optional[float] = None,
     open_positions_override: Optional[int] = None,
+    day_start_equity: Optional[float] = None,
 ) -> tuple[int, Dict, float, float, int]:
     params = cfg.get("daily_trend_reversal") or {}
     fixed_qty = params.get("fixed_qty")
@@ -364,6 +365,7 @@ def _compute_qty(
         allowed_total_override=allowed_total,
         open_positions=open_positions,
         slot_target_override=slot_target,
+        day_start_equity=day_start_equity,
     )
     return qty, state, allowed_total, used_notional, open_positions
 
@@ -605,6 +607,7 @@ def run_live(
     open_positions_runtime: Optional[int] = None
     live_buying_power: Optional[float] = None
     live_buying_power_present = False
+    day_start_equity_seed: Optional[float] = None
     if broker.ready():
         (
             equity_seed,
@@ -614,6 +617,8 @@ def run_live(
             live_buying_power,
             live_buying_power_present,
         ) = _seed_runtime_exposure(cfg, broker, emit_debug=debug)
+        if equity_seed is not None and equity_seed > 0:
+            day_start_equity_seed = float(equity_seed)
     placed: List[Dict] = []
     plans: List = []
     for symbol in symbols:
@@ -734,6 +739,8 @@ def run_live(
                 bp_now, bp_now_present = _account_buying_power(acct_now)
                 if equity_now > 0:
                     equity_seed = equity_now
+                    if day_start_equity_seed is None:
+                        day_start_equity_seed = equity_now
                 if bp_now_present:
                     max_margin_usage = float(params.get("max_margin_usage") or 0.70)
                     bp_budget = bp_now * max(0.0, min(max_margin_usage, 1.0))
@@ -763,6 +770,7 @@ def run_live(
             allowed_total_override=allowed_total_seed,
             used_notional_override=used_notional_runtime,
             open_positions_override=open_positions_runtime,
+            day_start_equity=day_start_equity_seed,
         )
         _log_debug(
             "symbol=%s qty=%s allowed_total=%.2f used_notional=%.2f open_positions=%s state=%s",
