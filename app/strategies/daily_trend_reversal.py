@@ -786,6 +786,11 @@ def build_trade(
         min_gap_fav_bps_short = None
     min_gap_bps_long = float(params.get("min_gap_bps_long") or 0.0)
     min_gap_bps_short = float(params.get("min_gap_bps_short") or 0.0)
+    trade_guardrails_enabled = bool(params.get("trade_guardrails_enabled", False))
+    trade_guardrail_min_stop_bps = max(0.0, float(params.get("trade_guardrail_min_stop_bps") or 0.0))
+    trade_guardrail_min_target_bps = max(0.0, float(params.get("trade_guardrail_min_target_bps") or 0.0))
+    trade_guardrail_min_stop_abs = max(0.0, float(params.get("trade_guardrail_min_stop_abs") or 0.0))
+    trade_guardrail_min_target_abs = max(0.0, float(params.get("trade_guardrail_min_target_abs") or 0.0))
     min_stop_atr = float(params.get("min_stop_atr") or 0.0)
     try:
         min_stop_atr_long = float(params["min_stop_atr_long"]) if params.get("min_stop_atr_long") is not None else None
@@ -806,6 +811,14 @@ def build_trade(
     reversal_lookback_days = int(params.get("reversal_lookback_days") or 1)
     early_range_minutes = int(params.get("early_range_minutes") or 0)
     max_early_pullback_bps = float(params.get("max_early_pullback_bps") or 0.0)
+    min_signal_return_atr_abs = float(params.get("min_signal_return_atr_abs") or 0.0)
+    max_signal_return_atr_abs = float(params.get("max_signal_return_atr_abs") or 0.0)
+    open_noise_window_minutes = int(params.get("open_noise_window_minutes") or 0)
+    open_noise_apply_in_watchlist = bool(params.get("open_noise_apply_in_watchlist", True))
+    max_open_noise_atr = float(params.get("max_open_noise_atr") or 0.0)
+    max_open_noise_stop_ratio = float(params.get("max_open_noise_stop_ratio") or 0.0)
+    min_stop_to_open_noise_ratio = float(params.get("min_stop_to_open_noise_ratio") or 0.0)
+    open_noise_risk_scale_enabled = bool(params.get("open_noise_risk_scale_enabled", False))
     # Optional early-reversal filter: require the price to have reversed off the early extreme
     # *before* entry (does not delay entry time).
     min_early_reversal_bps = float(params.get("min_early_reversal_bps") or 0.0)
@@ -841,6 +854,20 @@ def build_trade(
     apply_confirm = confirm_move_bps > 0 and confirm_minutes > 0
     if context == "watchlist" and not confirm_apply_in_watchlist:
         apply_confirm = False
+    apply_open_noise_filter = (
+        open_noise_window_minutes > 0
+        and (
+            max_open_noise_atr > 0
+            or max_open_noise_stop_ratio > 0
+            or min_stop_to_open_noise_ratio > 0
+        )
+    )
+    compute_open_noise_metrics = (
+        open_noise_window_minutes > 0 and (apply_open_noise_filter or open_noise_risk_scale_enabled)
+    )
+    if context == "watchlist" and not open_noise_apply_in_watchlist:
+        apply_open_noise_filter = False
+        compute_open_noise_metrics = False
 
     # Fast reject: if gap filters are enabled and we can compute the session gap from daily bars,
     # apply them before fetching intraday bars. This avoids expensive intraday fetches for signals
@@ -898,6 +925,8 @@ def build_trade(
         minutes_needed = max(minutes_needed, max_entry_minutes)
     if apply_confirm:
         minutes_needed = max(minutes_needed, max_entry_minutes + confirm_minutes)
+    if apply_open_noise_filter:
+        minutes_needed = max(minutes_needed, max(1, max_entry_minutes, int(open_noise_window_minutes)))
     if minutes_needed > 0 and bars_intraday is None:
         bars_intraday = get_intraday_bars(signal.symbol, signal.signal_date, minutes_needed, cfg=cfg, allow_fetch=True)
     def _intraday_entry_price(
@@ -993,6 +1022,37 @@ def build_trade(
         }
         return None
 
+    def _opening_noise_range(
+        bars_intraday_local: List[Dict],
+        entry_time_str: str,
+        entry_date_str: str,
+        window_minutes: int,
+    ) -> Optional[Dict[str, float]]:
+        if not bars_intraday_local or window_minutes <= 0:
+            return None
+        try:
+            open_dt = ensure_et(dt.datetime.combine(ensure_date(entry_date_str), parse_time_hhmm(session_open_et)))
+            entry_dt = ensure_et(dt.datetime.combine(ensure_date(entry_date_str), parse_time_hhmm(entry_time_str)))
+            cutoff_dt = open_dt + dt.timedelta(minutes=max(1, int(window_minutes)))
+            window_end_dt = min(entry_dt, cutoff_dt)
+            if window_end_dt <= open_dt:
+                return None
+            window_end_time_et = window_end_dt.strftime("%H:%M")
+        except Exception:
+            return None
+        window = filter_intraday_bars_until(bars_intraday_local, entry_date_str, window_end_time_et)
+        highs = [float(b.get("high") or b.get("h") or 0.0) for b in window]
+        lows = [float(b.get("low") or b.get("l") or 0.0) for b in window]
+        if not highs or not lows:
+            return None
+        max_high = max(highs)
+        min_low = min(lows)
+        rng = max(0.0, max_high - min_low)
+        return {
+            "open_noise_abs": float(rng),
+            "open_noise_window_minutes": int(window_minutes),
+        }
+
     signal_return_pct = float(signal.return_pct)
     for entry_time_et in entry_times:
         if entry_start_et and entry_end_et:
@@ -1033,6 +1093,12 @@ def build_trade(
                 signal_atr = atr_for_signal
                 if atr_for_signal and close_prev is not None and close_prevn is not None:
                     signal_return_atr = (close_prev - close_prevn) / atr_for_signal
+        if min_signal_return_atr_abs > 0:
+            if signal_return_atr is None or abs(float(signal_return_atr)) < min_signal_return_atr_abs:
+                continue
+        if max_signal_return_atr_abs > 0:
+            if signal_return_atr is None or abs(float(signal_return_atr)) > max_signal_return_atr_abs:
+                continue
         if apply_intraday_entry:
             if not bars_intraday:
                 continue
@@ -1170,10 +1236,38 @@ def build_trade(
                         # If we can't compute the metric, treat as not meeting the filter.
                         if early_reversal_bps is None or early_reversal_bps < float(min_early_reversal_bps_short):
                             continue
+        open_noise_abs = None
+        open_noise_bps = None
+        open_noise_atr = None
+        open_noise_stop_ratio = None
+        stop_to_open_noise_ratio = None
+        open_noise_window_minutes_used = None
+        if compute_open_noise_metrics and bars_intraday:
+            open_noise = _opening_noise_range(
+                bars_intraday,
+                str(entry_time_et),
+                signal.signal_date,
+                int(open_noise_window_minutes),
+            )
+            if open_noise:
+                open_noise_abs = float(open_noise.get("open_noise_abs") or 0.0)
+                open_noise_window_minutes_used = int(open_noise.get("open_noise_window_minutes") or 0)
+                if open_noise_abs > 0 and entry_price > 0:
+                    open_noise_bps = (open_noise_abs / entry_price) * 10000.0
+        if apply_open_noise_filter:
+            if not bars_intraday:
+                continue
+            if open_noise_abs is None or open_noise_abs <= 0:
+                continue
         atr_end_idx = entry_idx - 1
         if entry_info.get("entry_source_date") != entry_date:
             atr_end_idx = entry_idx
         atr = compute_atr_daily(bars, atr_period, atr_end_idx)
+        if compute_open_noise_metrics and open_noise_abs is not None and atr is not None and atr > 0:
+            open_noise_atr = open_noise_abs / atr
+        if apply_open_noise_filter and max_open_noise_atr > 0:
+            if open_noise_atr is None or open_noise_atr > max_open_noise_atr:
+                continue
         target_mode_used = target_mode
         target_window_avg_pct = None
         target_window_samples = None
@@ -1263,6 +1357,41 @@ def build_trade(
             else:
                 stop_price = entry_price + stop_distance
                 target_price = entry_price - stop_distance * target_rr
+        if trade_guardrails_enabled and entry_price > 0:
+            min_stop_distance = max(
+                trade_guardrail_min_stop_abs,
+                entry_price * (trade_guardrail_min_stop_bps / 10000.0),
+            )
+            if min_stop_distance > 0 and stop_distance < min_stop_distance:
+                stop_distance = min_stop_distance
+                if direction == "long":
+                    stop_price = entry_price - stop_distance
+                else:
+                    stop_price = entry_price + stop_distance
+            target_distance_eff = abs(target_price - entry_price)
+            min_target_distance = max(
+                trade_guardrail_min_target_abs,
+                entry_price * (trade_guardrail_min_target_bps / 10000.0),
+            )
+            if min_target_distance > 0 and target_distance_eff < min_target_distance:
+                target_distance_eff = min_target_distance
+                if direction == "long":
+                    target_price = entry_price + target_distance_eff
+                else:
+                    target_price = entry_price - target_distance_eff
+            if stop_distance > 0:
+                target_rr = target_distance_eff / stop_distance
+        if compute_open_noise_metrics and open_noise_abs is not None and stop_distance > 0:
+            open_noise_stop_ratio = open_noise_abs / stop_distance
+            stop_to_open_noise_ratio = stop_distance / open_noise_abs if open_noise_abs > 0 else None
+        if apply_open_noise_filter and open_noise_abs is not None and stop_distance > 0:
+            if max_open_noise_stop_ratio > 0 and open_noise_stop_ratio > max_open_noise_stop_ratio:
+                continue
+            if (
+                min_stop_to_open_noise_ratio > 0
+                and (stop_to_open_noise_ratio is None or stop_to_open_noise_ratio < min_stop_to_open_noise_ratio)
+            ):
+                continue
         if min_rr > 0:
             effective_rr = target_rr
             if target_distance is not None and stop_distance > 0:
@@ -1294,6 +1423,12 @@ def build_trade(
             gap_bps=gap_bps,
             early_pullback_bps=early_pullback_bps,
             early_reversal_bps=early_reversal_bps,
+            open_noise_abs=open_noise_abs,
+            open_noise_bps=open_noise_bps,
+            open_noise_atr=open_noise_atr,
+            open_noise_stop_ratio=open_noise_stop_ratio,
+            stop_to_open_noise_ratio=stop_to_open_noise_ratio,
+            open_noise_window_minutes=open_noise_window_minutes_used,
             confirm_move_bps=confirm_move_bps if apply_confirm else None,
             confirm_minutes=confirm_minutes if apply_confirm else None,
             confirm_hit_bps=confirm_hit_bps,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from app.brokers.alpaca import AlpacaBroker
@@ -13,7 +14,11 @@ from app.data.alpaca_intraday_store import (
     get_latest_intraday_prices,
 )
 from app.market.filters import market_filter_decision
-from app.portfolio.sizing import compute_qty_with_guards, estimate_slot_target_from_stats
+from app.portfolio.sizing import (
+    compute_qty_with_guards,
+    estimate_slot_target_from_stats,
+    resolve_effective_margin_buffer,
+)
 from app.strategies.daily_trend_reversal import build_trade, generate_signal_for_date
 from app.utils.time import ensure_et, et_now, parse_time_hhmm
 from app.watchlist.day_filter import day_filter_decision
@@ -161,16 +166,403 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_float_opt(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _asset_maintenance_margin_pct(
+    broker: Optional[AlpacaBroker],
+    symbol: Optional[str],
+    asset_margin_cache: Optional[Dict[str, Optional[float]]],
+) -> Optional[float]:
+    sym = str(symbol or "").upper().strip()
+    if not sym or broker is None or not broker.ready():
+        return None
+    cache = asset_margin_cache if isinstance(asset_margin_cache, dict) else None
+    if cache is not None and sym in cache and cache[sym] is not None:
+        return cache[sym]
+    mmr_pct: Optional[float] = None
+    try:
+        asset = broker.get_asset(sym) or {}
+        mmr_pct = _safe_float_opt(asset.get("maintenance_margin_requirement"))
+        if mmr_pct is not None and mmr_pct < 0:
+            mmr_pct = None
+    except Exception:
+        mmr_pct = None
+    # Cache only successful values so transient API failures don't poison the cache
+    # with `None` and silently disable MMR-based guards for the rest of the session.
+    if cache is not None and mmr_pct is not None:
+        cache[sym] = mmr_pct
+    elif cache is not None and sym in cache and cache[sym] is None:
+        cache.pop(sym, None)
+    return mmr_pct
+
+
+def _bp_short_mmr_multiplier(
+    cfg: Dict,
+    broker: Optional[AlpacaBroker],
+    symbol: Optional[str],
+    asset_margin_cache: Optional[Dict[str, Optional[float]]],
+) -> float:
+    params = cfg.get("daily_trend_reversal") or {}
+    if not bool(params.get("buying_power_short_mmr_enabled", False)):
+        return 1.0
+    mmr_pct = _asset_maintenance_margin_pct(broker, symbol, asset_margin_cache)
+    if mmr_pct is None:
+        return 1.0
+    weight = max(0.0, min(float(params.get("buying_power_short_mmr_weight") or 0.0), 2.0))
+    floor_pct = max(0.0, float(params.get("buying_power_short_mmr_floor_pct") or 0.0))
+    cap_pct = max(floor_pct, float(params.get("buying_power_short_mmr_cap_pct") or 50.0))
+    eff_pct = _clamp(mmr_pct * weight, floor_pct, cap_pct)
+    return 1.0 + (eff_pct / 100.0)
+
+
+def _bp_effective_price(
+    cfg: Dict,
+    side: str,
+    ref_price: float,
+    *,
+    broker: Optional[AlpacaBroker] = None,
+    symbol: Optional[str] = None,
+    asset_margin_cache: Optional[Dict[str, Optional[float]]] = None,
+) -> float:
+    px = max(0.0, float(ref_price or 0.0))
+    if px <= 0:
+        return 0.0
+    params = cfg.get("daily_trend_reversal") or {}
+    if not bool(params.get("buying_power_model_enabled", True)):
+        return px
+    long_markup = max(0.0, min(float(params.get("buying_power_long_open_markup") or 0.0), 0.5))
+    short_markup = max(0.0, min(float(params.get("buying_power_short_open_markup") or 0.03), 0.5))
+    short_margin_mult = max(1.0, min(float(params.get("buying_power_short_margin_multiplier") or 1.2), 3.0))
+    side_norm = str(side or "").strip().lower()
+    if side_norm == "sell":
+        mmr_mult = _bp_short_mmr_multiplier(cfg, broker, symbol, asset_margin_cache)
+        return px * (1.0 + short_markup) * short_margin_mult * mmr_mult
+    return px * (1.0 + long_markup)
+
+
+def _compute_reanchored_exit_prices(plan: Any, fill_price: float) -> tuple[float, float, float, float]:
+    fill_px = max(0.0, float(fill_price or 0.0))
+    if fill_px <= 0:
+        raise ValueError("fill price must be positive")
+
+    raw_entry = _safe_float(getattr(plan, "entry_price", None), fill_px)
+    raw_stop = _safe_float(getattr(plan, "stop_price", None), 0.0)
+    raw_target = _safe_float(getattr(plan, "target_price", None), 0.0)
+    stop_offset = abs(raw_entry - raw_stop)
+    target_offset = abs(raw_target - raw_entry)
+    if stop_offset <= 0:
+        stop_offset = max(0.0, _safe_float(getattr(plan, "stop_distance", None), 0.0))
+    if target_offset <= 0 and stop_offset > 0:
+        rr = max(0.0, _safe_float(getattr(plan, "target_rr", None), 0.0))
+        target_offset = stop_offset * rr if rr > 0 else stop_offset
+    if stop_offset <= 0 or target_offset <= 0:
+        raise ValueError("invalid stop/target offsets for reanchoring")
+
+    direction = str(getattr(plan, "direction", "long") or "long").lower()
+    if direction == "long":
+        stop_price = fill_px - stop_offset
+        target_price = fill_px + target_offset
+    else:
+        stop_price = fill_px + stop_offset
+        target_price = fill_px - target_offset
+    return stop_price, target_price, stop_offset, target_offset
+
+
+def _wait_for_entry_fill(
+    broker: AlpacaBroker,
+    order_id: str,
+    expected_qty: int,
+    timeout_sec: float,
+    poll_sec: float,
+    cancel_unfilled: bool,
+) -> Optional[Dict[str, Any]]:
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None
+    expected = max(1, int(expected_qty))
+    timeout = max(0.5, float(timeout_sec))
+    poll = max(0.05, float(poll_sec))
+    deadline = time.time() + timeout
+    last_order: Optional[Dict[str, Any]] = None
+
+    while True:
+        try:
+            order = broker.get_order(oid) or {}
+        except Exception:
+            order = {}
+        if order:
+            last_order = order
+            status = str(order.get("status") or "").lower().strip()
+            filled_qty = int(_safe_float(order.get("filled_qty"), 0.0) or 0)
+            fill_price = _safe_float(order.get("filled_avg_price"), 0.0)
+            if filled_qty > 0 and fill_price > 0:
+                full = status == "filled" or filled_qty >= expected
+                if full:
+                    return {
+                        "order": order,
+                        "status": status,
+                        "filled_qty": filled_qty,
+                        "fill_price": fill_price,
+                        "full": True,
+                        "timed_out": False,
+                    }
+            if status in {"canceled", "expired", "rejected"}:
+                break
+
+        if time.time() >= deadline:
+            break
+        time.sleep(poll)
+
+    if cancel_unfilled:
+        try:
+            broker.cancel_order(oid)
+        except Exception:
+            pass
+        try:
+            refreshed = broker.get_order(oid) or {}
+            if refreshed:
+                last_order = refreshed
+        except Exception:
+            pass
+
+    if not isinstance(last_order, dict):
+        return None
+    status = str(last_order.get("status") or "").lower().strip()
+    filled_qty = int(_safe_float(last_order.get("filled_qty"), 0.0) or 0)
+    fill_price = _safe_float(last_order.get("filled_avg_price"), 0.0)
+    if filled_qty <= 0 or fill_price <= 0:
+        return None
+    return {
+        "order": last_order,
+        "status": status,
+        "filled_qty": filled_qty,
+        "fill_price": fill_price,
+        "full": status == "filled" or filled_qty >= expected,
+        "timed_out": True,
+    }
+
+
+def _position_fill_snapshot(broker: AlpacaBroker, symbol: str) -> Optional[Dict[str, Any]]:
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return None
+    try:
+        positions = broker.list_positions() or []
+    except Exception:
+        return None
+    for pos in positions:
+        if str((pos or {}).get("symbol") or "").upper().strip() != sym:
+            continue
+        qty_abs = abs(int(_safe_float((pos or {}).get("qty"), 0.0) or 0))
+        avg_entry = _safe_float((pos or {}).get("avg_entry_price"), 0.0)
+        if qty_abs > 0 and avg_entry > 0:
+            return {
+                "filled_qty": qty_abs,
+                "fill_price": avg_entry,
+                "source": "position_snapshot",
+            }
+    return None
+
+
+def _position_snapshot_map(broker: AlpacaBroker) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        positions = broker.list_positions() or []
+    except Exception:
+        return out
+    for pos in positions:
+        sym = str((pos or {}).get("symbol") or "").upper().strip()
+        if not sym:
+            continue
+        out[sym] = pos or {}
+    return out
+
+
+def _open_exit_coverage_map(broker: AlpacaBroker) -> Dict[tuple[str, str], Dict[str, bool]]:
+    coverage: Dict[tuple[str, str], Dict[str, bool]] = {}
+    try:
+        orders = broker.list_orders(status="open", limit=500) or []
+    except Exception:
+        return coverage
+    stop_types = {"stop", "stop_limit", "trailing_stop"}
+    for order in orders:
+        sym = str((order or {}).get("symbol") or "").upper().strip()
+        side = str((order or {}).get("side") or "").lower().strip()
+        otype = str((order or {}).get("type") or "").lower().strip()
+        if not sym or side not in {"buy", "sell"}:
+            continue
+        key = (sym, side)
+        state = coverage.setdefault(key, {"has_limit": False, "has_stop": False})
+        if otype == "limit":
+            state["has_limit"] = True
+        if otype in stop_types:
+            state["has_stop"] = True
+    return coverage
+
+
+def _repair_pending_reanchor_exits(
+    cfg: Dict[str, Any],
+    broker: AlpacaBroker,
+    pending: Dict[str, Dict[str, Any]],
+    *,
+    debug: bool = False,
+) -> None:
+    if not pending or not broker.ready():
+        return
+    positions_by_symbol = _position_snapshot_map(broker)
+    if not positions_by_symbol:
+        return
+    coverage = _open_exit_coverage_map(broker)
+    for symbol, meta in list((pending or {}).items()):
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            continue
+        pos = positions_by_symbol.get(sym)
+        if not pos:
+            continue
+        side_raw = str((pos or {}).get("side") or "").lower().strip()
+        qty_raw = _safe_float((pos or {}).get("qty"), 0.0)
+        is_long = (side_raw == "long") or (qty_raw > 0)
+        close_side = "sell" if is_long else "buy"
+        cov = coverage.get((sym, close_side), {"has_limit": False, "has_stop": False})
+        if cov.get("has_limit") and cov.get("has_stop"):
+            if debug:
+                logging.info("[LIVE_DEBUG] reanchor_repair_skip symbol=%s reason=covered", sym)
+            continue
+
+        qty_abs = int(abs(qty_raw))
+        avg_entry = _safe_float((pos or {}).get("avg_entry_price"), 0.0)
+        plan = (meta or {}).get("plan")
+        tif = str((meta or {}).get("tif") or "day").lower()
+        if qty_abs <= 0 or avg_entry <= 0 or plan is None:
+            if debug:
+                logging.info(
+                    "[LIVE_DEBUG] reanchor_repair_skip symbol=%s reason=invalid_snapshot qty=%s avg_entry=%s has_plan=%s",
+                    sym,
+                    qty_abs,
+                    avg_entry,
+                    bool(plan),
+                )
+            continue
+        try:
+            stop_price, target_price, stop_offset, target_offset = _compute_reanchored_exit_prices(plan, avg_entry)
+            resp = broker.submit_oco_exit_order(
+                symbol=sym,
+                side=close_side,
+                qty=qty_abs,
+                take_profit=target_price,
+                stop_loss=stop_price,
+                base_price=avg_entry,
+                tif=tif,
+            )
+            logging.info(
+                "[LIVE] reanchor_repair_exit_placed symbol=%s qty=%s close_side=%s entry=%.6f stop=%.6f target=%.6f stop_offset=%.6f target_offset=%.6f order_id=%s",
+                sym,
+                qty_abs,
+                close_side,
+                avg_entry,
+                stop_price,
+                target_price,
+                stop_offset,
+                target_offset,
+                (resp or {}).get("id"),
+            )
+            pending.pop(sym, None)
+        except Exception as exc:
+            logging.error("[LIVE] reanchor_repair_exit_failed symbol=%s error=%s", sym, exc)
+
+
+def _passes_live_quality_gate(cfg: Dict, stats: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+    params = cfg.get("daily_trend_reversal") or {}
+    if not bool(params.get("live_quality_gate_enabled", False)):
+        return True, None
+    if not isinstance(stats, dict):
+        return False, "missing_watchlist_stats"
+
+    min_selection_score = _safe_float_opt(params.get("live_quality_min_selection_score"))
+    min_avg_r = _safe_float_opt(params.get("live_quality_min_avgR"))
+    min_trades = int(params.get("live_quality_min_trades_count") or 0)
+    max_rank = int(params.get("live_quality_max_rank") or 0)
+    min_positive_month_rate = _safe_float_opt(params.get("live_quality_min_positive_month_rate"))
+
+    rank = int(stats.get("rank") or 0)
+    if max_rank > 0 and rank > 0 and rank > max_rank:
+        return False, f"rank>{max_rank}"
+
+    selection_score = _safe_float_opt(stats.get("selection_score"))
+    if min_selection_score is not None and selection_score is not None and selection_score < min_selection_score:
+        return False, f"selection_score<{min_selection_score:.4f}"
+
+    avg_r = _safe_float_opt(stats.get("avgR"))
+    if min_avg_r is not None and avg_r is not None and avg_r < min_avg_r:
+        return False, f"avgR<{min_avg_r:.4f}"
+
+    trades_count = int(stats.get("trades_count") or 0)
+    if min_trades > 0 and trades_count < min_trades:
+        return False, f"trades_count<{min_trades}"
+
+    positive_month_rate = _safe_float_opt(stats.get("positive_month_rate"))
+    if (
+        min_positive_month_rate is not None
+        and positive_month_rate is not None
+        and positive_month_rate < min_positive_month_rate
+    ):
+        return False, f"positive_month_rate<{min_positive_month_rate:.4f}"
+
+    return True, None
+
+
 def _account_buying_power(acct: Optional[Dict[str, Any]]) -> tuple[float, bool]:
     if not isinstance(acct, dict):
         return 0.0, False
-    for key in ("buying_power", "daytrading_buying_power", "regt_buying_power"):
+    primary_candidates: List[float] = []
+    for key in ("effective_buying_power", "daytrading_buying_power", "buying_power"):
         if key not in acct or acct.get(key) is None:
             continue
         try:
-            return max(0.0, float(acct.get(key) or 0.0)), True
+            val = max(0.0, float(acct.get(key) or 0.0))
+            if val > 0:
+                primary_candidates.append(val)
         except Exception:
             continue
+    if primary_candidates:
+        # Prefer intraday/effective BP fields that Alpaca applies to active session checks.
+        return min(primary_candidates), True
+    fallback_candidates: List[float] = []
+    for key in ("regt_buying_power",):
+        if key not in acct or acct.get(key) is None:
+            continue
+        try:
+            val = max(0.0, float(acct.get(key) or 0.0))
+            if val > 0:
+                fallback_candidates.append(val)
+        except Exception:
+            continue
+    if fallback_candidates:
+        return min(fallback_candidates), True
+    return 0.0, False
+
+
+def _account_non_marginable_buying_power(acct: Optional[Dict[str, Any]]) -> tuple[float, bool]:
+    if not isinstance(acct, dict):
+        return 0.0, False
+    try:
+        val = max(0.0, float(acct.get("non_marginable_buying_power") or 0.0))
+        if val > 0:
+            return val, True
+    except Exception:
+        pass
     return 0.0, False
 
 
@@ -178,11 +570,12 @@ def _seed_runtime_exposure(
     cfg: Dict,
     broker: AlpacaBroker,
     *,
+    asset_margin_cache: Optional[Dict[str, Optional[float]]] = None,
     emit_debug: bool = True,
-) -> tuple[Optional[float], Optional[float], Optional[float], Optional[int], Optional[float], bool]:
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[int], Optional[float], bool, Optional[float], bool]:
     params = cfg.get("daily_trend_reversal") or {}
     if not broker.ready():
-        return None, None, None, None, None, False
+        return None, None, None, None, None, False, None, False
     try:
         acct = broker.get_account() or {}
         equity_seed = _safe_float(acct.get("equity"), 0.0)
@@ -192,6 +585,7 @@ def _seed_runtime_exposure(
         except Exception:
             leverage = 4.0
         buying_power, bp_present = _account_buying_power(acct)
+        non_marginable_buying_power, non_marginable_bp_present = _account_non_marginable_buying_power(acct)
         max_margin_usage = float(params.get("max_margin_usage") or 0.70)
         allowed_total_seed = max(0.0, equity_seed * leverage)
         if bp_present:
@@ -201,13 +595,37 @@ def _seed_runtime_exposure(
         used_positions = 0.0
         positions = broker.list_positions() or []
         for pos in positions:
-            used_positions += abs(_safe_float(pos.get("market_value"), 0.0))
-        open_order_notional, open_order_count = _estimate_open_entry_order_exposure(cfg, broker)
+            qty_abs = abs(_safe_float(pos.get("qty"), 0.0))
+            mv = abs(_safe_float(pos.get("market_value"), 0.0))
+            if mv <= 0 and qty_abs > 0:
+                px = abs(_safe_float(pos.get("current_price"), 0.0))
+                if px <= 0:
+                    px = abs(_safe_float(pos.get("avg_entry_price"), 0.0))
+                mv = qty_abs * px
+            side_raw = str(pos.get("side") or "").strip().lower()
+            is_short = side_raw == "short" or _safe_float(pos.get("qty"), 0.0) < 0
+            bp_side = "sell" if is_short else "buy"
+            symbol = str(pos.get("symbol") or "").upper()
+            if mv > 0 and qty_abs > 0:
+                mv = _bp_effective_price(
+                    cfg,
+                    bp_side,
+                    mv / qty_abs,
+                    broker=broker,
+                    symbol=symbol,
+                    asset_margin_cache=asset_margin_cache,
+                ) * qty_abs
+            used_positions += mv
+        open_order_notional, open_order_count = _estimate_open_entry_order_exposure(
+            cfg,
+            broker,
+            asset_margin_cache=asset_margin_cache,
+        )
         used_notional_runtime = used_positions + open_order_notional
         open_positions_runtime = len(positions) + open_order_count
         if emit_debug:
             logging.info(
-                "[LIVE_DEBUG] exposure_seed equity=%.2f allowed_total=%.2f used_positions=%.2f used_open_orders=%.2f used_total=%.2f open_positions=%s open_entry_orders=%s buying_power=%.2f bp_present=%s",
+                "[LIVE_DEBUG] exposure_seed equity=%.2f allowed_total=%.2f used_positions=%.2f used_open_orders=%.2f used_total=%.2f open_positions=%s open_entry_orders=%s buying_power=%.2f bp_present=%s non_marginable_bp=%.2f non_marginable_bp_present=%s",
                 equity_seed,
                 allowed_total_seed,
                 used_positions,
@@ -217,6 +635,8 @@ def _seed_runtime_exposure(
                 open_order_count,
                 buying_power,
                 bp_present,
+                non_marginable_buying_power,
+                non_marginable_bp_present,
             )
         return (
             equity_seed,
@@ -225,21 +645,28 @@ def _seed_runtime_exposure(
             open_positions_runtime,
             buying_power,
             bp_present,
+            non_marginable_buying_power,
+            non_marginable_bp_present,
         )
     except Exception as exc:
         if emit_debug:
             logging.info("[LIVE_DEBUG] exposure_seed_failed error=%s", exc)
-        return None, None, None, None, None, False
+        return None, None, None, None, None, False, None, False
 
 
-def _estimate_open_entry_order_exposure(cfg: Dict, broker: AlpacaBroker) -> tuple[float, int]:
+def _estimate_open_entry_order_exposure(
+    cfg: Dict,
+    broker: AlpacaBroker,
+    *,
+    asset_margin_cache: Optional[Dict[str, Optional[float]]] = None,
+) -> tuple[float, int]:
     if not broker.ready():
         return 0.0, 0
     try:
         orders = broker.list_orders(status="open", limit=500) or []
     except Exception:
         return 0.0, 0
-    unresolved: List[tuple[str, float, float]] = []
+    unresolved: List[tuple[str, float, float, str]] = []
     symbols_needing_px: List[str] = []
     exposure = 0.0
     count = 0
@@ -259,16 +686,24 @@ def _estimate_open_entry_order_exposure(cfg: Dict, broker: AlpacaBroker) -> tupl
             exposure += abs(notional)
             count += 1
             continue
+        order_side = str(order.get("side") or "").strip().lower()
+        symbol = str(order.get("symbol") or "").upper()
         limit_price = _safe_float(order.get("limit_price"), 0.0)
         if limit_price > 0:
-            exposure += remaining_qty * limit_price
+            exposure += remaining_qty * _bp_effective_price(
+                cfg,
+                order_side,
+                limit_price,
+                broker=broker,
+                symbol=symbol,
+                asset_margin_cache=asset_margin_cache,
+            )
             count += 1
             continue
-        symbol = str(order.get("symbol") or "").upper()
         if not symbol:
             continue
         stop_price = _safe_float(order.get("stop_price"), 0.0)
-        unresolved.append((symbol, remaining_qty, stop_price))
+        unresolved.append((symbol, remaining_qty, stop_price, order_side))
         symbols_needing_px.append(symbol)
     px_map: Dict[str, float] = {}
     if symbols_needing_px:
@@ -276,12 +711,19 @@ def _estimate_open_entry_order_exposure(cfg: Dict, broker: AlpacaBroker) -> tupl
             px_map = get_latest_intraday_prices(sorted(set(symbols_needing_px)), cfg=cfg, lookback_minutes=5)
         except Exception:
             px_map = {}
-    for symbol, remaining_qty, stop_price in unresolved:
+    for symbol, remaining_qty, stop_price, order_side in unresolved:
         px = _safe_float(px_map.get(symbol), 0.0)
         if px <= 0 and stop_price > 0:
             px = stop_price
         if px > 0:
-            exposure += remaining_qty * px
+            exposure += remaining_qty * _bp_effective_price(
+                cfg,
+                order_side,
+                px,
+                broker=broker,
+                symbol=symbol,
+                asset_margin_cache=asset_margin_cache,
+            )
             count += 1
     return exposure, count
 
@@ -581,15 +1023,20 @@ def run_live(
     entry_type = str(params.get("entry_order_type") or "market").lower()
     tif = str(params.get("order_tif") or "day").lower()
     use_brackets = bool(params.get("use_brackets", True))
+    live_reanchor_brackets_on_fill = bool(params.get("live_reanchor_brackets_on_fill", True))
+    live_reanchor_fill_timeout_sec = max(0.5, float(params.get("live_reanchor_fill_timeout_sec") or 30.0))
+    live_reanchor_fill_poll_sec = max(0.05, float(params.get("live_reanchor_fill_poll_sec") or 0.25))
+    live_reanchor_cancel_unfilled_entry = bool(params.get("live_reanchor_cancel_unfilled_entry", True))
     _log_debug("watchlist date=%s symbols=%s", tgt, len(symbols))
     _log_debug(
-        "entry_type=%s tif=%s intraday_filter=%s early_range_minutes=%s time_stop_minutes=%s entry_time_override=%s",
+        "entry_type=%s tif=%s intraday_filter=%s early_range_minutes=%s time_stop_minutes=%s entry_time_override=%s reanchor_brackets_on_fill=%s",
         entry_type,
         tif,
         bool(params.get("intraday_filter_enabled", False)),
         params.get("early_range_minutes"),
         params.get("time_stop_minutes"),
         entry_time_et,
+        live_reanchor_brackets_on_fill,
     )
     _log_debug(
         "slot_distribution enabled=%s slot_target=%s meta=%s",
@@ -607,7 +1054,10 @@ def run_live(
     open_positions_runtime: Optional[int] = None
     live_buying_power: Optional[float] = None
     live_buying_power_present = False
+    live_non_marginable_buying_power: Optional[float] = None
+    live_non_marginable_buying_power_present = False
     day_start_equity_seed: Optional[float] = None
+    asset_margin_cache: Dict[str, Optional[float]] = {}
     if broker.ready():
         (
             equity_seed,
@@ -616,13 +1066,34 @@ def run_live(
             open_positions_runtime,
             live_buying_power,
             live_buying_power_present,
-        ) = _seed_runtime_exposure(cfg, broker, emit_debug=debug)
+            live_non_marginable_buying_power,
+            live_non_marginable_buying_power_present,
+        ) = _seed_runtime_exposure(
+            cfg,
+            broker,
+            asset_margin_cache=asset_margin_cache,
+            emit_debug=debug,
+        )
         if equity_seed is not None and equity_seed > 0:
             day_start_equity_seed = float(equity_seed)
     placed: List[Dict] = []
     plans: List = []
+    pending_reanchor_exits: Dict[str, Dict[str, Any]] = {}
     for symbol in symbols:
         _log_debug("symbol=%s start", symbol)
+        wl_stats = symbol_watchlist_stats.get(symbol) or {}
+        quality_ok, quality_reason = _passes_live_quality_gate(cfg, wl_stats)
+        if not quality_ok:
+            _log_debug(
+                "symbol=%s skip_live_quality_gate reason=%s rank=%s selection_score=%s avgR=%s trades=%s",
+                symbol,
+                quality_reason,
+                wl_stats.get("rank"),
+                wl_stats.get("selection_score"),
+                wl_stats.get("avgR"),
+                wl_stats.get("trades_count"),
+            )
+            continue
         signal = generate_signal_for_date(symbol, tgt, cfg, data_store)
         if not signal:
             _log_debug("symbol=%s no_signal", symbol)
@@ -725,6 +1196,19 @@ def run_live(
             plan.stop_distance,
             plan.target_rr,
         )
+        if (
+            getattr(plan, "signal_return_atr", None) is not None
+            or getattr(plan, "open_noise_bps", None) is not None
+        ):
+            _log_debug(
+                "symbol=%s quality signal_return_atr=%s open_noise_bps=%s open_noise_atr=%s open_noise_stop_ratio=%s stop_to_open_noise_ratio=%s",
+                symbol,
+                getattr(plan, "signal_return_atr", None),
+                getattr(plan, "open_noise_bps", None),
+                getattr(plan, "open_noise_atr", None),
+                getattr(plan, "open_noise_stop_ratio", None),
+                getattr(plan, "stop_to_open_noise_ratio", None),
+            )
         base_price = None
         if entry_type == "market":
             latest = get_latest_intraday_prices([symbol], cfg=cfg, lookback_minutes=1)
@@ -737,6 +1221,7 @@ def run_live(
                 acct_now = broker.get_account() or {}
                 equity_now = _safe_float(acct_now.get("equity"), 0.0)
                 bp_now, bp_now_present = _account_buying_power(acct_now)
+                non_marginable_bp_now, non_marginable_bp_now_present = _account_non_marginable_buying_power(acct_now)
                 if equity_now > 0:
                     equity_seed = equity_now
                     if day_start_equity_seed is None:
@@ -750,11 +1235,14 @@ def run_live(
                         allowed_total_seed = bp_budget
                     live_buying_power = bp_now
                     live_buying_power_present = True
+                    live_non_marginable_buying_power = non_marginable_bp_now
+                    live_non_marginable_buying_power_present = non_marginable_bp_now_present
                     _log_debug(
-                        "symbol=%s broker_bp_snapshot equity=%.2f buying_power=%.2f bp_budget=%.2f allowed_total_seed=%.2f used_notional_runtime=%s",
+                        "symbol=%s broker_bp_snapshot equity=%.2f buying_power=%.2f non_marginable_bp=%.2f bp_budget=%.2f allowed_total_seed=%.2f used_notional_runtime=%s",
                         symbol,
                         equity_seed or 0.0,
                         bp_now,
+                        non_marginable_bp_now,
                         bp_budget,
                         allowed_total_seed or 0.0,
                         used_notional_runtime,
@@ -784,19 +1272,75 @@ def run_live(
         if qty > 0 and live_buying_power_present:
             ref_px = _safe_float(base_price, 0.0) if entry_type == "market" else _safe_float(plan.entry_price, 0.0)
             if ref_px > 0:
-                bp_buffer = float(params.get("live_buying_power_buffer") or params.get("margin_safety_buffer") or 0.0)
-                bp_buffer = max(0.0, min(bp_buffer, 0.5))
+                open_side = "buy" if plan.direction == "long" else "sell"
+                bp_buffer = resolve_effective_margin_buffer(params)
+                live_bp_buffer_override = _safe_float_opt(params.get("live_buying_power_buffer"))
+                if live_bp_buffer_override is not None:
+                    bp_buffer = max(bp_buffer, max(0.0, min(live_bp_buffer_override, 0.9)))
                 bp_budget = max(0.0, (live_buying_power or 0.0) * (1.0 - bp_buffer))
-                bp_qty_cap = int(bp_budget // ref_px) if bp_budget > 0 else 0
+                live_non_marginable_bp_cap_enabled = bool(params.get("live_non_marginable_bp_cap_enabled", True))
+                live_non_marginable_mmr_threshold_pct = max(
+                    0.0,
+                    float(params.get("live_non_marginable_mmr_threshold_pct") or 100.0),
+                )
+                live_non_marginable_bp_cap_when_mmr_missing = bool(
+                    params.get("live_non_marginable_bp_cap_when_mmr_missing", True)
+                )
+                mmr_pct = _asset_maintenance_margin_pct(
+                    broker,
+                    symbol,
+                    asset_margin_cache,
+                )
+                cap_non_marginable_reason: Optional[str] = None
+                if mmr_pct is not None and mmr_pct >= live_non_marginable_mmr_threshold_pct:
+                    cap_non_marginable_reason = "mmr_threshold"
+                elif (
+                    mmr_pct is None
+                    and open_side == "sell"
+                    and live_non_marginable_bp_cap_when_mmr_missing
+                ):
+                    cap_non_marginable_reason = "mmr_missing_short"
+                if (
+                    live_non_marginable_bp_cap_enabled
+                    and live_non_marginable_buying_power_present
+                    and (live_non_marginable_buying_power or 0.0) > 0.0
+                    and cap_non_marginable_reason is not None
+                ):
+                    non_marginable_bp_budget = max(
+                        0.0,
+                        (live_non_marginable_buying_power or 0.0) * (1.0 - bp_buffer),
+                    )
+                    if non_marginable_bp_budget < bp_budget:
+                        _log_debug(
+                            "symbol=%s bp_budget_capped_non_marginable reason=%s mmr_pct=%s threshold=%.2f bp_budget=%.2f non_marginable_bp_budget=%.2f",
+                            symbol,
+                            cap_non_marginable_reason,
+                            "None" if mmr_pct is None else f"{mmr_pct:.2f}",
+                            live_non_marginable_mmr_threshold_pct,
+                            bp_budget,
+                            non_marginable_bp_budget,
+                        )
+                        bp_budget = non_marginable_bp_budget
+                bp_unit_price = _bp_effective_price(
+                    cfg,
+                    open_side,
+                    ref_px,
+                    broker=broker,
+                    symbol=symbol,
+                    asset_margin_cache=asset_margin_cache,
+                )
+                bp_qty_cap = int(bp_budget // bp_unit_price) if bp_budget > 0 and bp_unit_price > 0 else 0
                 if bp_qty_cap < qty:
                     _log_debug(
-                        "symbol=%s qty_capped_by_broker_bp qty=%s cap=%s buying_power=%.2f bp_buffer=%.3f ref_px=%.4f",
+                        "symbol=%s qty_capped_by_broker_bp qty=%s cap=%s buying_power=%.2f bp_buffer=%.3f ref_px=%.4f bp_unit_px=%.4f side=%s",
                         symbol,
                         qty,
                         bp_qty_cap,
                         live_buying_power or 0.0,
                         bp_buffer,
                         ref_px,
+                        bp_unit_price,
+                        open_side,
                     )
                     qty = max(0, bp_qty_cap)
                     if isinstance(state, dict):
@@ -808,12 +1352,142 @@ def run_live(
             logging.error("[LIVE] Alpaca credentials missing; cannot place order for %s", symbol)
             continue
         side = "buy" if plan.direction == "long" else "sell"
-        try:
+        if use_brackets and entry_type == "market" and live_reanchor_brackets_on_fill:
+            pending_reanchor_exits[str(symbol).upper()] = {"plan": plan, "tif": tif}
+
+        def _submit_reanchored_market_with_qty(order_qty: int) -> Dict[str, Any]:
+            # Submit market entry first, then anchor exits to actual fill.
+            entry_payload = {
+                "symbol": symbol,
+                "side": side,
+                "qty": order_qty,
+                "type": "market",
+                "time_in_force": tif,
+            }
+            entry_resp = broker.submit_order(entry_payload)
+            entry_order_id = str((entry_resp or {}).get("id") or "").strip()
+            fill_info = _wait_for_entry_fill(
+                broker,
+                entry_order_id,
+                expected_qty=order_qty,
+                timeout_sec=live_reanchor_fill_timeout_sec,
+                poll_sec=live_reanchor_fill_poll_sec,
+                cancel_unfilled=live_reanchor_cancel_unfilled_entry,
+            )
+            if not fill_info:
+                # Fallback for API timing gaps: infer fill from live position snapshot.
+                pos_fill = _position_fill_snapshot(broker, symbol)
+                if pos_fill:
+                    fallback_order = {}
+                    try:
+                        fallback_order = broker.get_order(entry_order_id) or {}
+                    except Exception:
+                        fallback_order = {}
+                    fill_info = {
+                        "order": fallback_order,
+                        "status": "position_snapshot",
+                        "filled_qty": int(pos_fill.get("filled_qty") or 0),
+                        "fill_price": _safe_float(pos_fill.get("fill_price"), 0.0),
+                        "full": False,
+                        "timed_out": True,
+                        "source": "position_snapshot",
+                    }
+                    _log_debug(
+                        "symbol=%s reanchor_fill_fallback source=position_snapshot order_id=%s filled_qty=%s fill_price=%.6f",
+                        symbol,
+                        entry_order_id,
+                        fill_info.get("filled_qty"),
+                        _safe_float(fill_info.get("fill_price"), 0.0),
+                    )
+                else:
+                    latest_status = None
+                    latest_filled_qty = None
+                    latest_fill_px = None
+                    try:
+                        latest = broker.get_order(entry_order_id) or {}
+                        latest_status = latest.get("status")
+                        latest_filled_qty = latest.get("filled_qty")
+                        latest_fill_px = latest.get("filled_avg_price")
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "entry fill unavailable for symbol=%s order_id=%s status=%s filled_qty=%s fill_px=%s"
+                        % (symbol, entry_order_id, latest_status, latest_filled_qty, latest_fill_px)
+                    )
+            fill_qty = int(fill_info.get("filled_qty") or 0)
+            fill_price = _safe_float(fill_info.get("fill_price"), 0.0)
+            if fill_qty <= 0 or fill_price <= 0:
+                raise RuntimeError(f"invalid entry fill for symbol={symbol} order_id={entry_order_id}")
+            if bool(fill_info.get("timed_out")):
+                _log_debug(
+                    "symbol=%s reanchor_entry_fill_timed_out order_id=%s status=%s filled_qty=%s fill_price=%.6f",
+                    symbol,
+                    entry_order_id,
+                    fill_info.get("status"),
+                    fill_qty,
+                    fill_price,
+                )
+            if fill_qty < order_qty:
+                _log_debug(
+                    "symbol=%s reanchor_entry_partial_fill order_id=%s requested_qty=%s filled_qty=%s",
+                    symbol,
+                    entry_order_id,
+                    order_qty,
+                    fill_qty,
+                )
+
+            stop_price_anchored, target_price_anchored, stop_offset, target_offset = _compute_reanchored_exit_prices(
+                plan,
+                fill_price,
+            )
+            close_side = "sell" if side == "buy" else "buy"
+            try:
+                exit_resp = broker.submit_oco_exit_order(
+                    symbol=symbol,
+                    side=close_side,
+                    qty=fill_qty,
+                    take_profit=target_price_anchored,
+                    stop_loss=stop_price_anchored,
+                    base_price=fill_price,
+                    tif=tif,
+                )
+            except Exception:
+                # Never leave a fresh fill without a protective exit order.
+                try:
+                    broker.close_position(symbol)
+                    logging.error("[LIVE] emergency close submitted symbol=%s after exit-order failure", symbol)
+                except Exception as close_exc:
+                    logging.error("[LIVE] emergency close failed symbol=%s error=%s", symbol, close_exc)
+                raise
+
+            _log_debug(
+                "symbol=%s reanchor_exits_on_fill entry_fill=%.6f stop=%.6f target=%.6f stop_offset=%.6f target_offset=%.6f close_side=%s",
+                symbol,
+                fill_price,
+                stop_price_anchored,
+                target_price_anchored,
+                stop_offset,
+                target_offset,
+                close_side,
+            )
+            combined = dict(entry_resp or {})
+            combined["entry_order"] = entry_resp
+            combined["exit_order"] = exit_resp
+            combined["filled_qty_used"] = fill_qty
+            combined["filled_avg_price_used"] = fill_price
+            combined["reanchored_stop_price"] = stop_price_anchored
+            combined["reanchored_target_price"] = target_price_anchored
+            combined["reanchor_enabled"] = True
+            return combined
+
+        def _submit_with_qty(order_qty: int) -> Dict[str, Any]:
+            if use_brackets and entry_type == "market" and live_reanchor_brackets_on_fill:
+                return _submit_reanchored_market_with_qty(order_qty)
             if use_brackets:
-                resp = broker.submit_bracket_order(
+                return broker.submit_bracket_order(
                     symbol=symbol,
                     side=side,
-                    qty=qty,
+                    qty=order_qty,
                     entry_type=entry_type,
                     entry_price=plan.entry_price if entry_type == "limit" else None,
                     base_price=base_price,
@@ -821,39 +1495,65 @@ def run_live(
                     stop_loss=plan.stop_price,
                     tif=tif,
                 )
-            else:
-                payload = {
-                    "symbol": symbol,
-                    "side": side,
-                    "qty": qty,
-                    "type": entry_type,
-                    "time_in_force": tif,
-                }
-                if entry_type == "limit":
-                    payload["limit_price"] = plan.entry_price
-                resp = broker.submit_order(payload)
-            placed.append(resp)
-            logging.info("[LIVE] order placed symbol=%s side=%s qty=%s", symbol, side, qty)
-            _log_debug("symbol=%s order_response=%s", symbol, resp)
+            payload = {
+                "symbol": symbol,
+                "side": side,
+                "qty": order_qty,
+                "type": entry_type,
+                "time_in_force": tif,
+            }
+            if entry_type == "limit":
+                payload["limit_price"] = plan.entry_price
+            return broker.submit_order(payload)
+
+        def _record_success(resp_obj: Dict[str, Any], placed_qty_val: int) -> None:
+            nonlocal used_notional_runtime, open_positions_runtime, pending_reanchor_exits
+            effective_qty = int(_safe_float((resp_obj or {}).get("filled_qty_used"), float(placed_qty_val)) or 0)
+            if effective_qty <= 0:
+                effective_qty = int(max(0, placed_qty_val))
+            placed.append(resp_obj)
+            logging.info("[LIVE] order placed symbol=%s side=%s qty=%s", symbol, side, effective_qty)
+            _log_debug("symbol=%s order_response=%s", symbol, resp_obj)
+            pending_reanchor_exits.pop(str(symbol).upper(), None)
             if used_notional_runtime is not None and open_positions_runtime is not None:
-                reserve_qty = int((state or {}).get("capacity_qty") or qty)
-                reserve_px = 0.0
+                reserve_qty = int((state or {}).get("capacity_qty") or effective_qty)
+                if (resp_obj or {}).get("filled_qty_used") is not None:
+                    reserve_qty = min(max(0, reserve_qty), max(0, effective_qty))
+                reserve_unit_price = _safe_float((state or {}).get("capacity_notional_per_share"), 0.0)
+                reserve_px = _safe_float((resp_obj or {}).get("filled_avg_price_used"), 0.0)
                 if entry_type == "market":
-                    reserve_px = _safe_float(base_price, 0.0)
+                    reserve_px = max(reserve_px, _safe_float(base_price, 0.0))
                 if reserve_px <= 0:
                     reserve_px = _safe_float(getattr(plan, "entry_price", 0.0), 0.0)
-                reserve_notional = max(0.0, reserve_qty * reserve_px)
+                reserve_side = "buy" if plan.direction == "long" else "sell"
+                reserve_unit_price_live = _bp_effective_price(
+                    cfg,
+                    reserve_side,
+                    reserve_px,
+                    broker=broker,
+                    symbol=symbol,
+                    asset_margin_cache=asset_margin_cache,
+                )
+                if reserve_unit_price <= 0:
+                    reserve_unit_price = reserve_unit_price_live
+                else:
+                    reserve_unit_price = max(reserve_unit_price, reserve_unit_price_live)
+                reserve_notional = max(0.0, reserve_qty * reserve_unit_price)
                 used_notional_runtime += reserve_notional
                 open_positions_runtime += 1
                 _log_debug(
-                    "symbol=%s reserve_notional=%.2f reserve_qty=%s reserve_px=%.4f used_notional_runtime=%.2f open_positions_runtime=%s",
+                    "symbol=%s reserve_notional=%.2f reserve_qty=%s reserve_px=%.4f reserve_unit_price=%.4f used_notional_runtime=%.2f open_positions_runtime=%s",
                     symbol,
                     reserve_notional,
                     reserve_qty,
                     reserve_px,
+                    reserve_unit_price,
                     used_notional_runtime,
                     open_positions_runtime,
                 )
+        try:
+            resp = _submit_with_qty(qty)
+            _record_success(resp, qty)
         except Exception as exc:
             logging.error("[LIVE] order failed symbol=%s error=%s", symbol, exc)
             resp = getattr(exc, "response", None)
@@ -866,7 +1566,8 @@ def run_live(
                     logging.error("[LIVE] order failed symbol=%s status=%s body=%s", symbol, resp.status_code, resp.text)
                 except Exception:
                     pass
-            if status_code in (403, 422) and "buying power" in body_text.lower():
+            body_lower = body_text.lower()
+            if status_code in (403, 422) and "buying power" in body_lower:
                 (
                     equity_seed,
                     allowed_total_seed,
@@ -874,9 +1575,16 @@ def run_live(
                     open_positions_runtime,
                     live_buying_power,
                     live_buying_power_present,
-                ) = _seed_runtime_exposure(cfg, broker, emit_debug=False)
+                    live_non_marginable_buying_power,
+                    live_non_marginable_buying_power_present,
+                ) = _seed_runtime_exposure(
+                    cfg,
+                    broker,
+                    asset_margin_cache=asset_margin_cache,
+                    emit_debug=False,
+                )
                 _log_debug(
-                    "symbol=%s exposure_resync_after_bp_reject equity=%.2f allowed_total=%.2f used_notional=%.2f open_positions=%s buying_power=%.2f bp_present=%s",
+                    "symbol=%s exposure_resync_after_bp_reject equity=%.2f allowed_total=%.2f used_notional=%.2f open_positions=%s buying_power=%.2f bp_present=%s non_marginable_bp=%.2f non_marginable_bp_present=%s",
                     symbol,
                     equity_seed or 0.0,
                     allowed_total_seed or 0.0,
@@ -884,7 +1592,15 @@ def run_live(
                     open_positions_runtime or 0,
                     live_buying_power or 0.0,
                     live_buying_power_present,
+                    live_non_marginable_buying_power or 0.0,
+                    live_non_marginable_buying_power_present,
                 )
+    _repair_pending_reanchor_exits(
+        cfg,
+        broker,
+        pending_reanchor_exits,
+        debug=debug,
+    )
     flatten_intraday_positions_if_needed(cfg, broker)
     return (placed, plans) if return_plans else placed
 

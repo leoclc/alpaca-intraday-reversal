@@ -28,6 +28,19 @@ def _safe_int_opt(value: Any) -> Optional[int]:
         return None
 
 
+def resolve_effective_margin_buffer(params: Dict[str, Any]) -> float:
+    p = params or {}
+    configured = _safe_float_opt(p.get("margin_safety_buffer"))
+    required = _safe_float_opt(p.get("required_free_margin_buffer"))
+    if required is None:
+        required = _safe_float_opt(p.get("alpaca_required_free_margin_buffer"))
+    if required is None:
+        required = 0.30
+    cfg_buffer = max(0.0, min(configured if configured is not None else 0.0, 0.9))
+    req_buffer = max(0.0, min(required, 0.9))
+    return max(cfg_buffer, req_buffer)
+
+
 def estimate_slot_target_from_stats(
     stats_rows: list[Dict[str, Any]],
     lookback_days: float,
@@ -310,7 +323,14 @@ def compute_qty_with_guards(
     leverage = float(params.get("leverage") or 1.0)
     max_margin_usage = float(params.get("max_margin_usage") or 1.0)
     margin_safety_buffer = float(params.get("margin_safety_buffer") or 0.0)
+    required_free_margin_buffer = _safe_float_opt(params.get("required_free_margin_buffer"))
+    if required_free_margin_buffer is None:
+        required_free_margin_buffer = _safe_float_opt(params.get("alpaca_required_free_margin_buffer"))
+    if required_free_margin_buffer is None:
+        required_free_margin_buffer = 0.30
+    effective_margin_safety_buffer = resolve_effective_margin_buffer(params)
     per_trade_max_pct_available = float(params.get("per_trade_max_pct_available") or 1.0)
+    min_overlap_order_notional = max(0.0, float(params.get("min_overlap_order_notional") or 0.0))
     equal_split_cfg = bool(params.get("equal_split_across_max_slots", False))
     min_af_abs = float(params.get("min_available_funds_abs") or 0.0)
     min_af_ratio = float(params.get("min_available_funds_ratio_of_netliq") or 0.0)
@@ -326,6 +346,13 @@ def compute_qty_with_guards(
     tight_stop_exposure_apply_if_rank_at_least = int(params.get("tight_stop_exposure_apply_if_rank_at_least") or 0)
     tight_stop_exposure_apply_if_score_below = _safe_float_opt(params.get("tight_stop_exposure_apply_if_score_below"))
     tight_stop_exposure_activate_equity_mult = max(0.0, float(params.get("tight_stop_exposure_activate_equity_mult") or 0.0))
+    buying_power_model_enabled = bool(params.get("buying_power_model_enabled", True))
+    buying_power_long_open_markup = max(0.0, min(float(params.get("buying_power_long_open_markup") or 0.0), 0.5))
+    buying_power_short_open_markup = max(0.0, min(float(params.get("buying_power_short_open_markup") or 0.03), 0.5))
+    buying_power_short_margin_multiplier = max(
+        1.0,
+        min(float(params.get("buying_power_short_margin_multiplier") or 1.2), 3.0),
+    )
     equity_taper_enabled = bool(params.get("equity_risk_taper_enabled", False))
     equity_taper_start_mult = max(0.0, float(params.get("equity_risk_taper_start_mult") or 0.0))
     equity_taper_full_mult = max(equity_taper_start_mult, float(params.get("equity_risk_taper_full_mult") or 0.0))
@@ -359,7 +386,10 @@ def compute_qty_with_guards(
         "leverage": leverage,
         "max_margin_usage": max_margin_usage,
         "margin_safety_buffer": margin_safety_buffer,
+        "required_free_margin_buffer": required_free_margin_buffer,
+        "margin_safety_buffer_effective": effective_margin_safety_buffer,
         "per_trade_max_pct_available": per_trade_max_pct_available,
+        "min_overlap_order_notional": min_overlap_order_notional,
         "equal_split_across_max_slots": equal_split_cfg,
         "max_positions": max_positions_cfg,
         "slot_distribution_enabled": slot_distribution_enabled,
@@ -378,6 +408,10 @@ def compute_qty_with_guards(
         "tight_stop_exposure_apply_if_rank_at_least": tight_stop_exposure_apply_if_rank_at_least,
         "tight_stop_exposure_apply_if_score_below": tight_stop_exposure_apply_if_score_below,
         "tight_stop_exposure_activate_equity_mult": tight_stop_exposure_activate_equity_mult,
+        "buying_power_model_enabled": buying_power_model_enabled,
+        "buying_power_long_open_markup": buying_power_long_open_markup,
+        "buying_power_short_open_markup": buying_power_short_open_markup,
+        "buying_power_short_margin_multiplier": buying_power_short_margin_multiplier,
         "equity_risk_taper_enabled": equity_taper_enabled,
         "equity_risk_taper_start_mult": equity_taper_start_mult,
         "equity_risk_taper_full_mult": equity_taper_full_mult,
@@ -464,12 +498,50 @@ def compute_qty_with_guards(
                 dd_scale = max(0.0, 1.0 - (dd_max_reduction * progress))
                 risk_amt = risk_amt_base * dd_scale
                 state["risk_amount_daily_scale"] = dd_scale
+    open_noise_risk_scale_enabled = bool(params.get("open_noise_risk_scale_enabled", False))
+    open_noise_risk_scale_ratio_start = max(0.0, float(params.get("open_noise_risk_scale_ratio_start") or 0.0))
+    open_noise_risk_scale_ratio_full = max(
+        open_noise_risk_scale_ratio_start,
+        float(params.get("open_noise_risk_scale_ratio_full") or open_noise_risk_scale_ratio_start),
+    )
+    open_noise_risk_scale_min_factor = _clamp(
+        float(params.get("open_noise_risk_scale_min_factor") or 1.0),
+        0.05,
+        1.0,
+    )
+    state["open_noise_risk_scale_enabled"] = open_noise_risk_scale_enabled
+    state["open_noise_risk_scale_ratio_start"] = open_noise_risk_scale_ratio_start
+    state["open_noise_risk_scale_ratio_full"] = open_noise_risk_scale_ratio_full
+    state["open_noise_risk_scale_min_factor"] = open_noise_risk_scale_min_factor
+    atr_risk_scale_enabled = bool(params.get("atr_risk_scale_enabled", False))
+    atr_risk_scale_pct_start = max(0.0, float(params.get("atr_risk_scale_pct_start") or 0.0))
+    atr_risk_scale_pct_full = max(
+        atr_risk_scale_pct_start,
+        float(params.get("atr_risk_scale_pct_full") or atr_risk_scale_pct_start),
+    )
+    atr_risk_scale_min_factor = _clamp(
+        float(params.get("atr_risk_scale_min_factor") or 1.0),
+        0.05,
+        1.0,
+    )
+    state["atr_risk_scale_enabled"] = atr_risk_scale_enabled
+    state["atr_risk_scale_pct_start"] = atr_risk_scale_pct_start
+    state["atr_risk_scale_pct_full"] = atr_risk_scale_pct_full
+    state["atr_risk_scale_min_factor"] = atr_risk_scale_min_factor
     state["risk_amount"] = risk_amt
     raw_stop_distance = float(plan.stop_distance)
     if raw_stop_distance <= 0:
         state["reject_reason"] = "stop_distance_zero"
         return 0, state
     entry_price = max(1e-9, float(plan.entry_price))
+    open_side = "buy" if str(getattr(plan, "direction", "long")).lower() == "long" else "sell"
+    bp_markup = buying_power_short_open_markup if open_side == "sell" else buying_power_long_open_markup
+    side_mult = buying_power_short_margin_multiplier if open_side == "sell" else 1.0
+    bp_price_mult = ((1.0 + bp_markup) * side_mult) if buying_power_model_enabled else 1.0
+    bp_unit_price = entry_price * bp_price_mult
+    state["bp_open_side"] = open_side
+    state["bp_price_mult"] = bp_price_mult
+    state["bp_unit_price"] = bp_unit_price
     min_stop_distance = 0.0
     if sizing_stop_pct_floor > 0.0:
         min_stop_distance = max(min_stop_distance, entry_price * (sizing_stop_pct_floor / 100.0))
@@ -487,7 +559,7 @@ def compute_qty_with_guards(
         state["reject_reason"] = "risk_qty_zero"
         return 0, state
 
-    msb = max(0.0, min(margin_safety_buffer, 0.9))
+    msb = effective_margin_safety_buffer
     net_avail = available * (1.0 - msb)
     headroom_cap = max(0.0, allowed_total * (1.0 - msb) - used_notional)
     net_avail = min(net_avail, headroom_cap)
@@ -553,9 +625,9 @@ def compute_qty_with_guards(
     state["quality_sizing"] = quality_state
     state["quality_qty_multiplier"] = quality_mult
     state["net_available_final"] = net_avail
-    budget_qty = int(net_avail // entry_price) if net_avail > 0 else 0
+    budget_qty = int(net_avail // bp_unit_price) if net_avail > 0 else 0
     budget_qty_pre_cap = (
-        int(net_avail_before_per_trade_cap // entry_price)
+        int(net_avail_before_per_trade_cap // bp_unit_price)
         if net_avail_before_per_trade_cap > 0
         else 0
     )
@@ -568,6 +640,61 @@ def compute_qty_with_guards(
 
     quality_mult_eff = max(0.0, quality_mult) if quality_state.get("applied") else 1.0
     risk_amt_adjusted = risk_amt * quality_mult_eff
+    open_noise_ratio = _safe_float_opt(getattr(plan, "open_noise_stop_ratio", None))
+    open_noise_risk_scale_factor = 1.0
+    state["open_noise_stop_ratio"] = open_noise_ratio
+    state["open_noise_risk_scale_applied"] = False
+    if (
+        open_noise_risk_scale_enabled
+        and open_noise_ratio is not None
+        and open_noise_risk_scale_ratio_start > 0.0
+    ):
+        if open_noise_ratio > open_noise_risk_scale_ratio_start:
+            if open_noise_risk_scale_ratio_full <= open_noise_risk_scale_ratio_start:
+                progress = 1.0
+            else:
+                progress = _clamp(
+                    (open_noise_ratio - open_noise_risk_scale_ratio_start)
+                    / (open_noise_risk_scale_ratio_full - open_noise_risk_scale_ratio_start),
+                    0.0,
+                    1.0,
+                )
+            open_noise_risk_scale_factor = max(
+                open_noise_risk_scale_min_factor,
+                1.0 - ((1.0 - open_noise_risk_scale_min_factor) * progress),
+            )
+        risk_amt_adjusted *= open_noise_risk_scale_factor
+    state["open_noise_risk_scale_factor"] = open_noise_risk_scale_factor
+    state["open_noise_risk_scale_applied"] = open_noise_risk_scale_factor < 0.999999
+    atr_risk_scale_factor = 1.0
+    atr_pct = None
+    atr_abs = _safe_float_opt(getattr(plan, "atr", None))
+    if atr_abs is not None and entry_price > 0:
+        atr_pct = (atr_abs / entry_price) * 100.0
+    state["atr_pct"] = atr_pct
+    state["atr_risk_scale_applied"] = False
+    if (
+        atr_risk_scale_enabled
+        and atr_pct is not None
+        and atr_risk_scale_pct_start > 0.0
+    ):
+        if atr_pct > atr_risk_scale_pct_start:
+            if atr_risk_scale_pct_full <= atr_risk_scale_pct_start:
+                progress = 1.0
+            else:
+                progress = _clamp(
+                    (atr_pct - atr_risk_scale_pct_start)
+                    / (atr_risk_scale_pct_full - atr_risk_scale_pct_start),
+                    0.0,
+                    1.0,
+                )
+            atr_risk_scale_factor = max(
+                atr_risk_scale_min_factor,
+                1.0 - ((1.0 - atr_risk_scale_min_factor) * progress),
+            )
+        risk_amt_adjusted *= atr_risk_scale_factor
+    state["atr_risk_scale_factor"] = atr_risk_scale_factor
+    state["atr_risk_scale_applied"] = atr_risk_scale_factor < 0.999999
     risk_qty_adjusted = int(risk_amt_adjusted // effective_stop_distance) if risk_amt_adjusted > 0 else 0
     state["risk_amount_adjusted"] = risk_amt_adjusted
     state["risk_qty_adjusted"] = risk_qty_adjusted
@@ -594,9 +721,17 @@ def compute_qty_with_guards(
         # refill the remaining budget with lower-priority symbols in the same pass.
         capacity_qty = base_qty_pre_cap
     state["capacity_qty"] = capacity_qty
+    state["capacity_notional_per_share"] = bp_unit_price
     state["final_qty"] = qty
     if qty <= 0:
         state["reject_reason"] = "budget_zero"
+        return 0, state
+    final_order_notional = qty * bp_unit_price
+    state["final_order_notional"] = final_order_notional
+    state["overlap_order_notional_reject_applied"] = False
+    if open_positions > 0 and min_overlap_order_notional > 0.0 and final_order_notional < min_overlap_order_notional:
+        state["overlap_order_notional_reject_applied"] = True
+        state["reject_reason"] = "min_overlap_order_notional"
         return 0, state
 
     return qty, state

@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
+from pathlib import Path
+from typing import Optional, TextIO
 
 from app.config.loader import load_config
 from app.brokers.alpaca import AlpacaBroker
@@ -12,6 +14,71 @@ from app.strategies.daily_trend_reversal import resolve_entry_times
 from app.utils.time import ensure_et, et_now, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
 from app.watchlist.storage import read_watchlist, expected_watchlist_date_str
+
+
+class _ETDailyFileHandler(logging.Handler):
+    """Writes logs to logs/live/DD-MM-YYYY.log and rolls over at ET midnight."""
+
+    def __init__(self, live_log_dir: Path):
+        super().__init__()
+        self._live_log_dir = live_log_dir
+        self._live_log_dir.mkdir(parents=True, exist_ok=True)
+        self._stream: Optional[TextIO] = None
+        self._current_date: Optional[dt.date] = None
+        self._open_for_date(et_now().date())
+
+    def _path_for_date(self, day: dt.date) -> Path:
+        return self._live_log_dir / f"{day.strftime('%d-%m-%Y')}.log"
+
+    def _open_for_date(self, day: dt.date) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+        self._current_date = day
+        self._stream = self._path_for_date(day).open("a", encoding="utf-8")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            day = et_now().date()
+            if self._stream is None or day != self._current_date:
+                self._open_for_date(day)
+            msg = self.format(record)
+            self._stream.write(msg + "\n")
+            self._stream.flush()
+        except Exception:
+            self.handleError(record)
+
+    def close(self) -> None:
+        try:
+            if self._stream is not None:
+                self._stream.close()
+        except Exception:
+            pass
+        self._stream = None
+        self._current_date = None
+        super().close()
+
+
+def _setup_live_logging(logs_root: Path) -> Path:
+    live_log_dir = logs_root / "live"
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+    fmt = logging.Formatter("%(levelname)s:%(message)s")
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+    daily_file = _ETDailyFileHandler(live_log_dir)
+    daily_file.setFormatter(fmt)
+    root.addHandler(daily_file)
+    return live_log_dir
 
 
 def _sleep_until(target: dt.datetime) -> None:
@@ -231,8 +298,10 @@ def _log_new_position_closes(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
     cfg = load_config()
+    logs_root = Path(str(cfg.get("logs_dir") or "logs"))
+    live_log_dir = _setup_live_logging(logs_root)
+    logging.info("[LIVE] file logging enabled dir=%s pattern=DD-MM-YYYY.log tz=America/New_York", live_log_dir)
     params = cfg.get("daily_trend_reversal") or {}
     watchlist_time_str = str(params.get("watchlist_time_et") or "03:00")
     entry_time_strs = _ordered_entry_time_strs(cfg)

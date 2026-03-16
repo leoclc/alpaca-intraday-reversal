@@ -27,7 +27,40 @@ DEFAULT_CONFIG: dict = {
         "leverage": 4.0,
         "max_margin_usage": 0.75,
         "margin_safety_buffer": 0.25,
+        # Enforced minimum free-BP reserve (used by both live and backtest sizing).
+        "required_free_margin_buffer": 0.30,
+        # Buying-power model parity (Alpaca short openings reserve extra BP).
+        "buying_power_model_enabled": True,
+        "buying_power_long_open_markup": 0.0,
+        "buying_power_short_open_markup": 0.03,
+        # Additional short-side BP multiplier (1.20 ~= +20% reserve on short notionals).
+        "buying_power_short_margin_multiplier": 1.2,
+        # Optional symbol-aware add-on from asset maintenance margin requirement.
+        "buying_power_short_mmr_enabled": False,
+        "buying_power_short_mmr_weight": 0.0,
+        "buying_power_short_mmr_floor_pct": 0.0,
+        "buying_power_short_mmr_cap_pct": 50.0,
+        # Live guard: for symbols with very high maintenance margin requirement (e.g. 100%),
+        # cap order sizing using non_marginable_buying_power to avoid broker-side BP rejects.
+        "live_non_marginable_bp_cap_enabled": True,
+        "live_non_marginable_mmr_threshold_pct": 100.0,
+        # If MMR lookup is temporarily unavailable, conservatively cap short entries
+        # against non_marginable_buying_power to prevent avoidable broker rejects.
+        "live_non_marginable_bp_cap_when_mmr_missing": True,
+        # Backtest parity: apply the same post-sizing execution cap used by live
+        # (broker BP + non-marginable guard for high-MMR symbols).
+        "backtest_live_bp_execution_cap_enabled": True,
+        # Optional stricter parity mode: reseed open exposure from marked positions at each
+        # entry-time bucket (can be noisier than live due bar-level approximation).
+        "backtest_live_exposure_resync_enabled": False,
+        # Backtest parity source for symbol maintenance margin requirement.
+        "backtest_use_live_asset_mmr": True,
+        # Simulated non-marginable BP pool = equity * multiplier (Alpaca-like accounts: 1.0).
+        "backtest_non_marginable_buying_power_mult": 1.0,
         "per_trade_max_pct_available": 0.25,
+        # When another position is already open, reject follow-up entries whose actual
+        # BP-sized order notional is below this floor. If 0, disabled.
+        "min_overlap_order_notional": 0.0,
         "equal_split_across_max_slots": False,
         # Optional dynamic slot distribution: split capital across expected trade count
         # estimated from watchlist trades_count / watchlist.lookback_days.
@@ -44,6 +77,15 @@ DEFAULT_CONFIG: dict = {
         "minute_report_interval_sec": 60,
         "position_close_report_enabled": True,
         "position_close_poll_interval_sec": 30,
+        # Optional live retry after broker BP reject (off by default; prefer deterministic pre-cap sizing).
+        "live_bp_retry_on_reject": False,
+        # Optional live-only gate from watchlist quality stats (off by default).
+        "live_quality_gate_enabled": False,
+        "live_quality_min_selection_score": None,
+        "live_quality_min_avgR": None,
+        "live_quality_min_trades_count": 0,
+        "live_quality_max_rank": 0,
+        "live_quality_min_positive_month_rate": None,
         "minute_report_max_symbols": 20,
         "minute_report_lookback_minutes": 5,
         "stop_mode": "atr",
@@ -51,6 +93,12 @@ DEFAULT_CONFIG: dict = {
         "stop_atr_mult": 1.0,
         "stop_pct": 1.0,
         "target_rr": 1.5,
+        # Optional plan-level stop/target floors (off by default).
+        "trade_guardrails_enabled": False,
+        "trade_guardrail_min_stop_bps": 0.0,
+        "trade_guardrail_min_target_bps": 0.0,
+        "trade_guardrail_min_stop_abs": 0.0,
+        "trade_guardrail_min_target_abs": 0.0,
         "stop_r": 1.0,
         "target_r": 1.5,
         "time_exit_days": 2,
@@ -59,6 +107,28 @@ DEFAULT_CONFIG: dict = {
         "intraday_filter_enabled": False,
         "intraday_filter_require_bars": False,
         "intraday_filter_apply_in_watchlist": False,
+        # Optional entry-quality guards (all disabled by default for backwards compatibility):
+        # - Signal strength in ATR units.
+        # - Opening-window noise caps relative to ATR/stop distance.
+        "min_signal_return_atr_abs": 0.0,
+        "max_signal_return_atr_abs": 0.0,
+        "open_noise_window_minutes": 0,
+        "open_noise_apply_in_watchlist": True,
+        "max_open_noise_atr": 0.0,
+        "max_open_noise_stop_ratio": 0.0,
+        "min_stop_to_open_noise_ratio": 0.0,
+        # Optional sizing-only scale (no signal rejection): when opening noise is large
+        # relative to stop_distance, reduce risk amount linearly.
+        "open_noise_risk_scale_enabled": False,
+        "open_noise_risk_scale_ratio_start": 1.0,
+        "open_noise_risk_scale_ratio_full": 2.0,
+        "open_noise_risk_scale_min_factor": 0.5,
+        # Optional sizing-only scale (no signal rejection): when daily ATR% is elevated
+        # versus entry price, reduce risk amount linearly.
+        "atr_risk_scale_enabled": False,
+        "atr_risk_scale_pct_start": 3.0,
+        "atr_risk_scale_pct_full": 6.0,
+        "atr_risk_scale_min_factor": 0.6,
         # Entry confirmation (optional). When enabled, evaluate the window after `entry_time_et`
         # (length `confirm_minutes`) and only enter if price moves in our favor by at least
         # `confirm_move_bps` at any point during that window.
@@ -92,6 +162,15 @@ DEFAULT_CONFIG: dict = {
         "entry_order_type": "market",
         "order_tif": "day",
         "use_brackets": True,
+        # For market entries, place exits from actual fill price (live parity with Alpaca fills).
+        "live_reanchor_brackets_on_fill": True,
+        "live_reanchor_fill_timeout_sec": 30.0,
+        "live_reanchor_fill_poll_sec": 0.25,
+        "live_reanchor_cancel_unfilled_entry": True,
+        # Backtest parity: re-simulate stop/target hits from simulated entry fill (not planned entry).
+        "backtest_reanchor_brackets_on_fill": True,
+        "backtest_reanchor_debug": False,
+        "backtest_reanchor_debug_max_logs": 40,
         # If true, backtest reuses existing watchlist files from watchlists_dir when present.
         # Useful for fast parity/sizing sweeps while keeping the signal set fixed.
         "backtest_reuse_existing_watchlists": False,

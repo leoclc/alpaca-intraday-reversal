@@ -34,6 +34,12 @@ class TradePlan:
     gap_bps: float | None = None
     early_pullback_bps: float | None = None
     early_reversal_bps: float | None = None
+    open_noise_abs: float | None = None
+    open_noise_bps: float | None = None
+    open_noise_atr: float | None = None
+    open_noise_stop_ratio: float | None = None
+    stop_to_open_noise_ratio: float | None = None
+    open_noise_window_minutes: int | None = None
     confirm_move_bps: float | None = None
     confirm_minutes: int | None = None
     confirm_hit_bps: float | None = None

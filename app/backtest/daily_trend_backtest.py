@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import datetime as dt
+import copy
 import json
 import logging
 import csv
+from dataclasses import is_dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 
+from app.brokers.alpaca import AlpacaBroker
 from app.config.loader import load_config
+from app.data.alpaca_intraday_store import filter_intraday_bars_until, get_intraday_bars
 from app.data.alpaca_quote_store import resolve_quote_for_timestamp
 from app.data.alpaca_ohlc_store import AlpacaOHLCStore
+from app.execution.daily_execution_model import simulate_exit
 from app.market.filters import market_filter_decision
-from app.portfolio.sizing import compute_qty_with_guards, estimate_slot_target_from_stats
+from app.portfolio.sizing import (
+    compute_qty_with_guards,
+    estimate_slot_target_from_stats,
+    resolve_effective_margin_buffer,
+)
 from app.replay.daily_strategy_replay import run_replay
 from app.utils.time import ensure_et, iter_trading_days, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
@@ -22,6 +31,7 @@ _FILL_MODEL_LOGGED = False
 _FILL_MODEL_DEBUG_LOGS = 0
 _QUOTE_MODEL_LOGGED = False
 _QUOTE_MODEL_DEBUG_LOGS = 0
+_REANCHOR_MODEL_DEBUG_LOGS = 0
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -146,9 +156,13 @@ def _apply_portfolio_sizing(
     day_trades: List,
     equity: float,
     cfg: Dict,
+    *,
+    asset_mmr_broker: Optional[AlpacaBroker] = None,
+    asset_mmr_cache: Optional[Dict[str, Optional[float]]] = None,
 ) -> Tuple[List, List[Dict], float]:
     params = cfg.get("daily_trend_reversal") or {}
     intraday_only = bool(params.get("intraday_only", False))
+    session_open_et = str(params.get("session_open_et") or "09:30")
     session_close_et = str(params.get("session_close_et") or "16:00")
     fill_model_enabled = bool(params.get("backtest_fill_model_enabled", False))
     fill_half_spread_bps = max(0.0, _safe_float(params.get("backtest_half_spread_bps"), default=0.0))
@@ -162,7 +176,10 @@ def _apply_portfolio_sizing(
     quote_lookback_seconds = max(1, _safe_int(params.get("backtest_quote_lookback_seconds"), default=120))
     quote_forward_seconds = max(0, _safe_int(params.get("backtest_quote_forward_seconds"), default=10))
     quote_max_age_seconds = max(1, _safe_int(params.get("backtest_quote_max_age_seconds"), default=300))
-    quote_fallback_to_bps = bool(params.get("backtest_quote_fallback_to_bps", True))
+    # Live-parity guard: disable synthetic bps fallback for missing/invalid quotes.
+    # We keep this variable for metadata/logging compatibility, but force it off.
+    quote_fallback_requested = bool(params.get("backtest_quote_fallback_to_bps", False))
+    quote_fallback_to_bps = False
     quote_target_limit_protect = bool(params.get("backtest_quote_target_limit_protect", True))
     quote_require_both_sides = bool(params.get("backtest_quote_require_both_sides", True))
     quote_max_spread_bps = max(0.0, _safe_float(params.get("backtest_quote_max_spread_bps"), default=80.0))
@@ -177,6 +194,9 @@ def _apply_portfolio_sizing(
     )
     quote_debug = bool(params.get("backtest_quote_debug", False))
     quote_debug_max_logs = max(0, _safe_int(params.get("backtest_quote_debug_max_logs"), default=40))
+    reanchor_brackets_on_fill = bool(params.get("backtest_reanchor_brackets_on_fill", True))
+    reanchor_debug = bool(params.get("backtest_reanchor_debug", False))
+    reanchor_debug_max_logs = max(0, _safe_int(params.get("backtest_reanchor_debug_max_logs"), default=40))
     slot_distribution_enabled = bool(params.get("slot_distribution_enabled", False))
     watch_cfg = cfg.get("watchlist") or {}
     slot_lookback_days = float(watch_cfg.get("lookback_days") or 252)
@@ -186,6 +206,183 @@ def _apply_portfolio_sizing(
     accepted: List = []
     sized_records: List[Dict] = []
     day_start_equity = equity
+    reanchor_store = AlpacaOHLCStore(cfg=cfg) if reanchor_brackets_on_fill else None
+    daily_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
+    intraday_bars_cache: Dict[Tuple[str, str, int], Optional[List[Dict[str, Any]]]] = {}
+    intraday_mark_price_cache: Dict[Tuple[str, str, str], float] = {}
+    mmr_cache: Dict[str, Optional[float]] = asset_mmr_cache if isinstance(asset_mmr_cache, dict) else {}
+    leverage = max(1.0, _safe_float(params.get("leverage"), default=4.0))
+    max_margin_usage = max(0.0, min(_safe_float(params.get("max_margin_usage"), default=1.0), 1.0))
+    bp_buffer = resolve_effective_margin_buffer(params)
+    backtest_live_bp_execution_cap_enabled = bool(params.get("backtest_live_bp_execution_cap_enabled", True))
+    backtest_live_exposure_resync_enabled = bool(params.get("backtest_live_exposure_resync_enabled", False))
+    backtest_use_live_asset_mmr = bool(params.get("backtest_use_live_asset_mmr", True))
+    backtest_non_marginable_buying_power_mult = max(
+        0.0,
+        _safe_float(params.get("backtest_non_marginable_buying_power_mult"), default=1.0),
+    )
+    live_non_marginable_bp_cap_enabled = bool(params.get("live_non_marginable_bp_cap_enabled", True))
+    live_non_marginable_mmr_threshold_pct = max(
+        0.0,
+        _safe_float(params.get("live_non_marginable_mmr_threshold_pct"), default=100.0),
+    )
+    live_non_marginable_bp_cap_when_mmr_missing = bool(
+        params.get("live_non_marginable_bp_cap_when_mmr_missing", True)
+    )
+    buying_power_model_enabled = bool(params.get("buying_power_model_enabled", True))
+    buying_power_long_open_markup = max(0.0, min(_safe_float(params.get("buying_power_long_open_markup"), default=0.0), 0.5))
+    buying_power_short_open_markup = max(
+        0.0,
+        min(_safe_float(params.get("buying_power_short_open_markup"), default=0.03), 0.5),
+    )
+    buying_power_short_margin_multiplier = max(
+        1.0,
+        min(_safe_float(params.get("buying_power_short_margin_multiplier"), default=1.2), 3.0),
+    )
+    buying_power_short_mmr_enabled = bool(params.get("buying_power_short_mmr_enabled", False))
+    buying_power_short_mmr_weight = max(0.0, min(_safe_float(params.get("buying_power_short_mmr_weight"), default=0.0), 2.0))
+    buying_power_short_mmr_floor_pct = max(0.0, _safe_float(params.get("buying_power_short_mmr_floor_pct"), default=0.0))
+    buying_power_short_mmr_cap_pct = max(
+        buying_power_short_mmr_floor_pct,
+        _safe_float(params.get("buying_power_short_mmr_cap_pct"), default=50.0),
+    )
+
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def _symbol_mmr_pct(symbol: str) -> Optional[float]:
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return None
+        if sym in mmr_cache and mmr_cache[sym] is not None:
+            return mmr_cache[sym]
+        if not backtest_use_live_asset_mmr:
+            return None
+        if asset_mmr_broker is None or not asset_mmr_broker.ready():
+            return None
+        mmr_pct: Optional[float] = None
+        try:
+            asset = asset_mmr_broker.get_asset(sym) or {}
+            mmr_pct = _safe_float(asset.get("maintenance_margin_requirement"), default=-1.0)
+            if mmr_pct < 0:
+                mmr_pct = None
+        except Exception:
+            mmr_pct = None
+        # Avoid poisoning cache with transient misses.
+        if mmr_pct is not None:
+            mmr_cache[sym] = mmr_pct
+        elif sym in mmr_cache and mmr_cache[sym] is None:
+            mmr_cache.pop(sym, None)
+        return mmr_pct
+
+    def _bp_unit_price(entry_price: float, side: str, mmr_pct: Optional[float]) -> float:
+        px = max(0.0, _safe_float(entry_price, default=0.0))
+        if px <= 0:
+            return 0.0
+        if not buying_power_model_enabled:
+            return px
+        side_norm = str(side or "").lower().strip()
+        if side_norm != "sell":
+            return px * (1.0 + buying_power_long_open_markup)
+        mmr_mult = 1.0
+        if buying_power_short_mmr_enabled and mmr_pct is not None:
+            eff_pct = _clamp(
+                mmr_pct * buying_power_short_mmr_weight,
+                buying_power_short_mmr_floor_pct,
+                buying_power_short_mmr_cap_pct,
+            )
+            mmr_mult = 1.0 + (eff_pct / 100.0)
+        return px * (1.0 + buying_power_short_open_markup) * buying_power_short_margin_multiplier * mmr_mult
+
+    def _bp_unit_price_broker_sim(entry_price: float, side: str, mmr_pct: Optional[float]) -> float:
+        # Mirror live behavior where broker-reported buying_power can be less conservative than
+        # our pre-submit short-open markup model. We keep the same short margin model but remove
+        # the extra open markup when estimating broker-side reserved notional.
+        unit = _bp_unit_price(entry_price, side, mmr_pct)
+        if buying_power_model_enabled and str(side or "").lower().strip() == "sell":
+            denom = max(1e-9, 1.0 + buying_power_short_open_markup)
+            unit = unit / denom
+        return unit
+
+    def _simulated_live_allowed_total_seed(
+        equity_now: float,
+        used_notional_model_now: float,
+        used_notional_broker_now: float,
+    ) -> tuple[float, float, float]:
+        # Live runner seeds sizing with:
+        #   allowed_total_seed = used_notional_runtime + (broker_buying_power * max_margin_usage)
+        # We simulate broker_buying_power from a broker-like reserved-notional book so backtest
+        # can open follow-up trades in the same way live does.
+        broker_buying_power_sim = max(0.0, (equity_now * leverage) - max(0.0, used_notional_broker_now))
+        bp_budget_sim = broker_buying_power_sim * max_margin_usage
+        allowed_total_seed = max(0.0, max(0.0, used_notional_model_now) + bp_budget_sim)
+        return allowed_total_seed, broker_buying_power_sim, bp_budget_sim
+
+    def _apply_backtest_execution_bp_cap(
+        plan_obj,
+        qty: int,
+        state: Dict[str, Any],
+        equity_now: float,
+        used_notional_now: float,
+        used_notional_broker_now: Optional[float] = None,
+    ) -> int:
+        if qty <= 0 or not backtest_live_bp_execution_cap_enabled:
+            return qty
+        entry_price = max(0.0, _safe_float(getattr(plan_obj, "entry_price", None), default=0.0))
+        if entry_price <= 0:
+            return qty
+        side = "buy" if str(getattr(plan_obj, "direction", "long")).lower() == "long" else "sell"
+        mmr_pct = _symbol_mmr_pct(str(getattr(plan_obj, "symbol", "") or ""))
+        cap_reason: Optional[str] = None
+        if mmr_pct is not None and mmr_pct >= live_non_marginable_mmr_threshold_pct:
+            cap_reason = "mmr_threshold"
+        elif mmr_pct is None and side == "sell" and live_non_marginable_bp_cap_when_mmr_missing:
+            cap_reason = "mmr_missing_short"
+
+        # Simulated broker BP parity:
+        # - buying_power_sim tracks current remaining intraday BP after open exposure.
+        # - non_marginable_buying_power_sim approximates the stricter cash-like pool.
+        used_for_bp = max(0.0, used_notional_broker_now if used_notional_broker_now is not None else used_notional_now)
+        buying_power_sim = max(0.0, (equity_now * leverage) - used_for_bp)
+        # In live, non_marginable BP is often unavailable once exposure exists; mirror that behavior
+        # by only treating it as present when there is effectively no open exposure.
+        non_marginable_bp_present_sim = used_for_bp <= 1e-9
+        non_marginable_buying_power_sim = (
+            max(0.0, equity_now * backtest_non_marginable_buying_power_mult)
+            if non_marginable_bp_present_sim
+            else 0.0
+        )
+        bp_budget = max(0.0, buying_power_sim * (1.0 - bp_buffer))
+        if (
+            live_non_marginable_bp_cap_enabled
+            and cap_reason is not None
+            and non_marginable_bp_present_sim
+            and non_marginable_buying_power_sim > 0.0
+        ):
+            non_marginable_bp_budget = max(0.0, non_marginable_buying_power_sim * (1.0 - bp_buffer))
+            if non_marginable_bp_budget < bp_budget:
+                state["backtest_bp_budget_capped_non_marginable"] = True
+                state["backtest_bp_budget_capped_non_marginable_reason"] = cap_reason
+                state["backtest_symbol_mmr_pct"] = mmr_pct
+                state["backtest_non_marginable_bp_budget"] = non_marginable_bp_budget
+                bp_budget = non_marginable_bp_budget
+        bp_unit_price = _bp_unit_price(entry_price, side, mmr_pct)
+        if bp_unit_price <= 0:
+            return qty
+        bp_qty_cap = int(bp_budget // bp_unit_price) if bp_budget > 0 else 0
+        state["backtest_broker_buying_power_sim"] = buying_power_sim
+        state["backtest_used_notional_for_bp_sim"] = used_for_bp
+        state["backtest_non_marginable_bp_present_sim"] = non_marginable_bp_present_sim
+        state["backtest_non_marginable_buying_power_sim"] = non_marginable_buying_power_sim
+        state["backtest_bp_buffer_effective"] = bp_buffer
+        state["backtest_bp_budget_effective"] = bp_budget
+        state["backtest_bp_unit_price"] = bp_unit_price
+        state["backtest_bp_qty_cap"] = bp_qty_cap
+        if bp_qty_cap < qty:
+            state["backtest_qty_capped_by_execution_bp"] = True
+            state["backtest_qty_before_execution_bp_cap"] = qty
+            return max(0, bp_qty_cap)
+        return qty
 
     if fill_model_enabled:
         global _FILL_MODEL_LOGGED
@@ -204,6 +401,10 @@ def _apply_portfolio_sizing(
     if quote_fill_enabled:
         global _QUOTE_MODEL_LOGGED
         if not _QUOTE_MODEL_LOGGED:
+            if quote_fallback_requested:
+                logging.warning(
+                    "[BACKTEST_QUOTE_FILL] backtest_quote_fallback_to_bps requested=true but is forced OFF for live-parity"
+                )
             logging.info(
                 "[BACKTEST_QUOTE_FILL] enabled=1 lookback_s=%s forward_s=%s max_age_s=%s require_both_sides=%s max_spread_bps=%.2f max_deviation_bps=%.2f max_spread_bps_stop=%.2f max_deviation_bps_stop=%.2f fallback_to_bps=%s target_limit_protect=%s debug=%s max_debug_logs=%s",
                 quote_lookback_seconds,
@@ -245,6 +446,35 @@ def _apply_portfolio_sizing(
         except Exception:
             return None
 
+    def _intraday_mark_price(symbol: str, date_str: str, cutoff_dt_obj: dt.datetime, fallback_px: float) -> float:
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return max(0.0, fallback_px)
+        cutoff_hhmm = cutoff_dt_obj.strftime("%H:%M")
+        cache_key = (sym, date_str, cutoff_hhmm)
+        if cache_key in intraday_mark_price_cache:
+            return intraday_mark_price_cache[cache_key]
+        try:
+            open_dt_obj = ensure_et(dt.datetime.combine(cutoff_dt_obj.date(), parse_time_hhmm(session_open_et)))
+            minutes_needed = max(1, int((cutoff_dt_obj - open_dt_obj).total_seconds() / 60.0) + 2)
+        except Exception:
+            minutes_needed = 16
+        bars_key = (sym, date_str, minutes_needed)
+        bars = intraday_bars_cache.get(bars_key)
+        if bars is None:
+            bars = get_intraday_bars(sym, date_str, minutes_needed, cfg=cfg, allow_fetch=True)
+            intraday_bars_cache[bars_key] = bars
+        mark_px = max(0.0, float(fallback_px or 0.0))
+        try:
+            bars_cut = filter_intraday_bars_until(bars or [], date_str, cutoff_hhmm)
+        except Exception:
+            bars_cut = bars or []
+        if bars_cut:
+            tail = bars_cut[-1] or {}
+            mark_px = _safe_float(tail.get("close"), default=0.0) or _safe_float(tail.get("open"), default=0.0) or mark_px
+        intraday_mark_price_cache[cache_key] = max(0.0, mark_px)
+        return intraday_mark_price_cache[cache_key]
+
     def _fallback_exit_dt(trade_obj, entry_dt_obj: dt.datetime) -> dt.datetime:
         try:
             exit_day = dt.date.fromisoformat(str(getattr(trade_obj, "exit_date", "") or entry_dt_obj.date().isoformat()))
@@ -274,6 +504,152 @@ def _apply_portfolio_sizing(
         if str(side).lower() == "buy":
             return ((fill_px / raw_px) - 1.0) * 10000.0
         return ((raw_px - fill_px) / raw_px) * 10000.0
+
+    def _plan_params(plan_obj) -> Dict[str, Any]:
+        out = dict(params)
+        plan_overrides = getattr(plan_obj, "param_overrides", None)
+        if isinstance(plan_overrides, dict) and plan_overrides:
+            out.update(plan_overrides)
+        return out
+
+    def _reanchored_exit_prices(plan_obj, fill_price: float) -> Optional[Dict[str, float]]:
+        fill_px = max(0.0, _safe_float(fill_price, default=0.0))
+        if fill_px <= 0:
+            return None
+        raw_entry = _safe_float(getattr(plan_obj, "entry_price", None), default=0.0)
+        raw_stop = _safe_float(getattr(plan_obj, "stop_price", None), default=0.0)
+        raw_target = _safe_float(getattr(plan_obj, "target_price", None), default=0.0)
+        stop_offset = abs(raw_entry - raw_stop)
+        target_offset = abs(raw_target - raw_entry)
+        if stop_offset <= 0:
+            stop_offset = max(0.0, _safe_float(getattr(plan_obj, "stop_distance", None), default=0.0))
+        if target_offset <= 0 and stop_offset > 0:
+            rr = max(0.0, _safe_float(getattr(plan_obj, "target_rr", None), default=0.0))
+            target_offset = stop_offset * rr if rr > 0 else stop_offset
+        if stop_offset <= 0 or target_offset <= 0:
+            return None
+        direction = str(getattr(plan_obj, "direction", "long") or "long").lower()
+        if direction == "long":
+            stop_price = fill_px - stop_offset
+            target_price = fill_px + target_offset
+        else:
+            stop_price = fill_px + stop_offset
+            target_price = fill_px - target_offset
+        return {
+            "entry_price": fill_px,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "stop_offset": stop_offset,
+            "target_offset": target_offset,
+        }
+
+    def _clone_plan_with_prices(plan_obj, entry_price: float, stop_price: float, target_price: float, stop_distance: float):
+        if is_dataclass(plan_obj):
+            return replace(
+                plan_obj,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                target_price=target_price,
+                stop_distance=stop_distance,
+            )
+        clone = copy.copy(plan_obj)
+        clone.entry_price = entry_price
+        clone.stop_price = stop_price
+        clone.target_price = target_price
+        clone.stop_distance = stop_distance
+        return clone
+
+    def _intraday_minutes_needed_for_exit(plan_obj) -> int:
+        p = _plan_params(plan_obj)
+        intraday_only_local = bool(p.get("intraday_only", False))
+        time_stop_minutes = int(p.get("time_stop_minutes") or 0)
+        require_intraday_exit = bool(p.get("require_intraday_exit", intraday_only_local or time_stop_minutes > 0))
+        if not require_intraday_exit:
+            return 0
+        entry_time_et = str(getattr(plan_obj, "entry_time_et", "") or "09:35")
+        session_open_et = str(p.get("session_open_et") or "09:30")
+        try:
+            open_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_open_et))
+            entry_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(entry_time_et))
+            entry_minutes = max(0, int((entry_dt - open_dt).total_seconds() / 60))
+        except Exception:
+            entry_minutes = 0
+        cutoff_minutes: Optional[int] = None
+        if time_stop_minutes > 0:
+            cutoff_minutes = entry_minutes + max(1, int(time_stop_minutes))
+        if intraday_only_local:
+            try:
+                session_close_et = str(p.get("session_close_et") or "16:00")
+                flatten_buffer = int(p.get("flatten_buffer_minutes") or 0)
+                close_dt = dt.datetime.combine(dt.date.today(), parse_time_hhmm(session_close_et))
+                flatten_dt = close_dt - dt.timedelta(minutes=max(0, flatten_buffer))
+                flatten_minutes = max(1, int((flatten_dt - open_dt).total_seconds() / 60))
+                cutoff_minutes = flatten_minutes if cutoff_minutes is None else min(cutoff_minutes, flatten_minutes)
+            except Exception:
+                pass
+        if cutoff_minutes is None:
+            cutoff_minutes = 390
+        return max(1, int(cutoff_minutes) + 1)
+
+    def _load_daily_bars_for_symbol(symbol: str) -> List[Dict[str, Any]]:
+        sym = str(symbol or "").upper()
+        if not sym or reanchor_store is None:
+            return []
+        cached = daily_bars_cache.get(sym)
+        if cached is not None:
+            return cached
+        try:
+            bars = reanchor_store.get_daily_bars(sym, None, None, cfg=cfg, allow_fetch=True) or []
+        except Exception:
+            bars = []
+        daily_bars_cache[sym] = bars
+        return bars
+
+    def _load_intraday_bars_for_plan(plan_obj) -> Optional[List[Dict[str, Any]]]:
+        symbol = str(getattr(plan_obj, "symbol", "") or "").upper()
+        entry_date = str(getattr(plan_obj, "entry_date", "") or "")
+        if not symbol or not entry_date:
+            return None
+        minutes_needed = _intraday_minutes_needed_for_exit(plan_obj)
+        if minutes_needed <= 0:
+            return None
+        key = (symbol, entry_date, int(minutes_needed))
+        if key in intraday_bars_cache:
+            return intraday_bars_cache.get(key)
+        try:
+            bars = get_intraday_bars(symbol, entry_date, minutes_needed, cfg=cfg, allow_fetch=True) or []
+        except Exception:
+            bars = []
+        out = bars or None
+        intraday_bars_cache[key] = out
+        return out
+
+    def _simulate_reanchored_exit(plan_obj, entry_fill_price: float) -> Optional[Dict[str, Any]]:
+        reanchored = _reanchored_exit_prices(plan_obj, entry_fill_price)
+        if not reanchored:
+            return None
+        bars_daily = _load_daily_bars_for_symbol(str(getattr(plan_obj, "symbol", "") or ""))
+        if not bars_daily:
+            return None
+        plan_sim = _clone_plan_with_prices(
+            plan_obj,
+            entry_price=float(reanchored["entry_price"]),
+            stop_price=float(reanchored["stop_price"]),
+            target_price=float(reanchored["target_price"]),
+            stop_distance=float(reanchored["stop_offset"]),
+        )
+        bars_intraday = _load_intraday_bars_for_plan(plan_sim)
+        exit_info = simulate_exit(plan_sim, "daily", bars_daily, bars_intraday, cfg)
+        if not exit_info:
+            return None
+        return {
+            "exit_info": exit_info,
+            "entry_price": float(reanchored["entry_price"]),
+            "stop_price": float(reanchored["stop_price"]),
+            "target_price": float(reanchored["target_price"]),
+            "stop_offset": float(reanchored["stop_offset"]),
+            "target_offset": float(reanchored["target_offset"]),
+        }
 
     def _resolve_quote_leg(
         symbol: str,
@@ -418,28 +794,33 @@ def _apply_portfolio_sizing(
     def _compute_fill_meta(trade_obj, plan_obj, qty: int) -> Dict[str, Any]:
         raw_entry = _safe_float(getattr(plan_obj, "entry_price", None), default=0.0)
         raw_exit = _safe_float(getattr(trade_obj, "exit_price", None), default=0.0)
+        raw_exit_reason_initial = str(getattr(trade_obj, "exit_reason", "") or "")
         direction = str(getattr(plan_obj, "direction", "long")).lower()
         direction_mult = 1.0 if direction == "long" else -1.0
-        stop_distance = max(0.0, _safe_float(getattr(plan_obj, "stop_distance", None), default=0.0))
+        stop_distance_plan = max(0.0, _safe_float(getattr(plan_obj, "stop_distance", None), default=0.0))
+        stop_distance_for_r = stop_distance_plan
 
         entry_side = _entry_side(direction)
-        exit_side = _exit_side(direction)
-        exit_slip_bps, exit_bucket = _exit_slippage_bps(str(getattr(trade_obj, "exit_reason", "") or ""))
         entry_bps_model = fill_half_spread_bps + fill_entry_slippage_bps
-        exit_bps_model = fill_half_spread_bps + exit_slip_bps
         use_bps_base = bool(fill_model_enabled or (quote_fill_enabled and quote_fallback_to_bps))
         entry_bps = entry_bps_model if use_bps_base else 0.0
-        exit_bps = exit_bps_model if use_bps_base else 0.0
         entry_fill = _adverse_fill_price(raw_entry, side=entry_side, bps=entry_bps) if use_bps_base else raw_entry
-        exit_fill = _adverse_fill_price(raw_exit, side=exit_side, bps=exit_bps) if use_bps_base else raw_exit
         entry_fill_mode = "bps" if use_bps_base else "raw"
-        exit_fill_mode = "bps" if use_bps_base else "raw"
+        exit_fill_mode = "raw"
         entry_quote_meta: Dict[str, Any] = {"ok": False, "reason": "quote_disabled"}
         exit_quote_meta: Dict[str, Any] = {"ok": False, "reason": "quote_disabled"}
         entry_ts = _entry_dt(plan_obj)
         exit_ts = _parse_ts_iso(getattr(trade_obj, "exit_ts", None))
+        exit_reason_active = raw_exit_reason_initial
+        stop_hit_ts_active = getattr(trade_obj, "stop_hit_ts", None)
+        target_hit_ts_active = getattr(trade_obj, "target_hit_ts", None)
         if exit_ts is None and entry_ts is not None:
             exit_ts = _fallback_exit_dt(trade_obj, entry_ts)
+        effective_stop_price = _safe_float(getattr(plan_obj, "stop_price", None), default=0.0)
+        effective_target_price = _safe_float(getattr(plan_obj, "target_price", None), default=0.0)
+        reanchor_applied = False
+        reanchor_stop_offset = None
+        reanchor_target_offset = None
 
         if quote_fill_enabled:
             entry_quote_meta = _resolve_quote_leg(
@@ -450,7 +831,58 @@ def _apply_portfolio_sizing(
                 max_spread_bps=quote_max_spread_bps,
                 max_deviation_bps=quote_max_deviation_bps,
             )
-            exit_reason_l = str(getattr(trade_obj, "exit_reason", "") or "").lower()
+            if bool(entry_quote_meta.get("ok")):
+                entry_fill = _safe_float(entry_quote_meta.get("price"), default=entry_fill)
+                entry_fill_mode = "quote"
+            elif not quote_fallback_to_bps:
+                entry_fill = raw_entry
+                entry_fill_mode = "raw_quote_missing"
+        if reanchor_brackets_on_fill:
+            reanchored = _simulate_reanchored_exit(plan_obj, entry_fill)
+            if reanchored:
+                reanchor_applied = True
+                exit_info = reanchored.get("exit_info") or {}
+                raw_exit = _safe_float(exit_info.get("exit_price"), default=raw_exit)
+                exit_reason_active = str(exit_info.get("exit_reason") or exit_reason_active)
+                exit_ts_candidate = _parse_ts_iso(exit_info.get("exit_ts"))
+                if exit_ts_candidate is not None:
+                    exit_ts = exit_ts_candidate
+                stop_hit_ts_active = exit_info.get("stop_hit_ts")
+                target_hit_ts_active = exit_info.get("target_hit_ts")
+                effective_stop_price = _safe_float(reanchored.get("stop_price"), default=effective_stop_price)
+                effective_target_price = _safe_float(reanchored.get("target_price"), default=effective_target_price)
+                reanchor_stop_offset = _safe_float(reanchored.get("stop_offset"), default=0.0)
+                reanchor_target_offset = _safe_float(reanchored.get("target_offset"), default=0.0)
+                stop_distance_for_r = abs(entry_fill - effective_stop_price) if effective_stop_price > 0 else stop_distance_plan
+                if reanchor_debug:
+                    global _REANCHOR_MODEL_DEBUG_LOGS
+                    if _REANCHOR_MODEL_DEBUG_LOGS < reanchor_debug_max_logs:
+                        _REANCHOR_MODEL_DEBUG_LOGS += 1
+                        logging.info(
+                            "[BACKTEST_REANCHOR_DEBUG] symbol=%s date=%s reason_raw=%s reason_reanchored=%s entry_raw=%.5f entry_fill=%.5f stop_raw=%.5f stop_eff=%.5f target_raw=%.5f target_eff=%.5f exit_raw=%.5f exit_reanchored=%.5f",
+                            str(getattr(plan_obj, "symbol", "") or ""),
+                            str(getattr(plan_obj, "entry_date", "") or ""),
+                            raw_exit_reason_initial,
+                            exit_reason_active,
+                            raw_entry,
+                            entry_fill,
+                            _safe_float(getattr(plan_obj, "stop_price", None), default=0.0),
+                            effective_stop_price,
+                            _safe_float(getattr(plan_obj, "target_price", None), default=0.0),
+                            effective_target_price,
+                            _safe_float(getattr(trade_obj, "exit_price", None), default=0.0),
+                            raw_exit,
+                        )
+
+        exit_side = _exit_side(direction)
+        exit_slip_bps, exit_bucket = _exit_slippage_bps(exit_reason_active)
+        exit_bps_model = fill_half_spread_bps + exit_slip_bps
+        exit_bps = exit_bps_model if use_bps_base else 0.0
+        exit_fill = _adverse_fill_price(raw_exit, side=exit_side, bps=exit_bps) if use_bps_base else raw_exit
+        exit_fill_mode = "bps" if use_bps_base else "raw"
+
+        if quote_fill_enabled:
+            exit_reason_l = str(exit_reason_active or "").lower()
             exit_spread_cap = quote_max_spread_bps_stop if exit_reason_l == "stop" else quote_max_spread_bps
             exit_dev_cap = quote_max_deviation_bps_stop if exit_reason_l == "stop" else quote_max_deviation_bps
             exit_quote_meta = _resolve_quote_leg(
@@ -461,12 +893,6 @@ def _apply_portfolio_sizing(
                 max_spread_bps=exit_spread_cap,
                 max_deviation_bps=exit_dev_cap,
             )
-            if bool(entry_quote_meta.get("ok")):
-                entry_fill = _safe_float(entry_quote_meta.get("price"), default=entry_fill)
-                entry_fill_mode = "quote"
-            elif not quote_fallback_to_bps:
-                entry_fill = raw_entry
-                entry_fill_mode = "raw_quote_missing"
             if bool(exit_quote_meta.get("ok")):
                 exit_fill = _safe_float(exit_quote_meta.get("price"), default=exit_fill)
                 exit_fill_mode = "quote"
@@ -475,24 +901,25 @@ def _apply_portfolio_sizing(
                 exit_fill_mode = "raw_quote_missing"
             exit_fill, target_limit_bound_applied = _target_limit_bound(
                 direction,
-                str(getattr(trade_obj, "exit_reason", "") or ""),
+                exit_reason_active,
                 exit_fill,
-                _safe_float(getattr(plan_obj, "target_price", None), default=0.0),
+                effective_target_price,
             )
         else:
             target_limit_bound_applied = False
             exit_spread_cap = quote_max_spread_bps
             exit_dev_cap = quote_max_deviation_bps
-        raw_pnl_per_share = (raw_exit - raw_entry) * direction_mult
+
+        raw_entry_for_exit = entry_fill if reanchor_applied else raw_entry
+        raw_pnl_per_share = (raw_exit - raw_entry_for_exit) * direction_mult
         fill_pnl_per_share = (exit_fill - entry_fill) * direction_mult
-        raw_pnl_pct = (raw_pnl_per_share / raw_entry * 100.0) if raw_entry > 0 else 0.0
+        raw_pnl_pct = (raw_pnl_per_share / raw_entry_for_exit * 100.0) if raw_entry_for_exit > 0 else 0.0
         fill_pnl_pct = (fill_pnl_per_share / entry_fill * 100.0) if entry_fill > 0 else 0.0
-        raw_r = (raw_pnl_per_share / stop_distance) if stop_distance > 0 else 0.0
-        fill_r = (fill_pnl_per_share / stop_distance) if stop_distance > 0 else 0.0
+        raw_r = (raw_pnl_per_share / stop_distance_for_r) if stop_distance_for_r > 0 else 0.0
+        fill_r = (fill_pnl_per_share / stop_distance_for_r) if stop_distance_for_r > 0 else 0.0
         fill_cost_per_share = raw_pnl_per_share - fill_pnl_per_share
         fill_cost_total = fill_cost_per_share * max(0, int(qty))
-        stop_price = _safe_float(getattr(plan_obj, "stop_price", None), default=0.0)
-        stop_distance_fill = abs(entry_fill - stop_price) if stop_price > 0 else None
+        stop_distance_fill = abs(entry_fill - effective_stop_price) if effective_stop_price > 0 else None
         fill_entry_bps_eff = _side_price_bps(raw_entry, entry_fill, entry_side)
         fill_exit_bps_eff = _side_price_bps(raw_exit, exit_fill, exit_side)
 
@@ -500,6 +927,10 @@ def _apply_portfolio_sizing(
             "fill_model_enabled": fill_model_enabled,
             "quote_fill_enabled": quote_fill_enabled,
             "quote_fallback_to_bps": quote_fallback_to_bps,
+            "reanchor_brackets_on_fill": reanchor_brackets_on_fill,
+            "reanchor_applied": reanchor_applied,
+            "reanchor_stop_offset": reanchor_stop_offset,
+            "reanchor_target_offset": reanchor_target_offset,
             "entry_fill_mode": entry_fill_mode,
             "exit_fill_mode": exit_fill_mode,
             "entry_quote_ok": bool(entry_quote_meta.get("ok")),
@@ -530,7 +961,15 @@ def _apply_portfolio_sizing(
             "entry_side": entry_side,
             "exit_side": exit_side,
             "fill_exit_reason_bucket": exit_bucket,
+            "raw_exit_reason_initial": raw_exit_reason_initial,
+            "exit_reason_active": exit_reason_active,
+            "exit_ts_active": exit_ts.isoformat() if isinstance(exit_ts, dt.datetime) else None,
+            "stop_hit_ts_active": stop_hit_ts_active,
+            "target_hit_ts_active": target_hit_ts_active,
+            "effective_stop_price": effective_stop_price,
+            "effective_target_price": effective_target_price,
             "raw_entry_price": raw_entry,
+            "raw_entry_price_for_exit": raw_entry_for_exit,
             "raw_exit_price": raw_exit,
             "entry_fill_price": entry_fill,
             "exit_fill_price": exit_fill,
@@ -549,15 +988,24 @@ def _apply_portfolio_sizing(
             "r_multiple": fill_r,
             "fill_cost_per_share": fill_cost_per_share,
             "fill_cost_total": fill_cost_total,
+            "stop_distance_for_r": stop_distance_for_r,
             "stop_distance_fill": stop_distance_fill,
         }
 
     def _apply_fill_to_trade(trade_obj, meta: Dict[str, Any]) -> None:
+        trade_obj.raw_exit_reason = meta.get("raw_exit_reason_initial")
         trade_obj.raw_exit_price = meta.get("raw_exit_price")
         trade_obj.raw_pnl_pct = meta.get("raw_pnl_pct")
         trade_obj.raw_r_multiple = meta.get("raw_r_multiple")
+        trade_obj.raw_entry_price_for_exit = meta.get("raw_entry_price_for_exit")
         trade_obj.entry_fill_price = meta.get("entry_fill_price")
         trade_obj.exit_fill_price = meta.get("exit_fill_price")
+        trade_obj.effective_stop_price = meta.get("effective_stop_price")
+        trade_obj.effective_target_price = meta.get("effective_target_price")
+        trade_obj.reanchor_brackets_on_fill = bool(meta.get("reanchor_brackets_on_fill"))
+        trade_obj.reanchor_applied = bool(meta.get("reanchor_applied"))
+        trade_obj.reanchor_stop_offset = meta.get("reanchor_stop_offset")
+        trade_obj.reanchor_target_offset = meta.get("reanchor_target_offset")
         trade_obj.entry_fill_mode = meta.get("entry_fill_mode")
         trade_obj.exit_fill_mode = meta.get("exit_fill_mode")
         trade_obj.quote_fill_enabled = bool(meta.get("quote_fill_enabled"))
@@ -595,9 +1043,14 @@ def _apply_portfolio_sizing(
         trade_obj.fill_exit_slippage_bps = meta.get("fill_exit_slippage_bps")
         trade_obj.fill_cost_per_share = meta.get("fill_cost_per_share")
         trade_obj.fill_cost_total = meta.get("fill_cost_total")
+        trade_obj.stop_distance_for_r = meta.get("stop_distance_for_r")
         trade_obj.stop_distance_fill = meta.get("stop_distance_fill")
         trade_obj.fill_model_enabled = bool(meta.get("fill_model_enabled"))
         trade_obj.fill_exit_reason_bucket = meta.get("fill_exit_reason_bucket")
+        trade_obj.exit_reason = str(meta.get("exit_reason_active") or getattr(trade_obj, "exit_reason", ""))
+        trade_obj.exit_ts = meta.get("exit_ts_active") or getattr(trade_obj, "exit_ts", None)
+        trade_obj.stop_hit_ts = meta.get("stop_hit_ts_active")
+        trade_obj.target_hit_ts = meta.get("target_hit_ts_active")
         trade_obj.exit_price = _safe_float(meta.get("exit_fill_price"), default=_safe_float(trade_obj.exit_price, default=0.0))
         trade_obj.pnl_pct = _safe_float(meta.get("pnl_pct"), default=_safe_float(trade_obj.pnl_pct, default=0.0))
         trade_obj.r_multiple = _safe_float(meta.get("r_multiple"), default=_safe_float(trade_obj.r_multiple, default=0.0))
@@ -698,12 +1151,25 @@ def _apply_portfolio_sizing(
             "target_price": plan_obj.target_price,
             "stop_distance": plan_obj.stop_distance,
             "raw_entry_price": fill_meta.get("raw_entry_price", plan_obj.entry_price),
+            "raw_entry_price_for_exit": fill_meta.get("raw_entry_price_for_exit", plan_obj.entry_price),
             "raw_exit_price": fill_meta.get("raw_exit_price", getattr(trade_obj, "exit_price", None)),
+            "raw_exit_reason_initial": fill_meta.get("raw_exit_reason_initial"),
+            "exit_reason_active": fill_meta.get("exit_reason_active", getattr(trade_obj, "exit_reason", None)),
+            "exit_ts_active": fill_meta.get("exit_ts_active", getattr(trade_obj, "exit_ts", None)),
+            "stop_hit_ts_active": fill_meta.get("stop_hit_ts_active", getattr(trade_obj, "stop_hit_ts", None)),
+            "target_hit_ts_active": fill_meta.get("target_hit_ts_active", getattr(trade_obj, "target_hit_ts", None)),
             "entry_fill_price": fill_meta.get("entry_fill_price", plan_obj.entry_price),
             "exit_fill_price": fill_meta.get("exit_fill_price", getattr(trade_obj, "exit_price", None)),
+            "effective_stop_price": fill_meta.get("effective_stop_price", plan_obj.stop_price),
+            "effective_target_price": fill_meta.get("effective_target_price", plan_obj.target_price),
             "stop_distance_fill": fill_meta.get("stop_distance_fill"),
+            "stop_distance_for_r": fill_meta.get("stop_distance_for_r", plan_obj.stop_distance),
             "fill_model_enabled": bool(fill_meta.get("fill_model_enabled", False)),
             "quote_fill_enabled": bool(fill_meta.get("quote_fill_enabled", False)),
+            "reanchor_brackets_on_fill": bool(fill_meta.get("reanchor_brackets_on_fill", False)),
+            "reanchor_applied": bool(fill_meta.get("reanchor_applied", False)),
+            "reanchor_stop_offset": fill_meta.get("reanchor_stop_offset"),
+            "reanchor_target_offset": fill_meta.get("reanchor_target_offset"),
             "entry_fill_mode": fill_meta.get("entry_fill_mode"),
             "exit_fill_mode": fill_meta.get("exit_fill_mode"),
             "fill_half_spread_bps": fill_meta.get("fill_half_spread_bps", 0.0),
@@ -751,6 +1217,12 @@ def _apply_portfolio_sizing(
             "gap_bps": getattr(plan_obj, "gap_bps", None),
             "early_pullback_bps": getattr(plan_obj, "early_pullback_bps", None),
             "early_reversal_bps": getattr(plan_obj, "early_reversal_bps", None),
+            "open_noise_abs": getattr(plan_obj, "open_noise_abs", None),
+            "open_noise_bps": getattr(plan_obj, "open_noise_bps", None),
+            "open_noise_atr": getattr(plan_obj, "open_noise_atr", None),
+            "open_noise_stop_ratio": getattr(plan_obj, "open_noise_stop_ratio", None),
+            "stop_to_open_noise_ratio": getattr(plan_obj, "stop_to_open_noise_ratio", None),
+            "open_noise_window_minutes": getattr(plan_obj, "open_noise_window_minutes", None),
             "confirm_move_bps": getattr(plan_obj, "confirm_move_bps", None),
             "confirm_minutes": getattr(plan_obj, "confirm_minutes", None),
             "confirm_hit_bps": getattr(plan_obj, "confirm_hit_bps", None),
@@ -800,6 +1272,7 @@ def _apply_portfolio_sizing(
     if not intraday_only:
         # Legacy path for multi-day holds: realized PnL is applied in sequence.
         open_positions = 0
+        used_notional_broker_sim = 0.0
         for idx, trade in enumerate(day_trades):
             plan = getattr(trade, "plan", None)
             if plan is None:
@@ -821,14 +1294,31 @@ def _apply_portfolio_sizing(
                 )
                 if target > 0:
                     slot_target = target
+            allowed_total_seed_sim, broker_buying_power_sim, bp_budget_sim = _simulated_live_allowed_total_seed(
+                equity,
+                used_notional,
+                used_notional_broker_sim,
+            )
             qty, state = compute_qty_with_guards(
                 plan,
                 equity,
                 used_notional,
                 cfg,
+                allowed_total_override=allowed_total_seed_sim,
                 open_positions=open_positions,
                 slot_target_override=slot_target,
                 day_start_equity=day_start_equity,
+            )
+            state["backtest_allowed_total_seed_sim"] = allowed_total_seed_sim
+            state["backtest_broker_buying_power_seed_sim"] = broker_buying_power_sim
+            state["backtest_bp_budget_seed_sim"] = bp_budget_sim
+            qty = _apply_backtest_execution_bp_cap(
+                plan,
+                qty,
+                state,
+                equity,
+                used_notional,
+                used_notional_broker_sim,
             )
             if qty <= 0:
                 continue
@@ -840,8 +1330,16 @@ def _apply_portfolio_sizing(
             entry_fill_price = _safe_float(fill_meta.get("entry_fill_price"), default=_safe_float(plan.entry_price, default=0.0))
             notional = entry_fill_price * qty
             capacity_qty = int((state or {}).get("capacity_qty") or qty)
-            capacity_notional = entry_fill_price * capacity_qty
+            capacity_px = _safe_float((state or {}).get("capacity_notional_per_share"), default=entry_fill_price)
+            if capacity_px <= 0:
+                capacity_px = entry_fill_price
+            capacity_notional = capacity_px * capacity_qty
             used_notional += capacity_notional
+            mmr_pct = _symbol_mmr_pct(str(getattr(plan, "symbol", "") or ""))
+            open_side = "buy" if str(getattr(plan, "direction", "long")).lower() == "long" else "sell"
+            broker_bp_unit = _bp_unit_price_broker_sim(entry_fill_price, open_side, mmr_pct)
+            capacity_notional_broker = broker_bp_unit * capacity_qty if broker_bp_unit > 0 else capacity_notional
+            used_notional_broker_sim += capacity_notional_broker
             open_positions += 1
             accepted.append(trade)
             rec = _build_sized_record(
@@ -854,6 +1352,7 @@ def _apply_portfolio_sizing(
                 capacity_notional,
                 fill_meta=fill_meta,
             )
+            rec["capacity_notional_broker_sim"] = capacity_notional_broker
             rec["equity_before"] = equity_before
             rec["equity_after"] = equity
             sized_records.append(rec)
@@ -884,9 +1383,11 @@ def _apply_portfolio_sizing(
     work.sort(key=lambda r: (r["entry_dt"], r["seq"]))
 
     open_positions_state: List[Dict] = []
+    used_notional_broker_sim = 0.0
+    last_exposure_resync_entry_dt: Optional[dt.datetime] = None
 
     def _realize_until(cutoff_dt: dt.datetime, include_equal: bool = False) -> None:
-        nonlocal equity, used_notional, open_positions_state
+        nonlocal equity, used_notional, used_notional_broker_sim, open_positions_state
         if not open_positions_state:
             return
         still_open: List[Dict] = []
@@ -899,15 +1400,60 @@ def _apply_portfolio_sizing(
                 rec["equity_before"] = eq_before
                 rec["equity_after"] = equity
                 used_notional = max(0.0, used_notional - float(pos["capacity_notional"]))
+                used_notional_broker_sim = max(
+                    0.0,
+                    used_notional_broker_sim - float(pos.get("capacity_notional_broker_sim") or 0.0),
+                )
             else:
                 still_open.append(pos)
         open_positions_state = still_open
+
+    def _resync_open_exposure(cutoff_dt_obj: dt.datetime) -> tuple[float, float, float]:
+        # Live parity: each pass reseeds exposure from current marked positions.
+        if not open_positions_state:
+            return equity, 0.0, 0.0
+        unrealized_total = 0.0
+        used_model = 0.0
+        used_broker = 0.0
+        for pos in open_positions_state:
+            symbol = str(pos.get("symbol") or "").upper()
+            direction = str(pos.get("direction") or "long").lower()
+            reserve_qty = max(0.0, float(pos.get("reserve_qty") or 0.0))
+            if reserve_qty <= 0:
+                continue
+            entry_fill_px = max(0.0, _safe_float(pos.get("entry_fill_price"), default=0.0))
+            fallback_px = entry_fill_px if entry_fill_px > 0 else _safe_float(pos.get("entry_price"), default=0.0)
+            mark_px = _intraday_mark_price(symbol, str(pos.get("entry_date") or ""), cutoff_dt_obj, fallback_px)
+            if entry_fill_px > 0 and mark_px > 0:
+                if direction == "long":
+                    unrealized_total += (mark_px - entry_fill_px) * reserve_qty
+                else:
+                    unrealized_total += (entry_fill_px - mark_px) * reserve_qty
+            side = "buy" if direction == "long" else "sell"
+            mmr_pct = _symbol_mmr_pct(symbol)
+            model_unit = _bp_unit_price(mark_px if mark_px > 0 else fallback_px, side, mmr_pct)
+            broker_unit = _bp_unit_price_broker_sim(mark_px if mark_px > 0 else fallback_px, side, mmr_pct)
+            if model_unit > 0:
+                used_model += reserve_qty * model_unit
+            if broker_unit > 0:
+                used_broker += reserve_qty * broker_unit
+        equity_seed = equity + unrealized_total
+        return max(0.0, equity_seed), max(0.0, used_model), max(0.0, used_broker)
 
     for row_idx, row in enumerate(work):
         trade = row["trade"]
         plan = row["plan"]
         entry_dt_obj = row["entry_dt"]
         _realize_until(entry_dt_obj)
+        equity_seed_sizing = equity
+        if (
+            backtest_live_exposure_resync_enabled
+            and (last_exposure_resync_entry_dt is None or entry_dt_obj != last_exposure_resync_entry_dt)
+        ):
+            equity_seed_sizing, used_notional_seed, used_notional_broker_seed = _resync_open_exposure(entry_dt_obj)
+            used_notional = used_notional_seed
+            used_notional_broker_sim = used_notional_broker_seed
+            last_exposure_resync_entry_dt = entry_dt_obj
         slot_target = None
         if slot_distribution_enabled:
             stats_rows = []
@@ -924,14 +1470,31 @@ def _apply_portfolio_sizing(
             )
             if target > 0:
                 slot_target = target
+        allowed_total_seed_sim, broker_buying_power_sim, bp_budget_sim = _simulated_live_allowed_total_seed(
+            equity_seed_sizing,
+            used_notional,
+            used_notional_broker_sim,
+        )
         qty, state = compute_qty_with_guards(
             plan,
-            equity,
+            equity_seed_sizing,
             used_notional,
             cfg,
+            allowed_total_override=allowed_total_seed_sim,
             open_positions=len(open_positions_state),
             slot_target_override=slot_target,
             day_start_equity=day_start_equity,
+        )
+        state["backtest_allowed_total_seed_sim"] = allowed_total_seed_sim
+        state["backtest_broker_buying_power_seed_sim"] = broker_buying_power_sim
+        state["backtest_bp_budget_seed_sim"] = bp_budget_sim
+        qty = _apply_backtest_execution_bp_cap(
+            plan,
+            qty,
+            state,
+            equity_seed_sizing,
+            used_notional,
+            used_notional_broker_sim,
         )
         if qty <= 0:
             continue
@@ -941,8 +1504,16 @@ def _apply_portfolio_sizing(
         entry_fill_price = _safe_float(fill_meta.get("entry_fill_price"), default=_safe_float(plan.entry_price, default=0.0))
         notional = entry_fill_price * qty
         capacity_qty = int((state or {}).get("capacity_qty") or qty)
-        capacity_notional = entry_fill_price * capacity_qty
+        capacity_px = _safe_float((state or {}).get("capacity_notional_per_share"), default=entry_fill_price)
+        if capacity_px <= 0:
+            capacity_px = entry_fill_price
+        capacity_notional = capacity_px * capacity_qty
         used_notional += capacity_notional
+        mmr_pct = _symbol_mmr_pct(str(getattr(plan, "symbol", "") or ""))
+        open_side = "buy" if str(getattr(plan, "direction", "long")).lower() == "long" else "sell"
+        broker_bp_unit = _bp_unit_price_broker_sim(entry_fill_price, open_side, mmr_pct)
+        capacity_notional_broker = broker_bp_unit * capacity_qty if broker_bp_unit > 0 else capacity_notional
+        used_notional_broker_sim += capacity_notional_broker
 
         accepted.append(trade)
         rec = _build_sized_record(
@@ -955,6 +1526,7 @@ def _apply_portfolio_sizing(
             capacity_notional,
             fill_meta=fill_meta,
         )
+        rec["capacity_notional_broker_sim"] = capacity_notional_broker
         sized_records.append(rec)
         _log_fill_debug(plan, trade, qty, fill_meta)
         _log_quote_debug(plan, trade, qty, fill_meta)
@@ -962,6 +1534,13 @@ def _apply_portfolio_sizing(
             {
                 "exit_dt": row["exit_dt"],
                 "capacity_notional": capacity_notional,
+                "capacity_notional_broker_sim": capacity_notional_broker,
+                "symbol": str(getattr(plan, "symbol", "") or ""),
+                "direction": str(getattr(plan, "direction", "long") or "long"),
+                "reserve_qty": float(qty),
+                "entry_fill_price": float(entry_fill_price or 0.0),
+                "entry_price": float(_safe_float(getattr(plan, "entry_price", 0.0), default=0.0)),
+                "entry_date": str(getattr(plan, "entry_date", "") or ""),
                 "pnl_total": pnl_total,
                 "record": rec,
             }
@@ -982,11 +1561,12 @@ def run_backtest(
     run_id: Optional[str] = None,
 ) -> Tuple[Dict[str, float], List]:
     cfg = cfg or load_config()
-    global _FILL_MODEL_LOGGED, _FILL_MODEL_DEBUG_LOGS, _QUOTE_MODEL_LOGGED, _QUOTE_MODEL_DEBUG_LOGS
+    global _FILL_MODEL_LOGGED, _FILL_MODEL_DEBUG_LOGS, _QUOTE_MODEL_LOGGED, _QUOTE_MODEL_DEBUG_LOGS, _REANCHOR_MODEL_DEBUG_LOGS
     _FILL_MODEL_LOGGED = False
     _FILL_MODEL_DEBUG_LOGS = 0
     _QUOTE_MODEL_LOGGED = False
     _QUOTE_MODEL_DEBUG_LOGS = 0
+    _REANCHOR_MODEL_DEBUG_LOGS = 0
     rep = cfg.get("replay") or {}
     start = start_date or rep.get("start_date")
     end = end_date or rep.get("end_date") or start
@@ -1073,6 +1653,21 @@ def run_backtest(
             )
             writer.writeheader()
     daily_lookup = _build_daily_lookup(data_store, symbols, prefetch_start, end, cfg)
+    params = cfg.get("daily_trend_reversal") or {}
+    backtest_live_bp_execution_cap_enabled = bool(params.get("backtest_live_bp_execution_cap_enabled", True))
+    backtest_use_live_asset_mmr = bool(params.get("backtest_use_live_asset_mmr", True))
+    backtest_asset_mmr_broker: Optional[AlpacaBroker] = None
+    backtest_asset_mmr_cache: Dict[str, Optional[float]] = {}
+    if backtest_live_bp_execution_cap_enabled and backtest_use_live_asset_mmr:
+        try:
+            candidate_broker = AlpacaBroker(cfg)
+            if candidate_broker.ready():
+                backtest_asset_mmr_broker = candidate_broker
+                logging.info("[BACKTEST] execution_bp_parity enabled=1 mmr_lookup=alpaca_assets")
+            else:
+                logging.info("[BACKTEST] execution_bp_parity enabled=1 mmr_lookup=disabled reason=broker_not_ready")
+        except Exception as exc:
+            logging.warning("[BACKTEST] execution_bp_parity mmr_lookup_init_failed error=%s", exc)
     month_key = None
     month_start_equity = equity
     month_trades: List[Dict] = []
@@ -1119,7 +1714,13 @@ def run_backtest(
             continue
         day_trades = run_replay(cfg, start_date=date_str, end_date=date_str, data_store=data_store, run_id=run_id)
         if day_trades:
-            accepted, sized_records, equity = _apply_portfolio_sizing(day_trades, equity, cfg)
+            accepted, sized_records, equity = _apply_portfolio_sizing(
+                day_trades,
+                equity,
+                cfg,
+                asset_mmr_broker=backtest_asset_mmr_broker,
+                asset_mmr_cache=backtest_asset_mmr_cache,
+            )
             if accepted:
                 all_trades.extend(accepted)
             if sized_records:
@@ -1255,6 +1856,9 @@ def run_backtest(
         mae_vals: List[float] = []
         gap_vals: List[float] = []
         pullback_vals: List[float] = []
+        open_noise_bps_vals: List[float] = []
+        open_noise_atr_vals: List[float] = []
+        open_noise_stop_ratio_vals: List[float] = []
         confirm_hit_vals: List[float] = []
         signal_return_vals: List[float] = []
         signal_return_atr_vals: List[float] = []
@@ -1317,6 +1921,12 @@ def run_backtest(
                 gap_vals.append(float(rec.get("gap_bps") or 0.0))
             if rec.get("early_pullback_bps") is not None:
                 pullback_vals.append(float(rec.get("early_pullback_bps") or 0.0))
+            if rec.get("open_noise_bps") is not None:
+                open_noise_bps_vals.append(float(rec.get("open_noise_bps") or 0.0))
+            if rec.get("open_noise_atr") is not None:
+                open_noise_atr_vals.append(float(rec.get("open_noise_atr") or 0.0))
+            if rec.get("open_noise_stop_ratio") is not None:
+                open_noise_stop_ratio_vals.append(float(rec.get("open_noise_stop_ratio") or 0.0))
             if rec.get("confirm_hit_bps") is not None:
                 confirm_hit_vals.append(float(rec.get("confirm_hit_bps") or 0.0))
             if rec.get("signal_return_pct") is not None:
@@ -1412,6 +2022,12 @@ def run_backtest(
                     "gap_bps": getattr(plan, "gap_bps", None) if plan else None,
                     "early_pullback_bps": getattr(plan, "early_pullback_bps", None) if plan else None,
                     "early_reversal_bps": getattr(plan, "early_reversal_bps", None) if plan else None,
+                    "open_noise_abs": getattr(plan, "open_noise_abs", None) if plan else None,
+                    "open_noise_bps": getattr(plan, "open_noise_bps", None) if plan else None,
+                    "open_noise_atr": getattr(plan, "open_noise_atr", None) if plan else None,
+                    "open_noise_stop_ratio": getattr(plan, "open_noise_stop_ratio", None) if plan else None,
+                    "stop_to_open_noise_ratio": getattr(plan, "stop_to_open_noise_ratio", None) if plan else None,
+                    "open_noise_window_minutes": getattr(plan, "open_noise_window_minutes", None) if plan else None,
                     "target_mode": getattr(plan, "target_mode", None) if plan else None,
                     "target_window_avg_pct": getattr(plan, "target_window_avg_pct", None) if plan else None,
                     "target_window_mult": getattr(plan, "target_window_mult", None) if plan else None,
@@ -1487,6 +2103,9 @@ def run_backtest(
                     "mae_pct_percentiles": _percentiles(mae_vals),
                     "gap_bps_percentiles": _percentiles(gap_vals),
                     "early_pullback_bps_percentiles": _percentiles(pullback_vals),
+                    "open_noise_bps_percentiles": _percentiles(open_noise_bps_vals),
+                    "open_noise_atr_percentiles": _percentiles(open_noise_atr_vals),
+                    "open_noise_stop_ratio_percentiles": _percentiles(open_noise_stop_ratio_vals),
                     "confirm_hit_bps_percentiles": _percentiles(confirm_hit_vals),
                     "signal_return_pct_percentiles": _percentiles(signal_return_vals),
                     "signal_return_atr_percentiles": _percentiles(signal_return_atr_vals),

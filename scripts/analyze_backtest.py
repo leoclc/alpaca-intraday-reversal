@@ -155,6 +155,9 @@ def _enrich_trade(t: Dict[str, Any]) -> Dict[str, Any]:
     direction = str(t.get("direction") or "").lower()
     gap_bps = _safe_float(t.get("gap_bps"), default=0.0)
     pb = t.get("early_pullback_bps")
+    open_noise_abs = t.get("open_noise_abs")
+    open_noise_stop_ratio = t.get("open_noise_stop_ratio")
+    stop_to_open_noise_ratio = t.get("stop_to_open_noise_ratio")
     target_r = abs(tp - ep) / sd if sd > 0 else None
     stop_atr = sd / atr if atr > 0 else None
     gap_fav_bps = gap_bps if direction == "short" else -gap_bps
@@ -164,6 +167,20 @@ def _enrich_trade(t: Dict[str, Any]) -> Dict[str, Any]:
     out["_stop_atr"] = stop_atr
     out["_gap_fav_bps"] = gap_fav_bps
     out["_early_pullback_bps"] = _safe_float(pb, default=0.0) if pb is not None else None
+    if open_noise_abs is not None:
+        out["_open_noise_abs"] = _safe_float(open_noise_abs, default=0.0)
+    if t.get("open_noise_bps") is not None:
+        out["_open_noise_bps"] = _safe_float(t.get("open_noise_bps"), default=0.0)
+    if t.get("open_noise_atr") is not None:
+        out["_open_noise_atr"] = _safe_float(t.get("open_noise_atr"), default=0.0)
+    if open_noise_stop_ratio is not None:
+        out["_open_noise_stop_ratio"] = _safe_float(open_noise_stop_ratio, default=0.0)
+    elif open_noise_abs is not None and sd > 0:
+        out["_open_noise_stop_ratio"] = _safe_float(open_noise_abs, default=0.0) / sd
+    if stop_to_open_noise_ratio is not None:
+        out["_stop_to_open_noise_ratio"] = _safe_float(stop_to_open_noise_ratio, default=0.0)
+    elif open_noise_abs is not None and _safe_float(open_noise_abs, default=0.0) > 0 and sd > 0:
+        out["_stop_to_open_noise_ratio"] = sd / _safe_float(open_noise_abs, default=0.0)
     po = t.get("param_overrides")
     out["param_overrides_json"] = _stable_json(po) if isinstance(po, dict) and po else ""
     out["_fill_r_delta"] = None
@@ -650,6 +667,12 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "gap_bps",
         "early_pullback_bps",
         "early_reversal_bps",
+        "open_noise_abs",
+        "open_noise_bps",
+        "open_noise_atr",
+        "open_noise_stop_ratio",
+        "stop_to_open_noise_ratio",
+        "open_noise_window_minutes",
         "confirm_move_bps",
         "confirm_minutes",
         "confirm_hit_bps",
@@ -664,6 +687,11 @@ def analyze(run_dir: Path, *, watchlists_dir: Optional[Path]) -> Path:
         "_target_r",
         "_stop_atr",
         "_gap_fav_bps",
+        "_open_noise_abs",
+        "_open_noise_bps",
+        "_open_noise_atr",
+        "_open_noise_stop_ratio",
+        "_stop_to_open_noise_ratio",
         "_fill_r_delta",
         "_fill_pnl_pct_delta",
         "_fill_cost_bps_notional",
