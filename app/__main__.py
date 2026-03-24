@@ -90,6 +90,77 @@ def _sleep_until(target: dt.datetime) -> None:
         time.sleep(min(30.0, max(1.0, remaining)))
 
 
+def _broker_clock_now(broker: Optional[AlpacaBroker]) -> dt.datetime | None:
+    if broker is None or not broker.ready():
+        return None
+    try:
+        payload = broker.get_clock() or {}
+    except Exception:
+        return None
+    return _parse_iso_ts(payload.get("timestamp"))
+
+
+def _entry_release_state(
+    target: dt.datetime,
+    *,
+    local_now: dt.datetime,
+    broker_now: dt.datetime | None,
+    fallback_delay_sec: float,
+) -> tuple[bool, float, str]:
+    if broker_now is not None:
+        remaining = max(0.0, (target - broker_now).total_seconds())
+        return remaining <= 0.0, remaining, "broker_clock"
+    effective_target = target + dt.timedelta(seconds=max(0.0, fallback_delay_sec))
+    remaining = max(0.0, (effective_target - local_now).total_seconds())
+    return remaining <= 0.0, remaining, "local_fallback"
+
+
+def _sleep_until_entry_release(cfg: dict, target: dt.datetime, entry_time_str: str) -> None:
+    params = cfg.get("daily_trend_reversal") or {}
+    use_broker_clock = bool(params.get("live_entry_use_broker_clock", True))
+    fallback_delay_sec = max(0.0, float(params.get("live_entry_timing_fallback_delay_sec") or 5.0))
+    poll_sec = max(0.05, float(params.get("live_entry_timing_poll_sec") or 0.25))
+    broker = AlpacaBroker(cfg) if use_broker_clock else None
+    if broker is not None and not broker.ready():
+        broker = None
+
+    logged_broker_guard = False
+    logged_fallback_guard = False
+    while True:
+        local_now = et_now()
+        broker_now = _broker_clock_now(broker)
+        ready, remaining, mode = _entry_release_state(
+            target,
+            local_now=local_now,
+            broker_now=broker_now,
+            fallback_delay_sec=fallback_delay_sec,
+        )
+        if ready:
+            return
+
+        if mode == "broker_clock" and broker_now is not None and local_now >= target and not logged_broker_guard:
+            skew_sec = (local_now - broker_now).total_seconds()
+            logging.info(
+                "[LIVE] broker_clock_guard entry_time_et=%s local_now=%s broker_now=%s skew_sec=%.3f waiting_sec=%.3f",
+                entry_time_str,
+                local_now.isoformat(),
+                broker_now.isoformat(),
+                skew_sec,
+                remaining,
+            )
+            logged_broker_guard = True
+        elif mode == "local_fallback" and local_now >= target and not logged_fallback_guard:
+            logging.warning(
+                "[LIVE] broker_clock_unavailable entry_time_et=%s fallback_delay_sec=%.2f local_now=%s",
+                entry_time_str,
+                fallback_delay_sec,
+                local_now.isoformat(),
+            )
+            logged_fallback_guard = True
+
+        time.sleep(min(5.0, max(poll_sec, remaining)))
+
+
 def _ordered_entry_time_strs(cfg: dict) -> list[str]:
     params = cfg.get("daily_trend_reversal") or {}
     watch_cfg = cfg.get("watchlist") or {}
@@ -371,11 +442,8 @@ def main() -> None:
             traded_symbols: set[str] = set()
             plans = []
             for entry_time_str, entry_dt in zip(entry_time_strs, entry_dts):
-                if et_now() < entry_dt:
-                    logging.info("[LIVE] waiting for entry_time_et=%s", entry_time_str)
-                    _sleep_until(entry_dt)
-                else:
-                    logging.info("[LIVE] entry_time_et=%s already passed; placing orders now", entry_time_str)
+                logging.info("[LIVE] waiting for entry_time_et=%s", entry_time_str)
+                _sleep_until_entry_release(cfg, entry_dt, entry_time_str)
                 logging.info("[LIVE] placing orders for entry_time_et=%s", entry_time_str)
                 allowed_symbols = None
                 if entry_time_map:

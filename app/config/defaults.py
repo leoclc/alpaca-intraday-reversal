@@ -167,13 +167,26 @@ DEFAULT_CONFIG: dict = {
         "live_reanchor_fill_timeout_sec": 30.0,
         "live_reanchor_fill_poll_sec": 0.25,
         "live_reanchor_cancel_unfilled_entry": True,
+        # Release live entry batches against broker time so local clock skew does not
+        # submit 09:35 orders a few seconds early.
+        "live_entry_use_broker_clock": True,
+        "live_entry_timing_fallback_delay_sec": 5.0,
+        "live_entry_timing_poll_sec": 0.25,
         # Backtest parity: re-simulate stop/target hits from simulated entry fill (not planned entry).
         "backtest_reanchor_brackets_on_fill": True,
         "backtest_reanchor_debug": False,
         "backtest_reanchor_debug_max_logs": 40,
+        # SEC Section 31 regulatory fee on covered sales. This applies to our long exits
+        # and short entries from the effective date onward.
+        "backtest_sec_sell_fee_enabled": True,
+        "backtest_sec_sell_fee_effective_date": "2026-04-04",
+        "backtest_sec_sell_fee_rate_per_million": 20.60,
         # If true, backtest reuses existing watchlist files from watchlists_dir when present.
         # Useful for fast parity/sizing sweeps while keeping the signal set fixed.
         "backtest_reuse_existing_watchlists": False,
+        # If a frozen live watchlist snapshot exists for a date, prefer it during backtests
+        # instead of rebuilding that day's watchlist with later-available data.
+        "backtest_reuse_frozen_live_watchlists": True,
         # Optional floor on stop_distance vs daily ATR (stop_distance / ATR).
         # If 0, disabled.
         "min_stop_atr": 0.0,
@@ -192,6 +205,9 @@ DEFAULT_CONFIG: dict = {
         "entry_time_rank_by": "avgR",
         "top_k_rank_by": "total_pnl_pct",
         "top_k": 0,
+        # Preserve the first live watchlist written each day in an immutable snapshot so
+        # after-the-fact parity runs can reuse the exact morning artifact.
+        "freeze_live_snapshot_enabled": True,
     },
     "watchlist_report_enabled": False,
     "watchlist_source": "node",
@@ -241,6 +257,7 @@ DEFAULT_CONFIG: dict = {
     "minute_bars_cache_dir": "cache/ohlc_minute",
     "minute_bars_refresh": False,
     "watchlists_dir": "watchlists",
+    "frozen_watchlists_dir": "logs/watchlist_snapshots/live",
     "logs_dir": "logs",
     "symbols": [],
 }

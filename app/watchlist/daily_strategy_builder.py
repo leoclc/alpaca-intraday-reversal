@@ -22,7 +22,7 @@ from app.strategies.daily_trend_reversal import (
 from app.utils.time import ensure_date, parse_time_hhmm
 from app.watchlist.day_filter import summarize_watchlist_rows
 from app.watchlist.node_assets import resolve_asset_universe_symbols
-from app.watchlist.storage import expected_watchlist_date_str, write_watchlist
+from app.watchlist.storage import expected_watchlist_date_str, freeze_watchlist_snapshot, write_watchlist
 
 
 @dataclass(frozen=True)
@@ -2934,12 +2934,15 @@ def build_watchlist(
         },
     }
 
+    payload = {"date": tgt, "watchlist": watchlist, "meta": watchlist_meta}
     if watchlist:
         write_watchlist(watchlist, cfg, date_str=tgt, meta=watchlist_meta)
     else:
         logging.warning("[WATCHLIST] empty watchlist date=%s; no fallback applied", tgt)
         # Overwrite any stale watchlist for this date so replay can't pick up old symbols.
         write_watchlist([], cfg, date_str=tgt, meta=watchlist_meta)
+    if run_id is None and bool((cfg.get("watchlist") or {}).get("freeze_live_snapshot_enabled", True)):
+        freeze_watchlist_snapshot(payload, cfg, date_str=tgt, overwrite=False)
     if watchlist:
         logging.info("[WATCHLIST_ENTRY_TIMES] date=%s %s", tgt, entry_time_counts)
     if report_enabled:

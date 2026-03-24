@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import csv
+import shutil
 from dataclasses import is_dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Iterable
@@ -25,7 +26,7 @@ from app.replay.daily_strategy_replay import run_replay
 from app.utils.time import ensure_et, iter_trading_days, parse_time_hhmm
 from app.watchlist.daily_strategy_builder import build_watchlist
 from app.watchlist.node_assets import read_asset_universe_snapshot, resolve_asset_universe_symbols
-from app.watchlist.storage import watchlist_path
+from app.watchlist.storage import frozen_watchlist_path, watchlist_path
 
 _FILL_MODEL_LOGGED = False
 _FILL_MODEL_DEBUG_LOGS = 0
@@ -50,6 +51,66 @@ def _safe_int(value: object, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _coerce_iso_date(value: object) -> Optional[dt.date]:
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if "T" in raw:
+            return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        return dt.date.fromisoformat(raw[:10])
+    except Exception:
+        return None
+
+
+def _compute_sec_sell_fee(
+    *,
+    direction: str,
+    entry_fill: float,
+    exit_fill: float,
+    entry_dt: Optional[dt.datetime],
+    exit_dt: Optional[dt.datetime],
+    entry_date: object,
+    exit_date: object,
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    enabled = bool(params.get("backtest_sec_sell_fee_enabled", True))
+    rate_per_million = _safe_float(params.get("backtest_sec_sell_fee_rate_per_million"), default=20.60)
+    rate_per_dollar = _safe_float(params.get("backtest_sec_sell_fee_rate_per_dollar"), default=0.0)
+    if rate_per_dollar <= 0.0:
+        rate_per_dollar = max(0.0, rate_per_million / 1_000_000.0)
+    effective_date = _coerce_iso_date(params.get("backtest_sec_sell_fee_effective_date")) or dt.date(2026, 4, 4)
+    direction_l = str(direction or "").lower()
+    sale_price = entry_fill if direction_l == "short" else exit_fill
+    sale_date = (
+        _coerce_iso_date(entry_dt) or _coerce_iso_date(entry_date)
+        if direction_l == "short"
+        else _coerce_iso_date(exit_dt) or _coerce_iso_date(exit_date)
+    )
+    if (not enabled) or rate_per_dollar <= 0.0 or sale_price <= 0.0 or sale_date is None or sale_date < effective_date:
+        return {
+            "applied": False,
+            "rate_per_dollar": rate_per_dollar,
+            "sale_date": sale_date.isoformat() if sale_date else None,
+            "sale_price": sale_price if sale_price > 0.0 else None,
+            "fee_per_share": 0.0,
+            "fee_total": 0.0,
+        }
+    fee_per_share = sale_price * rate_per_dollar
+    return {
+        "applied": True,
+        "rate_per_dollar": rate_per_dollar,
+        "sale_date": sale_date.isoformat(),
+        "sale_price": sale_price,
+        "fee_per_share": fee_per_share,
+        "fee_total": 0.0,
+    }
 
 
 def _adverse_fill_price(price: float, *, side: str, bps: float) -> float:
@@ -912,13 +973,30 @@ def _apply_portfolio_sizing(
 
         raw_entry_for_exit = entry_fill if reanchor_applied else raw_entry
         raw_pnl_per_share = (raw_exit - raw_entry_for_exit) * direction_mult
-        fill_pnl_per_share = (exit_fill - entry_fill) * direction_mult
+        fill_pnl_per_share_before_sec_fee = (exit_fill - entry_fill) * direction_mult
+        fill_pnl_pct_before_sec_fee = (fill_pnl_per_share_before_sec_fee / entry_fill * 100.0) if entry_fill > 0 else 0.0
+        fill_r_before_sec_fee = (fill_pnl_per_share_before_sec_fee / stop_distance_for_r) if stop_distance_for_r > 0 else 0.0
         raw_pnl_pct = (raw_pnl_per_share / raw_entry_for_exit * 100.0) if raw_entry_for_exit > 0 else 0.0
-        fill_pnl_pct = (fill_pnl_per_share / entry_fill * 100.0) if entry_fill > 0 else 0.0
         raw_r = (raw_pnl_per_share / stop_distance_for_r) if stop_distance_for_r > 0 else 0.0
-        fill_r = (fill_pnl_per_share / stop_distance_for_r) if stop_distance_for_r > 0 else 0.0
-        fill_cost_per_share = raw_pnl_per_share - fill_pnl_per_share
+        fill_cost_per_share = raw_pnl_per_share - fill_pnl_per_share_before_sec_fee
         fill_cost_total = fill_cost_per_share * max(0, int(qty))
+        sec_fee_meta = _compute_sec_sell_fee(
+            direction=direction,
+            entry_fill=entry_fill,
+            exit_fill=exit_fill,
+            entry_dt=entry_ts,
+            exit_dt=exit_ts,
+            entry_date=getattr(plan_obj, "entry_date", None),
+            exit_date=getattr(trade_obj, "exit_date", None),
+            params=params,
+        )
+        sec_fee_total = _safe_float(sec_fee_meta.get("fee_per_share"), default=0.0) * max(0, int(qty))
+        sec_fee_meta["fee_total"] = sec_fee_total
+        fill_pnl_per_share = fill_pnl_per_share_before_sec_fee - _safe_float(sec_fee_meta.get("fee_per_share"), default=0.0)
+        fill_pnl_pct = (fill_pnl_per_share / entry_fill * 100.0) if entry_fill > 0 else 0.0
+        fill_r = (fill_pnl_per_share / stop_distance_for_r) if stop_distance_for_r > 0 else 0.0
+        net_cost_per_share = fill_cost_per_share + _safe_float(sec_fee_meta.get("fee_per_share"), default=0.0)
+        net_cost_total = fill_cost_total + sec_fee_total
         stop_distance_fill = abs(entry_fill - effective_stop_price) if effective_stop_price > 0 else None
         fill_entry_bps_eff = _side_price_bps(raw_entry, entry_fill, entry_side)
         fill_exit_bps_eff = _side_price_bps(raw_exit, exit_fill, exit_side)
@@ -981,13 +1059,24 @@ def _apply_portfolio_sizing(
             "fill_entry_bps_model": entry_bps_model if use_bps_base else 0.0,
             "fill_exit_bps_model": exit_bps_model if use_bps_base else 0.0,
             "raw_pnl_per_share": raw_pnl_per_share,
+            "pnl_per_share_before_sec_fee": fill_pnl_per_share_before_sec_fee,
             "pnl_per_share": fill_pnl_per_share,
             "raw_pnl_pct": raw_pnl_pct,
+            "pnl_pct_before_sec_fee": fill_pnl_pct_before_sec_fee,
             "pnl_pct": fill_pnl_pct,
             "raw_r_multiple": raw_r,
+            "r_multiple_before_sec_fee": fill_r_before_sec_fee,
             "r_multiple": fill_r,
             "fill_cost_per_share": fill_cost_per_share,
             "fill_cost_total": fill_cost_total,
+            "net_cost_per_share": net_cost_per_share,
+            "net_cost_total": net_cost_total,
+            "sec_sell_fee_applied": bool(sec_fee_meta.get("applied", False)),
+            "sec_sell_fee_rate_per_dollar": sec_fee_meta.get("rate_per_dollar"),
+            "sec_sell_fee_sale_date": sec_fee_meta.get("sale_date"),
+            "sec_sell_fee_sale_price": sec_fee_meta.get("sale_price"),
+            "sec_sell_fee_per_share": sec_fee_meta.get("fee_per_share", 0.0),
+            "sec_sell_fee_total": sec_fee_total,
             "stop_distance_for_r": stop_distance_for_r,
             "stop_distance_fill": stop_distance_fill,
         }
@@ -1043,6 +1132,17 @@ def _apply_portfolio_sizing(
         trade_obj.fill_exit_slippage_bps = meta.get("fill_exit_slippage_bps")
         trade_obj.fill_cost_per_share = meta.get("fill_cost_per_share")
         trade_obj.fill_cost_total = meta.get("fill_cost_total")
+        trade_obj.net_cost_per_share = meta.get("net_cost_per_share")
+        trade_obj.net_cost_total = meta.get("net_cost_total")
+        trade_obj.sec_sell_fee_applied = bool(meta.get("sec_sell_fee_applied"))
+        trade_obj.sec_sell_fee_rate_per_dollar = meta.get("sec_sell_fee_rate_per_dollar")
+        trade_obj.sec_sell_fee_sale_date = meta.get("sec_sell_fee_sale_date")
+        trade_obj.sec_sell_fee_sale_price = meta.get("sec_sell_fee_sale_price")
+        trade_obj.sec_sell_fee_per_share = meta.get("sec_sell_fee_per_share")
+        trade_obj.sec_sell_fee_total = meta.get("sec_sell_fee_total")
+        trade_obj.pnl_per_share_before_sec_fee = meta.get("pnl_per_share_before_sec_fee")
+        trade_obj.pnl_pct_before_sec_fee = meta.get("pnl_pct_before_sec_fee")
+        trade_obj.r_multiple_before_sec_fee = meta.get("r_multiple_before_sec_fee")
         trade_obj.stop_distance_for_r = meta.get("stop_distance_for_r")
         trade_obj.stop_distance_fill = meta.get("stop_distance_fill")
         trade_obj.fill_model_enabled = bool(meta.get("fill_model_enabled"))
@@ -1182,6 +1282,14 @@ def _apply_portfolio_sizing(
             "fill_exit_reason_bucket": fill_meta.get("fill_exit_reason_bucket"),
             "fill_cost_per_share": fill_meta.get("fill_cost_per_share", 0.0),
             "fill_cost_total": fill_meta.get("fill_cost_total", 0.0),
+            "net_cost_per_share": fill_meta.get("net_cost_per_share", fill_meta.get("fill_cost_per_share", 0.0)),
+            "net_cost_total": fill_meta.get("net_cost_total", fill_meta.get("fill_cost_total", 0.0)),
+            "sec_sell_fee_applied": bool(fill_meta.get("sec_sell_fee_applied", False)),
+            "sec_sell_fee_rate_per_dollar": fill_meta.get("sec_sell_fee_rate_per_dollar"),
+            "sec_sell_fee_sale_date": fill_meta.get("sec_sell_fee_sale_date"),
+            "sec_sell_fee_sale_price": fill_meta.get("sec_sell_fee_sale_price"),
+            "sec_sell_fee_per_share": fill_meta.get("sec_sell_fee_per_share", 0.0),
+            "sec_sell_fee_total": fill_meta.get("sec_sell_fee_total", 0.0),
             "entry_quote_ok": bool(fill_meta.get("entry_quote_ok", False)),
             "exit_quote_ok": bool(fill_meta.get("exit_quote_ok", False)),
             "entry_quote_spread_cap_bps": fill_meta.get("entry_quote_spread_cap_bps"),
@@ -1207,8 +1315,11 @@ def _apply_portfolio_sizing(
             "entry_quote_price_source": fill_meta.get("entry_quote_price_source"),
             "exit_quote_price_source": fill_meta.get("exit_quote_price_source"),
             "target_limit_bound_applied": bool(fill_meta.get("target_limit_bound_applied", False)),
+            "pnl_per_share_before_sec_fee": fill_meta.get("pnl_per_share_before_sec_fee"),
             "raw_pnl_pct": fill_meta.get("raw_pnl_pct", getattr(trade_obj, "pnl_pct", None)),
+            "pnl_pct_before_sec_fee": fill_meta.get("pnl_pct_before_sec_fee"),
             "raw_r_multiple": fill_meta.get("raw_r_multiple", getattr(trade_obj, "r_multiple", None)),
+            "r_multiple_before_sec_fee": fill_meta.get("r_multiple_before_sec_fee"),
             "target_mode": getattr(plan_obj, "target_mode", None),
             "target_window_avg_pct": getattr(plan_obj, "target_window_avg_pct", None),
             "target_window_mult": getattr(plan_obj, "target_window_mult", None),
@@ -1530,9 +1641,10 @@ def _apply_portfolio_sizing(
         sized_records.append(rec)
         _log_fill_debug(plan, trade, qty, fill_meta)
         _log_quote_debug(plan, trade, qty, fill_meta)
+        position_exit_dt = _parse_ts_iso(fill_meta.get("exit_ts_active")) or row["exit_dt"]
         open_positions_state.append(
             {
-                "exit_dt": row["exit_dt"],
+                "exit_dt": position_exit_dt,
                 "capacity_notional": capacity_notional,
                 "capacity_notional_broker_sim": capacity_notional_broker,
                 "symbol": str(getattr(plan, "symbol", "") or ""),
@@ -1598,6 +1710,7 @@ def run_backtest(
     skip_reasons: Dict[str, int] = {}
     params = cfg.get("daily_trend_reversal") or {}
     reuse_existing_watchlists = bool(params.get("backtest_reuse_existing_watchlists", False))
+    reuse_frozen_live_watchlists = bool(params.get("backtest_reuse_frozen_live_watchlists", True))
     starting_equity = float(params.get("starting_equity") or 100000.0)
     equity = starting_equity
     run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1688,6 +1801,14 @@ def run_backtest(
                 len(symbols_for_day),
             )
         skip_watchlist_build = False
+        frozen_live_wl_path = frozen_watchlist_path(date_str, cfg)
+        if reuse_frozen_live_watchlists and frozen_live_wl_path.exists() and frozen_live_wl_path.stat().st_size > 0:
+            wl_path = watchlist_path(date_str, cfg)
+            if wl_path.resolve() != frozen_live_wl_path.resolve():
+                wl_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(frozen_live_wl_path, wl_path)
+            skip_watchlist_build = True
+            logging.info("[BACKTEST] reuse frozen live watchlist date=%s path=%s", date_str, frozen_live_wl_path)
         if reuse_existing_watchlists:
             wl_path = watchlist_path(date_str, cfg)
             if wl_path.exists() and wl_path.stat().st_size > 0:

@@ -176,6 +176,13 @@ class AlpacaBroker:
         resp.raise_for_status()
         return resp.json()
 
+    def get_clock(self) -> Optional[Dict[str, Any]]:
+        if not self.ready():
+            return None
+        resp = self._request("GET", "/v2/clock")
+        resp.raise_for_status()
+        return resp.json()
+
     def get_asset(self, symbol: str) -> Optional[Dict[str, Any]]:
         if not self.ready():
             return None
